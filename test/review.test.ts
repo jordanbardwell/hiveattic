@@ -87,6 +87,17 @@ describe("architect review regressions", () => {
     expect(scanSecrets("aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").length).toBeGreaterThan(0);
     expect(scanSecrets("use Zq8xP2mL9vR4tY7wK1n/B5cJ3hF6dS0aGq8xP2 now")).toContain("secret_entropy");
     expect(scanSecrets("see src/components/settings/NotificationPreferences.tsx")).toEqual([]);
+    const longAgent = "e2e0123456789-01hxyz7k3m9q2w4e6r8t0y2u";
+    expect(longAgent.length).toBeGreaterThanOrEqual(20);
+    expect(longAgent.length).toBeLessThanOrEqual(40);
+    expect(scanSecrets(`bots/${longAgent}/facts/city.md`)).toEqual([]);
+    expect(scanSecrets(`bots/${longAgent}/journal/2099/11/2099-11-11.md`)).toEqual([]);
+    expect(scanSecrets(`bots/architect-staging-admin/facts/city.md`)).toEqual([]);
+    expect(scanSecrets(`shared/e2e0123456789-secret-object.md`)).toEqual([]);
+    expect(scanSecrets(`## 16:00 UTC · ${longAgent} · outside ^01ARZ3NDEKTSV4RRFFQ69G5FAV`)).toEqual([]);
+    expect(scanSecrets(`owner: ${longAgent}`)).toEqual([]);
+    expect(scanSecrets(`note ${longAgent} in prose`)).toContain("secret_entropy");
+    expect(scanSecrets(`bots/sk-proj-abcdefghijklmnopqrstuvwxyz0123456789/facts/x.md`).length).toBeGreaterThan(0);
     expect(scanFinancial("call 2065550142 2065550143 2065550144")).toEqual([]);
     expect(scanFinancial("order number 20261017004512345678")).toEqual([]);
     expect(scanFinancial("UPS tracking 1Z999AA10123456784 and USPS 9400111899223197428490")).toEqual([]);
@@ -293,7 +304,7 @@ describe("architect review regressions", () => {
     expect(results((await rest("/v1/search?q=qxnewdrift", sharedWriter)).json).some((row) => row.path === drift)).toBe(true);
   });
 
-  it("cleanup is absent unless the staging flag is set, and it only removes namespaced paths", async () => {
+  it("cleanup is absent unless the staging flag is set, and it removes namespaced paths", async () => {
     await resetVault();
     const runId = "e2e0123456789";
     const blocked = await rest("/v1/admin/cleanup", ADMIN, { method: "POST", body: JSON.stringify({ run_id: runId }) });
@@ -314,6 +325,164 @@ describe("architect review regressions", () => {
       expect(cleaned.status, cleaned.text).toBe(200);
       expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(namespaced).first()).toBeNull();
       expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(kept).first()).toBeTruthy();
+    } finally {
+      testEnv().E2E_CLEANUP_ENABLED = "";
+      testEnv().DEPLOY_ENV = "";
+      testEnv().VAULT_BUCKET = "hiveattic-vault";
+      testEnv().DB_NAME = "hiveattic-index";
+      testEnv().WORKER_NAME = "hiveattic";
+    }
+  });
+
+  it("long agent ids can write facts, journals, decisions, and their own folder", async () => {
+    await resetVault();
+    const agent = "e2e0123456789-01hxyz7k3m9q2w4e6r8t0y2u";
+    const token = await mint(agent, ["read:shared", "read:own", "write:own", "write:shared", "write:decisions"], agent);
+    const fact = await rest("/v1/facts", token, {
+      method: "POST",
+      body: JSON.stringify({ key: "city", statement: "Lives near the cedar grove", observed_at: "2026-01-01T00:00:00Z", scope: "own" }),
+    });
+    expect(fact.status, fact.text).toBe(200);
+    expect(String(fact.json.data?.path)).toBe(`bots/${agent}/facts/city.md`);
+    const ownJournal = await rest("/v1/journal", token, {
+      method: "POST",
+      body: JSON.stringify({ target: "own", title: "did", body: "Wrote the city fact", at: "2099-11-11T16:00:00Z" }),
+    });
+    expect(ownJournal.status, ownJournal.text).toBe(200);
+    const sharedJournal = await rest("/v1/journal", token, {
+      method: "POST",
+      body: JSON.stringify({ target: "shared", title: "shared", body: "Shared day note", at: "2099-11-11T17:00:00Z" }),
+    });
+    expect(sharedJournal.status, sharedJournal.text).toBe(200);
+    const decision = await rest("/v1/journal", token, {
+      method: "POST",
+      body: JSON.stringify({ target: "decisions", title: "keep", body: "Keep the cedar fact", at: "2099-11-11T18:00:00Z" }),
+    });
+    expect(decision.status, decision.text).toBe(200);
+    const own = await rest("/v1/notes", token, {
+      method: "PUT",
+      body: JSON.stringify({ path: `bots/${agent}/secret-plans.md`, body: "A normal planning note", type: "note" }),
+    });
+    expect(own.status, own.text).toBe(200);
+    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    for (const path of [String(fact.json.data?.path), String(ownJournal.json.data?.path), String(sharedJournal.json.data?.path), "shared/decisions.md", `bots/${agent}/secret-plans.md`]) {
+      const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
+      expect(row?.status, path).toBe("active");
+    }
+  });
+
+  it("rebuild keeps bootstrap note ids and ids already stored for a path", async () => {
+    await resetVault();
+    const before = await testEnv().DB.prepare("SELECT id, path FROM notes WHERE path IN ('AGENTS.md', 'README.md') ORDER BY path").all<{ id: string; path: string }>();
+    expect(before.results?.map((row) => row.path)).toEqual(["AGENTS.md", "README.md"]);
+    for (const row of before.results ?? []) {
+      const text = await (await testEnv().VAULT.get(`vault/${row.path}`))!.text();
+      expect(text).toContain(`vault_id: ${row.id}`);
+    }
+    const plainId = "01PLAINFILE000000000000001";
+    const plainPath = "shared/plain-id.md";
+    const plain = "# Plain\n\nNo frontmatter here.\n";
+    const now = new Date().toISOString();
+    await testEnv().VAULT.put(`vault/${plainPath}`, plain, { httpMetadata: { contentType: "text/markdown" }, customMetadata: { "vault-writer": "do", "vault-id": plainId } });
+    await testEnv().DB.prepare(
+      `INSERT INTO notes (id, path, type, owner, sensitivity, title, body, frontmatter, content_hash, r2_key, status, created_at, updated_at, last_writer)
+       VALUES (?, ?, 'note', 'shared', 'normal', 'Plain', ?, '{}', 'abc', ?, 'active', ?, ?, 'test')`,
+    )
+      .bind(plainId, plainPath, plain, `vault/${plainPath}`, now, now)
+      .run();
+    const d1Id = "01D1ONLYFILE00000000000001";
+    const d1Path = "shared/d1-id.md";
+    const d1Body = "# From D1\n\nKeep this id.\n";
+    await testEnv().VAULT.put(`vault/${d1Path}`, d1Body, { httpMetadata: { contentType: "text/markdown" } });
+    await testEnv().DB.prepare(
+      `INSERT INTO notes (id, path, type, owner, sensitivity, title, body, frontmatter, content_hash, r2_key, status, created_at, updated_at, last_writer)
+       VALUES (?, ?, 'note', 'shared', 'normal', 'D1', ?, '{}', 'def', ?, 'active', ?, ?, 'test')`,
+    )
+      .bind(d1Id, d1Path, d1Body, `vault/${d1Path}`, now, now)
+      .run();
+    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    const after = await testEnv().DB.prepare("SELECT id, path FROM notes WHERE path IN ('AGENTS.md', 'README.md') ORDER BY path").all<{ id: string; path: string }>();
+    expect(after.results).toEqual(before.results);
+    expect((await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(plainPath).first<{ id: string }>())?.id).toBe(plainId);
+    expect((await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(d1Path).first<{ id: string }>())?.id).toBe(d1Id);
+  });
+
+  it("cleanup removes shared entries, history, and quarantine records for a run", async () => {
+    await resetVault();
+    const runId = "e2eabcdef9876";
+    const agent = `${runId}-shared-writer`;
+    const token = await mint(agent, ["read:shared", "read:own", "write:own", "write:shared", "write:decisions"], agent);
+    const keptNote = `shared/kept-${nid()}.md`;
+    expect((await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path: keptNote, body: "stay qxkeepnote", type: "note" }) })).status).toBe(200);
+    const day = await rest("/v1/journal", sharedWriter, {
+      method: "POST",
+      body: JSON.stringify({ target: "shared", title: "kept", body: "qxkeepday", at: "2099-04-04T16:00:00Z" }),
+    });
+    expect(day.status).toBe(200);
+    const dayPath = String(day.json.data?.path);
+    expect((await rest("/v1/journal", token, { method: "POST", body: JSON.stringify({ target: "shared", title: "outside", body: "qxrunday", at: "2099-04-04T17:00:00Z" }) })).status).toBe(200);
+    expect((await rest("/v1/journal", ADMIN, { method: "POST", body: JSON.stringify({ target: "decisions", title: "stay", body: "qxkeepdecision", at: "2099-04-04T18:00:00Z" }) })).status).toBe(200);
+    expect((await rest("/v1/journal", token, { method: "POST", body: JSON.stringify({ target: "decisions", title: "go", body: "qxrundecision", at: "2099-04-04T19:00:00Z" }) })).status).toBe(200);
+    const ownPath = `bots/${agent}/scratch.md`;
+    const own = await rest("/v1/notes", token, { method: "PUT", body: JSON.stringify({ path: ownPath, body: "qxown", type: "note" }) });
+    expect(own.status).toBe(200);
+    expect((await rest("/v1/notes", token, { method: "PUT", body: JSON.stringify({ path: ownPath, body: "qxown2", type: "note", if_match: own.json.data?.etag }) })).status).toBe(200);
+    const secretPath = `shared/${runId}-secret-object.md`;
+    expect((await rest("/v1/notes", token, { method: "PUT", body: JSON.stringify({ path: secretPath, body: "Plain qxplain", type: "note" }) })).status).toBe(200);
+    await testEnv().VAULT.put(`vault/${secretPath}`, "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\nqxsecretmarker\n");
+    expect((await deliver({ action: "PutObject", key: `vault/${secretPath}` })).acked).toBe(true);
+    const dayBytes = await (await testEnv().VAULT.get(`vault/${dayPath}`))!.text();
+    await testEnv().VAULT.put(`vault/${dayPath}`, `${dayBytes}\n`);
+    expect((await deliver({ action: "PutObject", key: `vault/${dayPath}` })).acked).toBe(true);
+    const inboxBefore = await rest("/v1/notes?path=inbox/quarantine.md", ADMIN);
+    expect(String(inboxBefore.json.data?.markdown ?? "")).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(String(inboxBefore.json.data?.markdown ?? "")).not.toContain(secretPath);
+    expect(inboxBefore.json.data?.status).toBe("active");
+    testEnv().E2E_CLEANUP_ENABLED = "true";
+    testEnv().DEPLOY_ENV = "staging";
+    testEnv().VAULT_BUCKET = "hiveattic-staging-vault";
+    testEnv().DB_NAME = "hiveattic-staging-index";
+    testEnv().WORKER_NAME = "hiveattic-staging";
+    try {
+      const cleaned = await rest("/v1/admin/cleanup", ADMIN, { method: "POST", body: JSON.stringify({ run_id: runId }) });
+      expect(cleaned.status, cleaned.text).toBe(200);
+      expect(cleaned.json.data?.remaining_notes).toBe(0);
+      expect(cleaned.json.data?.remaining_objects).toBe(0);
+      const dayAfter = await (await testEnv().VAULT.get(`vault/${dayPath}`))!.text();
+      expect(dayAfter).toContain("qxkeepday");
+      expect(dayAfter).not.toContain("qxrunday");
+      expect(dayAfter).not.toContain(runId);
+      const decisions = await (await testEnv().VAULT.get("vault/shared/decisions.md"))!.text();
+      expect(decisions).toContain("qxkeepdecision");
+      expect(decisions).not.toContain("qxrundecision");
+      expect(decisions).not.toContain(runId);
+      expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(ownPath).first()).toBeNull();
+      expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(secretPath).first()).toBeNull();
+      expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(keptNote).first()).toBeTruthy();
+      expect(await testEnv().DB.prepare("SELECT id FROM journal_entries WHERE agent_id = ?").bind(agent).first()).toBeNull();
+      const keptEntries = await testEnv().DB.prepare("SELECT id FROM journal_entries WHERE agent_id = ?").bind("rev-shared").all();
+      expect(keptEntries.results?.length).toBeGreaterThan(0);
+      const quarantine = await testEnv().VAULT.list({ prefix: "sys/quarantine/" });
+      for (const object of quarantine.objects) {
+        expect(await (await testEnv().VAULT.get(object.key))!.text()).not.toContain(runId);
+      }
+      let historyCursor: string | undefined;
+      do {
+        const history = await testEnv().VAULT.list({ prefix: "sys/history/", cursor: historyCursor });
+        for (const object of history.objects) {
+          const text = await (await testEnv().VAULT.get(object.key))!.text();
+          expect(text.includes(runId), object.key).toBe(false);
+          expect(text.includes("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"), object.key).toBe(false);
+        }
+        historyCursor = history.truncated ? history.cursor : undefined;
+      } while (historyCursor);
+      const inbox = await testEnv().VAULT.get("vault/inbox/quarantine.md");
+      if (inbox) {
+        const text = await inbox.text();
+        expect(text).not.toContain(runId);
+        expect(text).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
+        expect(text).not.toContain(secretPath);
+      }
     } finally {
       testEnv().E2E_CLEANUP_ENABLED = "";
       testEnv().DEPLOY_ENV = "";

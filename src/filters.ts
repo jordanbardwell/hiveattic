@@ -34,10 +34,9 @@ export function scanSecrets(input: string): string[] {
     const token = match[0];
     if (/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(token)) continue;
     const index = match.index ?? 0;
-    const around = text.slice(Math.max(0, index - 40), index + token.length + 40);
-    const nearSecretWord = /\b(?:secret|key|token|password|credential)\b|aws_/i.test(around);
+    if (isAgentIdentifier(text, index, token)) continue;
     const span = pathSpan(text, index, token.length);
-    if (!nearSecretWord && (isPathLike(token) || (span !== null && isPathLike(span)))) continue;
+    if (isStructuralPath(token) || (span !== null && isStructuralPath(span))) continue;
     if (shannon(token) > 4) reasons.push("secret_entropy");
   }
   return unique(reasons);
@@ -281,17 +280,24 @@ function pathSpan(text: string, index: number, length: number): string | null {
   return span.includes("/") ? span : null;
 }
 
-function isPathLike(token: string): boolean {
-  if (!token.includes("/") || /[+=]/.test(token)) return false;
+const VAULT_ROOTS = new Set(["bots", "domains", "shared", "journal", "inbox", "profile", "sys"]);
+
+function isAgentIdentifier(text: string, index: number, token: string): boolean {
+  if (!/^[a-z0-9][a-z0-9-]{23,63}$/.test(token)) return false;
+  const before = text.slice(Math.max(0, index - 80), index);
+  const after = text.slice(index + token.length, index + token.length + 4);
+  if (/(?:^|\n)(?:owner|source):\s*$/.test(before)) return true;
+  return /·\s*$/.test(before) && /^\s*·/.test(after);
+}
+
+function isStructuralPath(token: string): boolean {
+  if (token.length > 300 || !token.includes("/") || /[+=]/.test(token)) return false;
   const parts = token.split("/");
-  if (parts.length < 2 || parts.some((part) => part.length === 0 || part.length >= 80)) return false;
-  return parts.every((part) => {
-    if (!/^[A-Za-z0-9_.-]+$/.test(part)) return false;
-    if (/\.[A-Za-z0-9]{1,8}$/.test(part)) return true;
-    if (part.length >= 20) return false;
-    if (part.length >= 8 && shannon(part) > 4) return false;
-    return true;
-  });
+  if (parts.length < 2) return false;
+  if (!parts.every((part) => part.length >= 1 && part.length <= 200 && /^[A-Za-z0-9_.-]+$/.test(part))) return false;
+  const rooted = VAULT_ROOTS.has(parts[0] ?? "");
+  const extension = /\.[A-Za-z0-9]{1,8}$/.test(parts[parts.length - 1] ?? "");
+  return rooted || extension;
 }
 
 function shannon(value: string): number {

@@ -531,6 +531,9 @@ async function cleanupCase(): Promise<Check[]> {
   checks.push(check("staging cleanup", cleaned.status === 200, `status ${cleaned.status}`));
   checks.push(check("staging cleanup audited", entries.some((entry) => entry.action === "cleanup")));
   checks.push(check("namespaced notes gone", results(left.json).length === 0));
+  const remainingNotes = cleaned.json.data?.remaining_notes;
+  const remainingObjects = cleaned.json.data?.remaining_objects;
+  checks.push(check("no leftovers", remainingNotes === 0 && remainingObjects === 0, `notes ${remainingNotes} objects ${remainingObjects}`));
   return checks;
 }
 

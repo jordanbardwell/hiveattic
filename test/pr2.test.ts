@@ -78,14 +78,35 @@ describe("pr2 review regressions", () => {
     expect(id?.r2_etag).toBeTruthy();
     const history = await testEnv().VAULT.list({ prefix: `sys/history/${id?.id}/` });
     expect(history.objects.length).toBeGreaterThan(0);
+    let sawClean = false;
+    for (const object of history.objects) {
+      const text = await (await testEnv().VAULT.get(object.key))!.text();
+      expect(text).not.toContain("AKIAIOSFODNN7EXAMPLE");
+      if (text.includes("fine qxq")) sawClean = true;
+    }
+    expect(sawClean).toBe(true);
+    const reasons = await testEnv().DB.prepare("SELECT reason FROM note_versions WHERE note_id = ?").bind(id?.id).all<{ reason: string }>();
+    expect((reasons.results ?? []).map((row) => row.reason)).not.toContain("quarantine-r2");
+    const listed = JSON.stringify((await rest(`/v1/history?id=${id?.id}`, ADMIN)).json);
+    expect(listed).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(listed).toContain("fine qxq");
+    const inbox = await rest("/v1/notes?path=inbox/quarantine.md", ADMIN);
+    expect(inbox.json.data?.status).toBe("active");
+    const inboxBody = String(inbox.json.data?.markdown ?? "");
+    expect(inboxBody).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(inboxBody).not.toContain(notePath);
     const versions = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").bind(id?.id).first<{ n: number }>())?.n;
     const audits = async () =>
       (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE path = ? AND outcome = 'rejected'").bind(notePath).first<{ n: number }>())?.n;
+    const alerts = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'quarantine_alert'").first<{ n: number }>())?.n;
     const beforeVersions = await versions();
     const beforeAudits = await audits();
+    const beforeAlerts = await alerts();
+    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
     expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
     expect(await versions()).toBe(beforeVersions);
     expect(await audits()).toBe(beforeAudits);
+    expect(await alerts()).toBe(beforeAlerts);
     const blocked = await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path: notePath, body: "later", type: "note" }) });
     expect(blocked.status).toBe(409);
   });

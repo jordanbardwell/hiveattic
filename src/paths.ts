@@ -29,6 +29,10 @@ export function isServerManagedPath(path: string): boolean {
   return path === "profile/summary.md" || isFactPath(path);
 }
 
+export function isGeneratedNote(path: string): boolean {
+  return path === "inbox/quarantine.md" || path === "inbox/conflicts.md" || path === "profile/summary.md";
+}
+
 export function ownerForPath(path: string): string {
   const bot = /^bots\/([^/]+)\//.exec(path);
   return bot?.[1] ?? "shared";

@@ -18,7 +18,7 @@ import {
 } from "./markdown";
 import { domainOf } from "./access";
 import { stagingResources } from "./query";
-import { isAppendOnlyPath, isFactPath, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
+import { isAppendOnlyPath, isFactPath, isGeneratedNote, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
 import { etStamp, versionStamp, within24h } from "./time";
 
 export type Actor = {
@@ -612,7 +612,7 @@ export class VaultWriter extends DurableObject<Env> {
       return { ok: true, data: { skipped: true, reason: "unchanged" } };
     }
     const markdown = await object.text();
-    const hit = inspectWrite(textForFilter(markdown), await this.policy());
+    const hit = await this.contentHit(path, markdown);
     if (hit) {
       await this.quarantine(path, markdown, hit.reasons, actor, true, actionName, detail, objectEtag);
       return { ok: true, data: { quarantined: true, path, reasons: hit.reasons } };
@@ -668,7 +668,8 @@ export class VaultWriter extends DurableObject<Env> {
         if (!path) continue;
         const file = await this.env.VAULT.get(object.key);
         if (!file) continue;
-        const tombstone = await this.stageVaultFile(path, await file.text(), normalizeEtag(file.etag), actor);
+        const text = await file.text();
+        const tombstone = await this.stageVaultFile(path, text, normalizeEtag(file.etag), actor, file.customMetadata?.["vault-id"] ?? null);
         if (tombstone) tombstones.push(tombstone);
         imported += 1;
       }
@@ -756,14 +757,18 @@ export class VaultWriter extends DurableObject<Env> {
     ).run();
   }
 
-  private async stageVaultFile(path: string, markdown: string, etag: string | null, actor: Actor): Promise<{ id: string; hash: string } | null> {
-    const parsed = parseMarkdown(markdown);
-    const hit = inspectWrite(textForFilter(markdown), await this.policy());
+  private async stageVaultFile(
+    path: string,
+    markdown: string,
+    etag: string | null,
+    actor: Actor,
+    metaId: string | null = null,
+  ): Promise<{ id: string; hash: string } | null> {
+    const hit = await this.contentHit(path, markdown);
+    const id = await this.existingNoteId(path, markdown, metaId);
     let stored = markdown;
     let forced: string | null = null;
     if (hit) {
-      const id = stringField(parsed.frontmatter.vault_id) ?? ulid();
-      await this.putHistoryObject(id, markdown);
       stored = buildMarkdown(
         { vault_id: id, type: inferType(path), status: "quarantined", sensitivity: "sensitive", owner: ownerForPath(path) },
         "This note was quarantined by the content filter.",
@@ -772,14 +777,20 @@ export class VaultWriter extends DurableObject<Env> {
       const redacted = await this.auditHash(markdown);
       await this.env.VAULT.put(
         `sys/quarantine/${redacted ?? ulid()}.json`,
-        JSON.stringify({ path, at: new Date().toISOString(), reason_codes: hit.reasons, content_hash: redacted }),
+        JSON.stringify({
+          path,
+          at: new Date().toISOString(),
+          reason_codes: hit.reasons,
+          content_hash: redacted,
+          agent_id: actor.agentId,
+          run_id: runMarker(path),
+        }),
         { httpMetadata: { contentType: "application/json" } },
       );
     }
     const again = parseMarkdown(stored);
     const fmStatus = stringField(again.frontmatter.status);
     const status = forced ?? (fmStatus === "forgotten" || fmStatus === "quarantined" ? fmStatus : "active");
-    const id = stringField(again.frontmatter.vault_id) ?? ulid();
     const type = stringField(again.frontmatter.type) ?? inferType(path);
     const owner = stringField(again.frontmatter.owner) ?? ownerForPath(path);
     const domain = domainOf(path) ?? stringField(again.frontmatter.domain) ?? null;
@@ -847,23 +858,79 @@ export class VaultWriter extends DurableObject<Env> {
     if (!this.cleanupAllowed()) throw new VaultError("not_found", "Route not found");
     if (!/^e2e[0-9a-f]{10}$/.test(op.runId)) throw new VaultError("invalid", "run_id is not a safe namespace");
     const like = `%${op.runId}%`;
-    const rows = await this.env.DB.prepare("SELECT id, path FROM notes WHERE path LIKE ? ESCAPE '\\'")
-      .bind(like)
-      .all<{ id: string; path: string }>();
+    const rows = await this.env.DB.prepare(
+      `SELECT id, path, body, owner, type, title, sensitivity, domain, r2_etag FROM notes
+       WHERE path LIKE ? ESCAPE '\\' OR owner LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'
+          OR ifnull(last_writer, '') LIKE ? ESCAPE '\\'
+          OR id IN (SELECT note_id FROM journal_entries WHERE agent_id LIKE ? ESCAPE '\\')`,
+    )
+      .bind(like, like, like, like, like)
+      .all<CleanupNote>();
     let purged = 0;
+    let rewritten = 0;
     for (const row of rows.results ?? []) {
-      if (!row.path.includes(op.runId)) continue;
-      await this.purge(row.id, row.path, op.actor, false);
-      purged += 1;
+      const owned = row.path.includes(op.runId) || row.owner.includes(op.runId);
+      const stripped = owned ? null : stripRunContent(row.body, op.runId);
+      if (owned || stripped?.empty) {
+        await this.purge(row.id, row.path, op.actor, false);
+        purged += 1;
+        continue;
+      }
+      if (!stripped?.changed) continue;
+      const sensitivity = row.sensitivity === "sensitive" ? "sensitive" : "normal";
+      const saved = await this.saveMarkdown({
+        id: row.id,
+        path: row.path,
+        markdown: stripped.markdown,
+        type: row.type,
+        owner: row.owner,
+        domain: row.domain,
+        sensitivity,
+        factKey: null,
+        title: row.title ?? titleFromBody(stripped.markdown, row.path),
+        statementHash: null,
+        observedAt: null,
+        actor: op.actor,
+        ifMatch: row.r2_etag,
+        create: false,
+        reason: "cleanup",
+        action: "cleanup_rewrite",
+        idempotencyKey: null,
+        journal: null,
+      });
+      if (!saved.ok) return saved;
+      rewritten += 1;
+      await this.env.DB.prepare("DELETE FROM journal_entries WHERE note_id = ? AND (agent_id LIKE ? ESCAPE '\\' OR instr(?, id) = 0)")
+        .bind(row.id, like, stripped.markdown)
+        .run();
     }
-    await this.deleteKeysContaining(this.prefix(), op.runId);
-    await this.deleteQuarantineReferencing(op.runId);
-    await this.deleteKeysContaining("sys/history/", op.runId);
-    const now = new Date().toISOString();
-    await this.env.DB.prepare("UPDATE tokens SET revoked_at = ? WHERE label LIKE ? ESCAPE '\\' AND revoked_at IS NULL").bind(now, like).run();
-    await this.env.DB.prepare("UPDATE agents SET disabled_at = ? WHERE id LIKE ? ESCAPE '\\' AND disabled_at IS NULL").bind(now, like).run();
-    await this.audit(op.actor, "cleanup", null, null, "ok", [], null, purged, JSON.stringify({ run_id: op.runId, purged }));
-    return { ok: true, data: { purged, rewritten: 0 } };
+    await this.env.DB.prepare("DELETE FROM journal_entries WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.env.DB.prepare("DELETE FROM idempotency WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.env.DB.prepare("DELETE FROM links WHERE target LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.env.DB.prepare("DELETE FROM conflicts WHERE fact_key LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.env.DB.prepare("DELETE FROM policy_terms WHERE term LIKE ? ESCAPE '\\'").bind(like).run();
+    const runVersions = await this.env.DB.prepare("SELECT r2_key FROM note_versions WHERE writer LIKE ? ESCAPE '\\'")
+      .bind(like)
+      .all<{ r2_key: string }>();
+    const versionKeys = (runVersions.results ?? []).map((row) => row.r2_key).filter((key) => key.startsWith("sys/"));
+    if (versionKeys.length) await this.env.VAULT.delete(versionKeys);
+    await this.env.DB.prepare("DELETE FROM note_versions WHERE writer LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.deleteRunObjects(op.runId);
+    await this.env.DB.prepare("DELETE FROM tokens WHERE label LIKE ? ESCAPE '\\' OR agent_id LIKE ? ESCAPE '\\'").bind(like, like).run();
+    await this.env.DB.prepare("DELETE FROM agents WHERE id LIKE ? ESCAPE '\\'").bind(like).run();
+    const remaining = await this.runLeftovers(op.runId);
+    await this.audit(
+      op.actor,
+      "cleanup",
+      null,
+      null,
+      "ok",
+      [],
+      null,
+      purged,
+      JSON.stringify({ run_id: op.runId, purged, rewritten, ...remaining }),
+    );
+    return { ok: true, data: { purged, rewritten, remaining_notes: remaining.notes, remaining_objects: remaining.objects } };
   }
 
   private async saveMarkdown(input: {
@@ -1112,6 +1179,19 @@ export class VaultWriter extends DurableObject<Env> {
       }
     }
     if (input.write) {
+      const current = parseMarkdown(markdown);
+      if (!stringField(current.frontmatter.vault_id)) {
+        markdown = buildMarkdown(
+          {
+            ...current.frontmatter,
+            vault_id: id,
+            type: stringField(current.frontmatter.type) ?? inferType(input.path),
+            owner: stringField(current.frontmatter.owner) ?? ownerForPath(input.path),
+            status: stringField(current.frontmatter.status) ?? "active",
+          },
+          current.body,
+        );
+      }
       const put = await this.putVault(input.path, markdown, id, null);
       if (!put) throw new VaultError("conflict_etag", "Bootstrap object already exists");
       input = { ...input, etag: put.etag };
@@ -1180,8 +1260,10 @@ export class VaultWriter extends DurableObject<Env> {
     const existing = await this.noteByPath(path);
     const normalized = normalizeEtag(etag);
     if (existing?.status === "quarantined" && normalized && normalized === normalizeEtag(existing.r2_etag)) return;
-    if (existing?.status === "active") await this.snapshotBytes(existing, existing.body, actor.agentId, "quarantine");
-    if (existing && existing.body !== markdown) await this.snapshotBytes(existing, markdown, actor.agentId, "quarantine-r2");
+    if (existing?.status === "active") {
+      await this.snapshotBytes(existing, existing.body, actor.agentId, "quarantine");
+      await this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key NOT LIKE 'sys/history/%'").bind(existing.id).run();
+    }
     const id = existing?.id ?? ulid();
     const stub = buildMarkdown(
       { vault_id: id, type: inferType(path), status: "quarantined", sensitivity: "sensitive", owner: ownerForPath(path) },
@@ -1192,7 +1274,14 @@ export class VaultWriter extends DurableObject<Env> {
     const recordKey = `sys/quarantine/${hash ?? ulid()}.json`;
     await this.env.VAULT.put(
       recordKey,
-      JSON.stringify({ path, at: now, reason_codes: reasons, content_hash: hash }),
+      JSON.stringify({
+        path,
+        at: now,
+        reason_codes: reasons,
+        content_hash: hash,
+        agent_id: actor.agentId,
+        run_id: runMarker(path) ?? runMarker(actor.agentId),
+      }),
       { httpMetadata: { contentType: "application/json" } },
     );
     const prior = existing;
@@ -1221,7 +1310,6 @@ export class VaultWriter extends DurableObject<Env> {
           actor.agentId,
         )
         .run();
-      await this.snapshotBytes({ id }, markdown, actor.agentId, "quarantine-r2");
     } else {
       await this.env.DB.prepare(
         `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, r2_etag = ?, status = 'quarantined', sensitivity = 'sensitive', updated_at = ?, last_writer = ? WHERE id = ?`,
@@ -1234,7 +1322,8 @@ export class VaultWriter extends DurableObject<Env> {
     if (!alert) return;
     const inbox = await this.noteByPath("inbox/quarantine.md");
     if (hash && inbox?.body.includes(hash)) return;
-    const block = `## ${now} · quarantine\nA vault file was excluded from search (${reasons.join(", ")}). Hash ${hash}. Path ${path}.\n`;
+    const ref = runMarker(path) ?? runMarker(actor.agentId);
+    const block = `## ${now} · quarantine\nA vault file was excluded from search (${reasons.join(", ")}). Hash ${hash ?? "none"}.${ref ? ` Ref ${ref}.` : ""}\n`;
     const base =
       inbox?.body ??
       buildMarkdown({ vault_id: ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal", vault_summary: false }, "# Quarantine\n");
@@ -1506,7 +1595,7 @@ export class VaultWriter extends DurableObject<Env> {
         const file = await this.env.VAULT.get(object.key);
         if (!file) continue;
         const markdown = await file.text();
-        const hit = inspectWrite(textForFilter(markdown), await this.policy());
+        const hit = await this.contentHit(path, markdown);
         if (hit) await this.quarantine(path, markdown, hit.reasons, actor, false, "reconcile", null, normalizeEtag(file.etag));
         else {
           await this.indexBytes({
@@ -1552,13 +1641,21 @@ export class VaultWriter extends DurableObject<Env> {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
   }
 
-  private async putHistoryObject(noteId: string, bytes: string): Promise<void> {
-    const hash = await sha256Hex(bytes);
-    const key = `sys/history/${noteId}/${versionStamp()}-${hash8(hash)}.md`;
-    await this.env.VAULT.put(key, bytes, {
-      httpMetadata: { contentType: "text/markdown; charset=utf-8" },
-      customMetadata: { "vault-writer": "do", "vault-id": noteId },
-    });
+  private async contentHit(path: string, markdown: string) {
+    if (isGeneratedNote(path)) return null;
+    return inspectWrite(textForFilter(markdown), await this.policy());
+  }
+
+  private async existingNoteId(path: string, markdown: string, metaId: string | null): Promise<string> {
+    const fromFile = stringField(parseMarkdown(markdown).frontmatter.vault_id) ?? null;
+    const prior = await this.env.DB.prepare("SELECT id FROM notes WHERE path = ?").bind(path).first<{ id: string }>();
+    const meta = metaId?.trim() || null;
+    const candidates = [fromFile, prior?.id ?? null, meta].filter((value): value is string => Boolean(value));
+    for (const candidate of candidates) {
+      const clash = await this.env.DB.prepare("SELECT path FROM notes WHERE id = ?").bind(candidate).first<{ path: string }>();
+      if (!clash || clash.path === path) return candidate;
+    }
+    return ulid();
   }
 
   private async replay(agentId: string, key: string | null): Promise<{ [key: string]: JsonValue } | null> {
@@ -1648,29 +1745,57 @@ export class VaultWriter extends DurableObject<Env> {
     }
   }
 
-  private async deleteQuarantineReferencing(runId: string): Promise<void> {
-    let cursor: string | undefined;
-    do {
-      const page = await this.env.VAULT.list({ prefix: "sys/quarantine/", cursor, limit: 100 });
-      const keys: string[] = [];
-      for (const object of page.objects) {
-        const file = await this.env.VAULT.get(object.key);
-        if (!file) continue;
-        if ((await file.text()).includes(runId)) keys.push(object.key);
-      }
-      if (keys.length) await this.env.VAULT.delete(keys);
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+  private async deleteRunObjects(runId: string): Promise<void> {
+    for (const prefix of [this.prefix(), "sys/history/", "sys/quarantine/"]) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.env.VAULT.list({ prefix, cursor, limit: 100 });
+        const keys: string[] = [];
+        for (const object of page.objects) {
+          if (object.key.includes(runId)) {
+            keys.push(object.key);
+            continue;
+          }
+          const file = await this.env.VAULT.get(object.key);
+          if (file && (await file.text()).includes(runId)) keys.push(object.key);
+        }
+        if (keys.length) {
+          await this.env.VAULT.delete(keys);
+          for (const key of keys) await this.env.DB.prepare("DELETE FROM note_versions WHERE r2_key = ?").bind(key).run();
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+    }
   }
 
-  private async deleteKeysContaining(prefix: string, runId: string): Promise<void> {
-    let cursor: string | undefined;
-    do {
-      const page = await this.env.VAULT.list({ prefix, cursor, limit: 200 });
-      const keys = page.objects.filter((object) => object.key.includes(runId)).map((object) => object.key);
-      if (keys.length) await this.env.VAULT.delete(keys);
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+  private async runLeftovers(runId: string): Promise<{ notes: number; objects: number }> {
+    const like = `%${runId}%`;
+    const notes = await this.env.DB.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM notes WHERE path LIKE ? ESCAPE '\\' OR owner LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')
+         + (SELECT COUNT(*) FROM journal_entries WHERE agent_id LIKE ? ESCAPE '\\')
+         + (SELECT COUNT(*) FROM note_versions WHERE writer LIKE ? ESCAPE '\\' OR r2_key LIKE ? ESCAPE '\\')
+         AS n`,
+    )
+      .bind(like, like, like, like, like, like)
+      .first<{ n: number }>();
+    let objects = 0;
+    for (const prefix of [this.prefix(), "sys/history/", "sys/quarantine/"]) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.env.VAULT.list({ prefix, cursor, limit: 100 });
+        for (const object of page.objects) {
+          if (object.key.includes(runId)) {
+            objects += 1;
+            continue;
+          }
+          const file = await this.env.VAULT.get(object.key);
+          if (file && (await file.text()).includes(runId)) objects += 1;
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+    }
+    return { notes: notes?.n ?? 0, objects };
   }
 
   private prefix(): string {
@@ -1767,4 +1892,35 @@ export async function restoreJournalMarkers(env: Env, noteId: string, path: stri
       ).run();
     }
   }
+}
+
+type CleanupNote = {
+  id: string;
+  path: string;
+  body: string;
+  owner: string;
+  type: string;
+  title: string | null;
+  sensitivity: string;
+  domain: string | null;
+  r2_etag: string | null;
+};
+
+function runMarker(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /e2e[0-9a-f]{10}/.exec(value)?.[0] ?? null;
+}
+
+function stripRunContent(markdown: string, runId: string): { markdown: string; empty: boolean; changed: boolean } {
+  const parsed = parseMarkdown(markdown);
+  const pieces = parsed.body.split(/\n(?=## )/);
+  const kept = pieces.filter((piece) => !piece.includes(runId));
+  const changed = kept.length !== pieces.length;
+  if (!changed) return { markdown, empty: false, changed: false };
+  const body = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const hasSection = kept.some((piece) => piece.trimStart().startsWith("## "));
+  const leftover = body.replace(/^#[^\n]*$/gm, "").trim();
+  const empty = !hasSection && leftover.length === 0;
+  const next = Object.keys(parsed.frontmatter).length > 0 ? buildMarkdown(parsed.frontmatter, body) : body ? `${body}\n` : "";
+  return { markdown: next, empty, changed: true };
 }
