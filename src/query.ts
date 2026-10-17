@@ -1,8 +1,11 @@
-import { canRead, hasScope, NON_SENSITIVE_DOMAINS, SENSITIVE_DOMAINS, type Access, type NoteView } from "./access";
+import { canRead, hasScope, type Access, type NoteView } from "./access";
+import { domainConfig, RESTRICTED, stagingResources, vaultTimeZone } from "./config";
 import { sha256Hex } from "./crypto";
 import { VaultError } from "./errors";
 import { AGENTS_MD } from "./content";
 import { r2KeyFor } from "./paths";
+
+export { stagingResources };
 
 export type SearchOptions = { limit?: number; domains?: string[]; types?: string[]; since?: string };
 
@@ -19,6 +22,23 @@ type NoteHit = {
   chunk_text: string;
   rank: number;
 };
+
+type NoteRecord = {
+  id: string;
+  path: string;
+  owner: string;
+  domain: string | null;
+  sensitivity: string;
+  frontmatter: string;
+  body: string;
+  status: string;
+  r2_etag: string | null;
+  type: string;
+  title: string | null;
+  moved_to: string | null;
+};
+
+const RESTRICTED_LIKE = `sensitive/${RESTRICTED}/%`;
 
 export async function searchVault(env: Env, access: Access, query: string, mode: string, options: SearchOptions = {}): Promise<Record<string, unknown>> {
   const match = ftsQuery(query);
@@ -71,43 +91,22 @@ export async function searchVault(env: Env, access: Access, query: string, mode:
   return data;
 }
 
+const NOTE_SELECT = `SELECT id, path, owner, domain, sensitivity, frontmatter, body, status, r2_etag, type, title,
+  (SELECT moved_to FROM tombstones t WHERE t.note_id = notes.id) AS moved_to FROM notes`;
+
+// A note that moved to a sensitive folder reads as missing for everyone but the admin token, so the
+// old path gives no stub and no pointer to the new one.
+function readable(access: Access, note: NoteRecord | null): note is NoteRecord {
+  if (!note) return false;
+  if (note.moved_to && !access.admin) return false;
+  return canRead(access, noteView(note));
+}
+
 export async function readNote(env: Env, access: Access, path?: string, id?: string): Promise<Record<string, unknown>> {
   const note = id
-    ? await env.DB.prepare(
-        "SELECT id, path, owner, domain, sensitivity, frontmatter, body, status, r2_etag, type, title FROM notes WHERE id = ?",
-      )
-        .bind(id)
-        .first<{
-          id: string;
-          path: string;
-          owner: string;
-          domain: string | null;
-          sensitivity: string;
-          frontmatter: string;
-          body: string;
-          status: string;
-          r2_etag: string | null;
-          type: string;
-          title: string | null;
-        }>()
-    : await env.DB.prepare(
-        "SELECT id, path, owner, domain, sensitivity, frontmatter, body, status, r2_etag, type, title FROM notes WHERE path = ?",
-      )
-        .bind(path ?? "")
-        .first<{
-      id: string;
-      path: string;
-      owner: string;
-      domain: string | null;
-      sensitivity: string;
-      frontmatter: string;
-      body: string;
-      status: string;
-      r2_etag: string | null;
-      type: string;
-      title: string | null;
-    }>();
-  if (!note || !canRead(access, noteView(note))) throw new VaultError("not_found", "Note not found");
+    ? await env.DB.prepare(`${NOTE_SELECT} WHERE id = ?`).bind(id).first<NoteRecord>()
+    : await env.DB.prepare(`${NOTE_SELECT} WHERE path = ?`).bind(path ?? "").first<NoteRecord>();
+  if (!readable(access, note)) throw new VaultError("not_found", "Note not found");
   return {
     id: note.id,
     path: note.path,
@@ -121,41 +120,44 @@ export async function readNote(env: Env, access: Access, path?: string, id?: str
   };
 }
 
+// Pages through visible notes. Rows the SQL prefilter lets through but the caller cannot read do
+// not shorten a page: it keeps reading until it has a full page or runs out.
 export async function listNotes(env: Env, access: Access, prefix: string, cursor = ""): Promise<Record<string, unknown>> {
   const scope = scopeSql(access);
   const page = 100;
-  const rows = await env.DB.prepare(
-    `SELECT id, path, title, type, owner, domain, sensitivity, frontmatter, updated_at, status
-     FROM notes n WHERE status = 'active' AND path LIKE ? ESCAPE '\\' AND (? = '' OR path > ?) AND (${scope.sql})
-     ORDER BY path LIMIT ?`,
-  )
-    .bind(likePrefix(prefix), cursor, cursor, ...scope.binds, page + 1)
-    .all<{
-      id: string;
-      path: string;
-      title: string | null;
-      type: string;
-      owner: string;
-      domain: string | null;
-      sensitivity: string;
-      frontmatter: string;
-      updated_at: string;
-      status: string;
-    }>();
-  const visible = (rows.results ?? []).filter((note) => canRead(access, noteView(note)));
-  const pageRows = visible.slice(0, page);
-  const notes = pageRows.map((note) => ({ id: note.id, path: note.path, title: note.title, type: note.type, updated_at: note.updated_at }));
-  const next = visible.length > page ? pageRows[pageRows.length - 1]?.path ?? null : null;
-  return { notes, cursor: next };
+  const notes: { id: string; path: string; title: string | null; type: string; updated_at: string }[] = [];
+  let after = cursor;
+  let more = false;
+  for (let round = 0; round < 20; round++) {
+    const rows = await env.DB.prepare(
+      `SELECT id, path, title, type, owner, domain, sensitivity, frontmatter, updated_at, status
+       FROM notes n WHERE status = 'active' AND path LIKE ? ESCAPE '\\' AND (? = '' OR path > ?) AND (${scope.sql})
+       ORDER BY path LIMIT ?`,
+    )
+      .bind(likePrefix(prefix), after, after, ...scope.binds, page + 1)
+      .all<{ id: string; path: string; title: string | null; type: string; owner: string; domain: string | null; sensitivity: string; frontmatter: string; updated_at: string; status: string }>();
+    const batch = rows.results ?? [];
+    for (const note of batch.slice(0, page)) {
+      after = note.path;
+      if (!canRead(access, noteView(note))) continue;
+      notes.push({ id: note.id, path: note.path, title: note.title, type: note.type, updated_at: note.updated_at });
+      if (notes.length === page) break;
+    }
+    if (notes.length === page) {
+      more = batch.findIndex((note) => note.path === after) < batch.length - 1;
+      break;
+    }
+    more = batch.length > page;
+    if (!more) break;
+  }
+  return { notes, cursor: more ? after : null };
 }
 
 export async function noteHistory(env: Env, access: Access, path?: string, id?: string): Promise<Record<string, unknown>> {
   const note = id
-    ? await env.DB.prepare("SELECT id, path, owner, domain, sensitivity, frontmatter, status FROM notes WHERE id = ?").bind(id).first<NoteView & { id: string; status: string }>()
-    : await env.DB.prepare("SELECT id, path, owner, domain, sensitivity, frontmatter, status FROM notes WHERE path = ?")
-        .bind(path ?? "")
-        .first<NoteView & { id: string; status: string }>();
-  if (!note || !canRead(access, note)) throw new VaultError("not_found", "Note not found");
+    ? await env.DB.prepare(`${NOTE_SELECT} WHERE id = ?`).bind(id).first<NoteRecord>()
+    : await env.DB.prepare(`${NOTE_SELECT} WHERE path = ?`).bind(path ?? "").first<NoteRecord>();
+  if (!readable(access, note)) throw new VaultError("not_found", "Note not found");
   const versions = await env.DB.prepare(
     "SELECT version_ts, r2_key, content_hash, writer, reason FROM note_versions WHERE note_id = ? ORDER BY version_ts",
   )
@@ -184,6 +186,12 @@ export async function whoami(env: Env, access: Access): Promise<Record<string, u
   const key = r2KeyFor(env.VAULT_PREFIX || "vault/", "AGENTS.md");
   const object = await env.VAULT.get(key);
   const bytes = object ? await object.text() : AGENTS_MD;
+  let zone: string | null = null;
+  try {
+    zone = vaultTimeZone(env);
+  } catch {
+    zone = null;
+  }
   return {
     agent_id: access.agentId,
     token_id: access.tokenId,
@@ -192,16 +200,8 @@ export async function whoami(env: Env, access: Access): Promise<Record<string, u
     agents_md_sha256: await sha256Hex(bytes),
     deploy_env: env.DEPLOY_ENV === "staging" ? "staging" : "production",
     staging_resources: stagingResources(env),
+    vault_tz: zone,
   };
-}
-
-export function stagingResources(env: Env): boolean {
-  const bucket = env.VAULT_BUCKET ?? "";
-  const db = env.DB_NAME ?? "";
-  const worker = env.WORKER_NAME ?? "";
-  // Names from wrangler.staging.example.jsonc put `-staging` in the middle
-  // (`hiveattic-staging-vault`) or at the end (`hiveattic-vault-staging`).
-  return env.DEPLOY_ENV === "staging" && bucket.includes("-staging") && db.includes("-staging") && worker.includes("staging");
 }
 
 function likePrefix(prefix: string): string {
@@ -229,7 +229,7 @@ function extraFilters(options: SearchOptions): { sql: string; binds: string[] } 
 }
 
 function domainTagSql(access: Access): { sql: string; binds: string[] } {
-  if (hasScope(access, "read:domain/*") || hasScope(access, "read:sensitive/*")) return { sql: "1 = 1", binds: [] };
+  if (access.scopes.includes("read:domain/*") || access.scopes.includes("read:sensitive/*")) return { sql: "1 = 1", binds: [] };
   const names = new Set<string>();
   for (const scope of access.scopes) {
     const domain = /^read:domain\/([a-z0-9-]+)$/.exec(scope);
@@ -244,8 +244,12 @@ function domainTagSql(access: Access): { sql: string; binds: string[] } {
   };
 }
 
+// A SQL prefilter that is broader than canRead, which still checks every row. No branch reaches
+// sensitive/restricted/ for a non-admin token.
 function scopeSql(access: Access): { sql: string; binds: string[] } {
-  if (access.admin || hasScope(access, "read:all")) return { sql: "1 = 1", binds: [] };
+  if (access.admin) return { sql: "1 = 1", binds: [] };
+  const fenced = (inner: { sql: string; binds: string[] }) => ({ sql: `n.path NOT LIKE ? AND (${inner.sql})`, binds: [RESTRICTED_LIKE, ...inner.binds] });
+  if (hasScope(access, "read:all")) return fenced({ sql: "1 = 1", binds: [] });
   const parts: { sql: string; binds: string[] }[] = [{ sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] }];
   if (hasScope(access, "read:own") || hasScope(access, "write:own")) {
     parts.push({ sql: "n.path LIKE ?", binds: [`bots/${access.agentId}/%`] });
@@ -283,31 +287,34 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
       binds: [...visibleDomains.binds, ...tag.binds, ...visible.flatMap((item) => item.binds)],
     });
   }
+  const sensitive = [...domainConfig().sensitive];
   for (const scope of access.scopes) {
     const sens = /^read:sensitive\/([a-z0-9-]+)$/.exec(scope);
-    if (sens && sens[1] !== "pii") parts.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/%`] });
-    if (scope === "read:sensitive/*") {
-      const names = [...SENSITIVE_DOMAINS];
+    if (sens && sens[1] !== "pii" && sens[1] !== "*") {
+      parts.push({ sql: "(n.domain = ? OR n.path LIKE ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/%`, `sensitive/${sens[1]}/%`] });
+    }
+    if (scope === "read:sensitive/*" && sensitive.length) {
       parts.push({
-        sql: `(n.sensitivity = 'sensitive' OR n.domain IN (${names.map(() => "?").join(", ")}) OR n.path LIKE 'domains/%')`,
-        binds: names,
+        sql: `(n.sensitivity = 'sensitive' OR n.domain IN (${sensitive.map(() => "?").join(", ")}) OR n.path LIKE 'domains/%' OR n.path LIKE 'sensitive/%')`,
+        binds: sensitive,
       });
     }
   }
   if (hasScope(access, "read:sensitive/pii")) {
-    parts.push({ sql: "(n.sensitivity = 'sensitive' AND n.domain IS NULL AND n.path NOT LIKE 'domains/%')", binds: [] });
+    parts.push({ sql: "(n.sensitivity = 'sensitive' AND n.domain IS NULL AND n.path NOT LIKE 'domains/%' AND n.path NOT LIKE 'sensitive/%')", binds: [] });
   }
-  return { sql: parts.map((part) => part.sql).join(" OR "), binds: parts.flatMap((part) => part.binds) };
+  return fenced({ sql: parts.map((part) => part.sql).join(" OR "), binds: parts.flatMap((part) => part.binds) });
 }
 
 function ordinaryDomainSql(): { sql: string; binds: string[] } {
-  const ordinary = [...NON_SENSITIVE_DOMAINS];
-  const sensitive = [...SENSITIVE_DOMAINS];
-  const ordinarySlots = ordinary.map(() => "?").join(", ");
-  const sensitivePaths = sensitive.map(() => "n.path NOT LIKE ?").join(" AND ");
-  const ordinaryPaths = ordinary.map(() => "n.path LIKE ?").join(" OR ");
+  const { ordinary: ordinarySet, sensitive: sensitiveSet } = domainConfig();
+  const ordinary = [...ordinarySet];
+  const sensitive = [...sensitiveSet];
+  const domainClause = ordinary.length ? `(n.domain IS NULL OR n.domain IN (${ordinary.map(() => "?").join(", ")}))` : "n.domain IS NULL";
+  const sensitivePaths = sensitive.map(() => " AND n.path NOT LIKE ?").join("");
+  const ordinaryPaths = ordinary.length ? ` OR ${ordinary.map(() => "n.path LIKE ?").join(" OR ")}` : "";
   return {
-    sql: `(n.sensitivity != 'sensitive' AND (n.domain IS NULL OR n.domain IN (${ordinarySlots})) AND ${sensitivePaths} AND (n.path NOT LIKE 'domains/%' OR ${ordinaryPaths}))`,
+    sql: `(n.sensitivity != 'sensitive' AND ${domainClause}${sensitivePaths} AND n.path NOT LIKE 'sensitive/%' AND (n.path NOT LIKE 'domains/%'${ordinaryPaths}))`,
     binds: [...ordinary, ...sensitive.map((name) => `domains/${name}/%`), ...ordinary.map((name) => `domains/${name}/%`)],
   };
 }

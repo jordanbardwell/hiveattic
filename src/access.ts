@@ -1,4 +1,6 @@
+import { isClassifiedDomain, isOrdinaryDomain, isSensitiveDomain, RESTRICTED } from "./config";
 import { VaultError } from "./errors";
+import { innerPath, isRestrictedPath, sensitiveSegment } from "./paths";
 
 export type Access = {
   agentId: string;
@@ -17,40 +19,45 @@ export type NoteView = {
 
 export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox"];
 
-// Domain config. A name has to be in one of these sets. Sensitive domains stay
-// hidden without read:sensitive/<domain>. Anything not listed is rejected on
-// write and treated as sensitive on read, so a new folder cannot leak through
-// read:domain/*.
-export const SENSITIVE_DOMAINS = new Set(["health", "finance"]);
-export const NON_SENSITIVE_DOMAINS = new Set(["deals", "x"]);
-
+// Admin is the admin token only. A stored scope list never makes a token admin. A wildcard
+// expands only within its own class: `read:domain/*` to ordinary domains, `*:sensitive/*` to
+// sensitive domains. Neither reaches an unclassified domain or `restricted`.
 export function hasScope(access: Access, scope: string): boolean {
-  if (access.admin || access.scopes.includes("admin") || access.scopes.includes(scope)) return true;
+  if (access.admin || access.scopes.includes(scope)) return true;
   const slash = scope.indexOf("/");
-  if (slash > 0 && access.scopes.includes(`${scope.slice(0, slash)}/*`)) return true;
-  return false;
+  if (slash <= 0) return false;
+  const family = scope.slice(0, slash);
+  const name = scope.slice(slash + 1);
+  if (!access.scopes.includes(`${family}/*`)) return false;
+  if (family === "read:domain" || family === "write:domain") return isOrdinaryDomain(name);
+  if (family === "read:sensitive" || family === "write:sensitive") return isSensitiveDomain(name);
+  return true;
 }
 
+// The domain a path belongs to: domains/<d>/ or sensitive/<d>/. restricted is not a domain.
 export function domainOf(path: string): string | null {
   const match = /^domains\/([^/]+)\//.exec(path);
-  return match?.[1] ?? null;
-}
-
-// A path under domains/<d>/ always owns that domain. A caller-supplied domain that disagrees is invalid.
-export function isClassifiedDomain(domain: string): boolean {
-  return SENSITIVE_DOMAINS.has(domain) || NON_SENSITIVE_DOMAINS.has(domain);
+  if (match?.[1]) return match[1];
+  const segment = sensitiveSegment(path);
+  return segment && segment !== RESTRICTED ? segment : null;
 }
 
 export function assertClassifiedDomain(domain: string | null | undefined): void {
   if (!domain) return;
-  if (!isClassifiedDomain(domain)) throw new VaultError("invalid", "domain is not classified");
+  if (!isClassifiedDomain(domain)) throw new VaultError("unclassified_domain", "domain is not classified", [domain]);
 }
 
+// A path under domains/<d>/ or sensitive/<d>/ owns that domain. A caller-supplied domain that disagrees is invalid.
 export function resolveDomain(path: string, supplied: string | null | undefined): string | null {
+  if (isRestrictedPath(path)) {
+    if (supplied) throw new VaultError("invalid", "domain does not match the path");
+    return null;
+  }
   const fromPath = domainOf(path);
   if (fromPath) {
     if (supplied && supplied !== fromPath) throw new VaultError("invalid", "domain does not match the path");
     assertClassifiedDomain(fromPath);
+    if (sensitiveSegment(path) && !isSensitiveDomain(fromPath)) throw new VaultError("invalid", "sensitive/ holds sensitive domains only");
     return fromPath;
   }
   assertClassifiedDomain(supplied);
@@ -67,20 +74,22 @@ export function isSummary(note: NoteView): boolean {
 }
 
 export function isSensitive(note: NoteView): boolean {
+  if (note.path.startsWith("sensitive/")) return true;
   const domain = effectiveDomain(note);
   if (note.sensitivity === "sensitive") return true;
   if (domain === null) return false;
-  if (NON_SENSITIVE_DOMAINS.has(domain)) return false;
-  return true;
+  return !isOrdinaryDomain(domain);
 }
 
 export function canRead(access: Access, note: NoteView): boolean {
+  // sensitive/restricted/ is the admin token's alone. No scope, read:all included, reaches it.
+  if (isRestrictedPath(note.path)) return access.admin;
   if (access.admin || hasScope(access, "read:all")) return true;
   if (note.path === "AGENTS.md" || note.path === "README.md") return true;
+  const segment = sensitiveSegment(note.path);
+  if (segment) return isSensitiveDomain(segment) && hasScope(access, `read:sensitive/${segment}`);
   const ownFolder = note.path.startsWith(`bots/${access.agentId}/`);
-  if (ownFolder && (note.owner === access.agentId || ownFolder) && (hasScope(access, "read:own") || hasScope(access, "write:own"))) {
-    return true;
-  }
+  if (ownFolder && (hasScope(access, "read:own") || hasScope(access, "write:own"))) return true;
   const domain = effectiveDomain(note);
   if (isSensitive(note) && !sensitiveRead(access, note, domain)) return false;
   if (note.domain && !domainOf(note.path)) {
@@ -118,9 +127,17 @@ function sensitiveRead(access: Access, note: NoteView, domain: string | null): b
 
 export function canWrite(access: Access, path: string, sensitivity: "normal" | "sensitive", domain: string | null = null): boolean {
   if (access.admin) return true;
+  if (isRestrictedPath(path)) return false;
+  const segment = sensitiveSegment(path);
+  if (segment) {
+    // A rerouted file: the caller needs write:sensitive/<d> and the right to write the path it came from.
+    const inner = innerPath(path);
+    if (!inner || !isSensitiveDomain(segment) || !hasScope(access, `write:sensitive/${segment}`)) return false;
+    return canWrite(access, inner, "normal", null);
+  }
   const pathDomain = domainOf(path) ?? domain;
   const ownFolder = path.startsWith(`bots/${access.agentId}/`);
-  const sensitive = sensitivity === "sensitive" || (pathDomain !== null && !NON_SENSITIVE_DOMAINS.has(pathDomain));
+  const sensitive = sensitivity === "sensitive" || (pathDomain !== null && !isOrdinaryDomain(pathDomain));
   const ownPiiJournal = ownFolder && !pathDomain && path.includes("/journal-sensitive/");
   if (sensitive && !ownPiiJournal) {
     if (pathDomain) {
@@ -156,4 +173,38 @@ export function assertVaultPath(path: string): string {
     throw new VaultError("invalid", "Path is not a vault-relative markdown path");
   }
   return trimmed;
+}
+
+// Scope grammar for mint. A raw `admin` string is not a scope, and nothing names `restricted`.
+const PLAIN_SCOPES = new Set([
+  "read:own",
+  "write:own",
+  "read:shared",
+  "write:shared",
+  "read:inbox",
+  "write:inbox",
+  "read:decisions",
+  "write:decisions",
+  "read:all",
+  "audit:read",
+]);
+
+export function scopeProblem(scope: string): string | null {
+  if (PLAIN_SCOPES.has(scope)) return null;
+  const named = /^(read|write):(domain|sensitive|bots)\/(\*|[a-z0-9][a-z0-9-]{0,63})$/.exec(scope);
+  if (named) {
+    const [, , family, name] = named;
+    if (name === RESTRICTED) return "restricted_scope";
+    if (family === "sensitive" && name === "pii") return null;
+    return null;
+  }
+  const summary = /^read:sensitive:summary\/([a-z0-9][a-z0-9-]{0,63})$/.exec(scope);
+  if (summary) return summary[1] === RESTRICTED ? "restricted_scope" : null;
+  const prefix = /^(read|write):prefix:([A-Za-z0-9][A-Za-z0-9_./-]{0,199})$/.exec(scope);
+  if (prefix) {
+    const target = prefix[2]!;
+    if (target.includes("..") || target.includes("//") || target.startsWith("sys/") || target.startsWith("sensitive/")) return "unsafe_prefix";
+    return null;
+  }
+  return "bad_scope";
 }

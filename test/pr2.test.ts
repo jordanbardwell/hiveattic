@@ -1,7 +1,7 @@
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv } from "./helpers";
 
 let shared = "";
 let financeRo = "";
@@ -30,7 +30,7 @@ describe("pr2 review regressions", () => {
     });
     expect(decision.status).toBe(200);
     const before = results((await rest("/v1/search?q=qxfirstentry", shared)).json);
-    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     const after = results((await rest("/v1/search?q=qxfirstentry", shared)).json);
     expect(after.map((row) => row.path).sort()).toEqual(before.map((row) => row.path).sort());
     const journal = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
@@ -83,8 +83,8 @@ describe("pr2 review regressions", () => {
     const audits = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE path = ?").bind(notePath).first<{ n: number }>())?.n;
     const beforeVersions = await versions();
     const beforeAudits = await audits();
-    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
-    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
     expect(await versions()).toBe(beforeVersions);
     expect(await audits()).toBe(beforeAudits);
     const later = await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path: notePath, body: "later", type: "note", if_match: id?.r2_etag }) });
@@ -151,10 +151,15 @@ describe("pr2 review regressions", () => {
     const marker = `qxgone${nid()}`;
     await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path, body: marker, type: "note" }) });
     await testEnv().VAULT.delete(`vault/${path}`);
-    const reconciled = await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" });
-    expect(reconciled.status).toBe(200);
-    const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
+    const reconciled = await runJob("/v1/admin/reconcile");
+    expect(reconciled.job.data?.status).toBe("done");
+    const row = await testEnv().DB.prepare("SELECT status, body FROM notes WHERE path = ?").bind(path).first<{ status: string; body: string }>();
     expect(row?.status).toBe("forgotten");
+    // M1: a reader gets a stub, not the body the object had.
+    expect(row?.body).not.toContain(marker);
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, shared);
+    expect(read.json.data?.status).toBe("forgotten");
+    expect(read.text).not.toContain(marker);
     expect(results((await rest(`/v1/search?q=${marker}`, shared)).json)).toEqual([]);
   });
 

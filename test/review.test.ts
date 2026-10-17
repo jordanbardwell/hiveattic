@@ -2,7 +2,7 @@ import { createExecutionContext, createMessageBatch, env, getQueueResult, runInD
 import { beforeAll, describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/crypto";
 import worker from "../src/index";
-import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv } from "./helpers";
 
 let financeRw = "";
 let financeRo = "";
@@ -45,8 +45,7 @@ describe("architect review regressions", () => {
     await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: marker, type: "note" }) });
     expect((await rest("/v1/forget", sharedWriter, { method: "POST", body: JSON.stringify({ path, reason: "done" }) })).status).toBe(200);
     const before = await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM tombstones").first<{ n: number }>();
-    const rebuilt = await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" });
-    expect(rebuilt.status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
     const after = await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM tombstones").first<{ n: number }>();
     expect(row?.status).toBe("forgotten");
@@ -63,7 +62,7 @@ describe("architect review regressions", () => {
     const forgedId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const markdown = `---\nvault_id: 01FORGEDJOURNAL000000000001\ntype: journal\nowner: shared\nstatus: active\n---\n# 2026-03-02\n\n## 16:00 UTC · forged · stolen ^${forgedId}\nforged body\n`;
     await testEnv().VAULT.put("vault/journal/2026/03/2026-03-02.md", markdown, { httpMetadata: { contentType: "text/markdown" } });
-    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     const row = await testEnv().DB.prepare("SELECT id FROM journal_entries WHERE agent_id = ?").bind("forged").first();
     expect(row).toBeNull();
   });
@@ -167,30 +166,38 @@ describe("architect review regressions", () => {
     expect(version).toBeTruthy();
   });
 
-  it("P16 another bot cannot read a sensitive own journal", async () => {
+  it("P16 a sensitive journal entry is rerouted, not refused, and other bots cannot read it", async () => {
     await resetVault();
-    const owner = await mint("owner-a", ["read:own", "write:own", "read:shared"], "owner-a");
-    const bots = await mint("bots-reader", ["read:shared", "read:bots/*"], "bots-reader");
+    const owner = await mint("owner-a", ["read:own", "write:own", "read:shared", "write:shared"], "owner-a");
+    const bots = await mint("bots-reader", ["read:shared", "read:bots/*", "read:sensitive/*"], "bots-reader");
+    // A sensitive flag with no domain goes to sensitive/restricted/, which only the admin token reads.
     const appended = await rest("/v1/journal", owner, {
       method: "POST",
       body: JSON.stringify({ target: "own", title: "call", body: "Talked about the move", at: "2026-05-01T16:00:00.000Z", sensitivity: "sensitive" }),
     });
-    expect(appended.status, appended.text).toBe(200);
+    expect(appended.status, appended.text).toBe(201);
     const path = String(appended.json.data?.path);
-    expect(path.includes("/journal-sensitive/")).toBe(true);
+    expect(path).toBe("sensitive/restricted/journal/owner-a/2026-05-01.md");
+    expect(appended.json.data?.sensitive_domain).toBe("restricted");
     expect((await rest(`/v1/notes?path=${encodeURIComponent(path)}`, bots)).status).toBe(404);
-    expect((await rest(`/v1/notes?path=${encodeURIComponent(path)}`, owner)).status).toBe(200);
-    expect((await rest("/v1/journal", owner, {
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(path)}`, owner)).status).toBe(404);
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(path)}`, ADMIN)).status).toBe(200);
+    // A shared journal entry with the flag is accepted and rerouted the same way. The shared day file gets nothing.
+    const shared = await rest("/v1/journal", owner, {
       method: "POST",
-      body: JSON.stringify({ target: "shared", title: "nope", body: "private", at: "2026-05-01T17:00:00.000Z", sensitivity: "sensitive" }),
-    })).status).toBe(400);
-    // The server does not read content to pick sensitivity. A phone number alone stays in the normal journal.
+      body: JSON.stringify({ target: "shared", title: "private", body: "qxprivateshared entry", at: "2026-05-01T17:00:00.000Z", sensitivity: "sensitive" }),
+    });
+    expect(shared.status, shared.text).toBe(201);
+    expect(shared.json.data?.path).toBe("sensitive/restricted/journal/owner-a/2026-05-01.md");
+    expect((await rest("/v1/notes?path=journal/2026/05/2026-05-01.md", owner)).status).toBe(404);
+    expect(results((await rest("/v1/search?q=qxprivateshared", owner)).json)).toEqual([]);
+    // A phone number is PII. It reroutes to restricted too.
     const phone = await rest("/v1/journal", owner, {
       method: "POST",
       body: JSON.stringify({ target: "own", title: "call", body: "Reached me at 206-555-0142", at: "2026-05-02T16:00:00.000Z" }),
     });
-    expect(phone.status).toBe(200);
-    expect(String(phone.json.data?.path)).toContain("/journal/");
+    expect(phone.status).toBe(201);
+    expect(String(phone.json.data?.path)).toBe("sensitive/restricted/journal/owner-a/2026-05-02.md");
   });
 
   it("P17 revoke drops the cached token and is audited", async () => {
@@ -268,7 +275,8 @@ describe("architect review regressions", () => {
         method: "PUT",
         body: JSON.stringify({ path: note.path, body: note.body, type: "note", domain: note.domain }),
       });
-      expect(written.status, written.text).toBe(200);
+      // A declared sensitive domain on a shared path reroutes into sensitive/<d>/ (201). domains/ paths stay (200).
+      expect(written.status, written.text).toBe(note.path.startsWith("shared/") ? 201 : 200);
       ids.push(String(written.json.data?.id));
       const revised = await rest("/v1/notes", ADMIN, {
         method: "PUT",
@@ -280,7 +288,7 @@ describe("architect review regressions", () => {
           if_match: written.json.data?.etag,
         }),
       });
-      expect(revised.status, revised.text).toBe(200);
+      expect(revised.status, revised.text).toBe(note.path.startsWith("shared/") ? 201 : 200);
     }
     for (const note of notes) {
       const byPath = await rest(`/v1/notes?path=${encodeURIComponent(note.path)}`, token);
@@ -365,8 +373,7 @@ describe("architect review regressions", () => {
     const drift = `shared/drift-${nid()}.md`;
     await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path: drift, body: "Original qxolddrift", type: "note" }) });
     await testEnv().VAULT.put(`vault/${drift}`, "---\ntitle: Drift\n---\nUpdated qxnewdrift\n", { httpMetadata: { contentType: "text/markdown" } });
-    const reconciled = await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" });
-    expect(reconciled.status).toBe(200);
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
     expect(results((await rest("/v1/search?q=qxnewdrift", sharedWriter)).json).some((row) => row.path === drift)).toBe(true);
   });
 
@@ -430,7 +437,7 @@ describe("architect review regressions", () => {
       body: JSON.stringify({ path: `bots/${agent}/secret-plans.md`, body: "A normal planning note", type: "note" }),
     });
     expect(own.status, own.text).toBe(200);
-    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     for (const path of [String(fact.json.data?.path), String(ownJournal.json.data?.path), String(sharedJournal.json.data?.path), "shared/decisions.md", `bots/${agent}/secret-plans.md`]) {
       const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
       expect(row?.status, path).toBe("active");
@@ -466,7 +473,7 @@ describe("architect review regressions", () => {
     )
       .bind(d1Id, d1Path, d1Body, `vault/${d1Path}`, now, now)
       .run();
-    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     const after = await testEnv().DB.prepare("SELECT id, path FROM notes WHERE path IN ('AGENTS.md', 'README.md') ORDER BY path").all<{ id: string; path: string }>();
     expect(after.results).toEqual(before.results);
     expect((await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(plainPath).first<{ id: string }>())?.id).toBe(plainId);
@@ -586,7 +593,7 @@ describe("architect review regressions", () => {
     const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
     expect(row?.status).toBe("active");
     expect(results((await rest(`/v1/search?q=${marker}`, sharedWriter)).json).some((item) => item.path === path)).toBe(true);
-    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
     expect((await testEnv().VAULT.list({ prefix: "sys/quarantine/" })).objects).toEqual([]);
     expect(await testEnv().VAULT.head("vault/inbox/quarantine.md")).toBeNull();
     expect((await rest("/v1/admin/quarantine", ADMIN)).status).toBe(404);

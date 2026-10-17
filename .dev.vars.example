@@ -1,5 +1,11 @@
 TOKEN_PEPPER=replace-with-a-long-random-string
 ADMIN_TOKEN_HASH=replace-with-the-sha256-hex-from-pnpm-hash-token
+AUDIT_KEY=replace-with-another-long-random-string
 JOURNAL_MAC_KEY=replace-with-a-different-long-random-string
 RATE_LIMIT_WRITES_PER_MIN=60
 RATE_LIMIT_READS_PER_MIN=300
+# IANA zone for journal day files and headings. The code default is UTC. Staging uses America/New_York.
+VAULT_TZ=UTC
+# Domain classes. A domain in neither list is refused on write and read as sensitive.
+SENSITIVE_DOMAINS=health,finance
+ORDINARY_DOMAINS=deals,x

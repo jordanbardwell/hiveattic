@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
+import { domainOf } from "./access";
+import { frontmatterRoute } from "./classify";
+import { configure, FILE_LIMIT_BYTES, isOrdinaryDomain, isProductionDeploy, RESTRICTED, stagingResources, utf8Length, vaultTimeZone, writeTimeoutMs } from "./config";
 import { hash8, hmacSha256Hex, sha256Hex, ulid } from "./crypto";
-import { failure, VaultError, type ApiResult, type JsonValue } from "./errors";
+import { asVaultError, ERROR_STATUS, failure, VaultError, type ApiResult, type JsonValue } from "./errors";
 import { logEvent } from "./log";
 import {
   buildMarkdown,
@@ -14,9 +17,21 @@ import {
   type Frontmatter,
   type JournalEntry,
 } from "./markdown";
-import { domainOf, SENSITIVE_DOMAINS } from "./access";
-import { stagingResources } from "./query";
-import { isAppendOnlyPath, isFactPath, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
+import {
+  factPath,
+  inSensitiveFolder,
+  isAppendOnlyPath,
+  isFactPath,
+  isServerDocument,
+  journalPath,
+  ownerForPath,
+  r2KeyFor,
+  reroutedPath,
+  sensitiveJournalPath,
+  sensitiveSegment,
+  vaultPathFromKey,
+} from "./paths";
+import { emptyRows, jsonInsert, jsonSelect, jsonSlices, slices, type StagedRows } from "./stage";
 import { etStamp, versionStamp, within24h } from "./time";
 
 export type Actor = {
@@ -27,10 +42,14 @@ export type Actor = {
   ipCountry: string | null;
 };
 
+// What the caller may write in sensitive folders. The service fills it from the token's scopes.
+export type Grants = { admin: boolean; sensitive: string[] };
+
 export type WriterOp =
   | {
       kind: "fact";
       actor: Actor;
+      grants: Grants;
       key: string;
       statement: string;
       scope: "own" | "shared";
@@ -40,7 +59,7 @@ export type WriterOp =
       tags: string[];
       links: string[];
       idempotencyKey: string | null;
-      sensitivity: "normal" | "sensitive";
+      reroute: string | null;
     }
   | {
       kind: "journal";
@@ -52,11 +71,12 @@ export type WriterOp =
       tags: string[];
       idempotencyKey: string | null;
       domain: string | null;
-      sensitivity: "normal" | "sensitive";
+      reroute: string | null;
     }
   | {
       kind: "note";
       actor: Actor;
+      grants: Grants;
       path: string;
       body: string;
       extra: Frontmatter;
@@ -64,8 +84,10 @@ export type WriterOp =
       sensitivity: "normal" | "sensitive";
       domain: string | null;
       noteType: string;
+      idempotencyKey: string | null;
+      reroute: string | null;
     }
-  | { kind: "forget"; actor: Actor; path?: string; id?: string; reason: string }
+  | { kind: "forget"; actor: Actor; path?: string; id?: string; reason: string; idempotencyKey: string | null }
   | { kind: "restore"; actor: Actor; path?: string; id?: string; versionTs: string }
   | { kind: "purge"; actor: Actor; path?: string; id?: string }
   | { kind: "bootstrap"; actor: Actor; files: { path: string; markdown: string }[] }
@@ -77,10 +99,11 @@ export type WriterOp =
       eTag?: string | null;
       copySource?: { bucket?: string; object?: string } | string | null;
     }
-  | { kind: "rebuild"; actor: Actor }
-  | { kind: "reconcile" }
   | { kind: "replay" }
   | { kind: "cleanup"; actor: Actor; runId: string };
+
+export type JobKind = "rebuild" | "reindex" | "reconcile" | "quarantine-erase";
+export type JobRequest = { kind: JobKind; actor: Actor; dryRun?: boolean; confirmCount?: number | null; source?: "api" | "cron" };
 
 type NoteRow = {
   id: string;
@@ -105,27 +128,86 @@ type NoteRow = {
   last_writer: string;
 };
 
-// Ordinary writes answer within 25 seconds. A rebuild or reconcile walks the whole bucket, so it gets longer.
-const WRITE_TIMEOUT_MS = 25_000;
-const MAINTENANCE_TIMEOUT_MS = 120_000;
+type JobStatus = "queued" | "running" | "done" | "failed";
+
+type Job = {
+  id: string;
+  kind: JobKind;
+  status: JobStatus;
+  phase: string;
+  cursor: string | null;
+  gen: number;
+  dry_run: boolean;
+  started_ms: number;
+  counts: Record<string, number>;
+  errors: string[];
+  error: string | null;
+  pages: number;
+  attempts: number;
+  actor: Actor;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  report: { note_ids: string[]; paths: string[] };
+};
+
+type SaveInput = {
+  id: string;
+  path: string;
+  markdown: string;
+  type: string;
+  owner: string;
+  domain: string | null;
+  sensitivity: "normal" | "sensitive";
+  factKey: string | null;
+  title: string;
+  statementHash: string | null;
+  observedAt: string | null;
+  actor: Actor;
+  ifMatch: string | null;
+  create: boolean;
+  reason: string;
+  action: string;
+  journal: { id: string; title: string; at: string; idempotencyKey: string | null } | null;
+  remember?: { key: string; status: number; data: (etag: string) => { [key: string]: JsonValue } } | null;
+  allowRetry?: boolean;
+  skipPut?: boolean;
+  storedEtag?: string | null;
+  detail?: string | null;
+  createdAt?: string | null;
+};
+
+// Ordinary writes answer within WRITE_TIMEOUT_MS (25 s). A write still running then answers 202
+// with its operation id, keeps running, and stores its result for GET /v1/operations/:id.
+const OPERATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const R2_READ_CONCURRENCY = 8;
-// D1 caps a bound value at 2 MB. Staged rows are sent as JSON arrays split well below that.
-const STAGE_JSON_BYTES = 900_000;
+// One job page handles at most this many R2 objects, about this much wall time, and about this
+// many bytes of file text. The writer lock is held for one page, then released.
+const PAGE_OBJECTS = 100;
+const PAGE_BUDGET_MS = 10_000;
+const PAGE_BYTES = 16_000_000;
+const HISTORY_READS_PER_PAGE = 100;
+const LINK_ROWS_PER_PAGE = 500;
+const MAX_JOB_ATTEMPTS = 3;
 const NOTE_COLUMNS = [
   "id", "path", "type", "owner", "domain", "sensitivity", "fact_key", "title", "body", "frontmatter", "content_hash", "statement_hash",
-  "r2_etag", "r2_key", "status", "observed_at", "created_at", "updated_at", "version_ts", "last_writer",
+  "r2_etag", "r2_key", "status", "observed_at", "created_at", "updated_at", "version_ts", "last_writer", "index_gen",
 ];
+const NOTE_UPDATE_COLUMNS = NOTE_COLUMNS.filter((column) => column !== "id" && column !== "created_at");
 const CHUNK_COLUMNS = ["id", "note_id", "n", "text", "title", "path", "token_count"];
-const JOURNAL_STAGE_COLUMNS = ["id", "note_id", "agent_id", "at", "title", "block_ref", "idempotency_key", "path"];
+const JOURNAL_COLUMNS = ["id", "note_id", "agent_id", "at", "title", "block_ref", "idempotency_key"];
 const VERSION_COLUMNS = ["note_id", "version_ts", "r2_key", "content_hash", "writer", "reason"];
+const API_OPS = new Set(["fact", "journal", "note", "forget", "restore", "purge", "bootstrap", "cleanup"]);
 
 export class VaultWriter extends DurableObject<Env> {
   private tail: Promise<unknown> = Promise.resolve();
+  private inflight = new Map<string, Promise<ApiResult>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      ctx.storage.sql.exec(
+      const sql = ctx.storage.sql;
+      sql.exec(
         `CREATE TABLE IF NOT EXISTS write_intents (
           op_id TEXT PRIMARY KEY,
           path TEXT NOT NULL,
@@ -134,42 +216,215 @@ export class VaultWriter extends DurableObject<Env> {
           created_at TEXT NOT NULL
         )`,
       );
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS operations (
+          op_id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          idem_key TEXT,
+          kind TEXT NOT NULL,
+          status TEXT NOT NULL,
+          result TEXT,
+          created_at INTEGER NOT NULL,
+          finished_at INTEGER
+        )`,
+      );
+      sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS operations_idem ON operations(agent_id, idem_key) WHERE idem_key IS NOT NULL");
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          status TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )`,
+      );
+      sql.exec("CREATE TABLE IF NOT EXISTS writer_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      // An operation that was running when the object went away has no promise to wait on. A retry
+      // with its idempotency key runs it again, and the write's own replay check prevents a duplicate.
+      configure(env);
       await this.replayIntents();
       const alarm = await ctx.storage.getAlarm();
-      if (alarm === null) await ctx.storage.setAlarm(Date.now() + 60_000);
+      if (this.activeJob()) await ctx.storage.setAlarm(Date.now());
+      else if (alarm === null) await ctx.storage.setAlarm(Date.now() + 60_000);
     });
   }
 
-  async alarm(): Promise<void> {
-    const run = this.tail.then(() => this.replayIntents(), () => this.replayIntents());
-    this.tail = run.then(() => undefined, () => undefined);
-    await run;
-    await this.ctx.storage.setAlarm(Date.now() + 60_000);
+  // RPC: ordinary writes and admin actions. API writes get an operation id and the caller-facing timeout.
+  async perform(op: WriterOp, operationId?: string): Promise<ApiResult> {
+    try {
+      configure(this.env);
+    } catch (err) {
+      return failure(asVaultError(err));
+    }
+    if (!API_OPS.has(op.kind)) return this.serialize(() => this.dispatch(op));
+    const actor = (op as { actor: Actor }).actor;
+    const key = idempotencyKeyOf(op);
+    if (key) {
+      const row = this.ctx.storage.sql
+        .exec<{ op_id: string; status: string; result: string | null }>(
+          "SELECT op_id, status, result FROM operations WHERE agent_id = ? AND idem_key = ? AND created_at > ?",
+          actor.agentId,
+          key,
+          Date.now() - OPERATION_TTL_MS,
+        )
+        .toArray()[0];
+      if (row) {
+        if (row.status === "done" && row.result) {
+          const stored = JSON.parse(row.result) as ApiResult;
+          if (stored.ok) return stored;
+        }
+        const running = this.inflight.get(row.op_id);
+        if (row.status === "pending" && running) return this.withTimeout(row.op_id, running);
+        return this.launch(row.op_id, op, actor.agentId, key);
+      }
+    }
+    return this.launch(operationId ?? ulid(), op, actor.agentId, key);
+  }
+
+  // RPC: a result stored for a write that answered 202. Only the writing agent or the admin token can read it.
+  async getOperation(id: string, agentId: string, admin: boolean): Promise<ApiResult> {
+    const row = this.ctx.storage.sql
+      .exec<{ op_id: string; agent_id: string; status: string; result: string | null; kind: string }>(
+        "SELECT op_id, agent_id, status, result, kind FROM operations WHERE op_id = ? AND created_at > ?",
+        id,
+        Date.now() - OPERATION_TTL_MS,
+      )
+      .toArray()[0];
+    if (!row || (!admin && row.agent_id !== agentId)) return failure(new VaultError("not_found", "Operation not found"));
+    if (row.status !== "done" || !row.result) return { ok: true, data: { operation_id: row.op_id, kind: row.kind, status: "pending" } };
+    const stored = JSON.parse(row.result) as ApiResult;
+    if (stored.ok) {
+      return { ok: true, data: { operation_id: row.op_id, kind: row.kind, status: "done", http_status: stored.status ?? 200, result: stored.data, error: null } };
+    }
+    return {
+      ok: true,
+      data: { operation_id: row.op_id, kind: row.kind, status: "done", http_status: ERROR_STATUS[stored.error.code] ?? 400, result: null, error: stored.error as JsonValue },
+    };
   }
 
   async replayPending(): Promise<{ replayed: number; dropped: number }> {
-    const run = this.tail.then(() => this.replayIntents(), () => this.replayIntents());
-    this.tail = run.then(() => undefined, () => undefined);
+    return this.serialize(() => this.replayIntents());
+  }
+
+  // RPC: start a paged job. One job runs at a time. The alarm drives it one page per lock hold.
+  async startJob(request: JobRequest): Promise<ApiResult> {
+    configure(this.env);
+    const refuse = async (error: VaultError): Promise<ApiResult> => {
+      if (request.source === "cron") {
+        await this.audit(request.actor, `${jobAuditName(request.kind)}_skipped`, null, null, "skipped", [error.code], null, 0, JSON.stringify({ source: "cron", ...error.extra }));
+      }
+      return failure(error);
+    };
+    const running = this.activeJob();
+    if (running) return refuse(jobRunning(running.id));
+    const kind = request.kind;
+    // Until the quarantine migration has run, nothing that rebuilds rows from R2 may start while
+    // quarantine records exist, so a quarantined note can never come back as active.
+    if ((kind === "rebuild" || kind === "reindex" || kind === "reconcile") && !this.retiredAt() && (await this.quarantineRecordsExist())) {
+      return refuse(new VaultError("migration_required", "Quarantine records exist. Run POST /v1/admin/migrations/quarantine-erase first.", ["quarantine_erase"]));
+    }
+    const dryRun = kind === "quarantine-erase" ? request.dryRun === true : false;
+    if (kind === "quarantine-erase" && !dryRun && isProductionDeploy(this.env)) {
+      const count = await this.quarantineCount();
+      if (request.confirmCount !== count) {
+        return failure(new VaultError("count_mismatch", "confirm_count does not match the current quarantine count. Run a dry run and confirm its total.", [`current_count:${count}`]));
+      }
+    }
+    const again = this.activeJob();
+    if (again) return failure(jobRunning(again.id));
+    const now = new Date();
+    const job: Job = {
+      id: ulid(),
+      kind,
+      status: "queued",
+      phase: "start",
+      cursor: null,
+      gen: 0,
+      dry_run: dryRun,
+      started_ms: Date.now(),
+      counts: {},
+      errors: [],
+      error: null,
+      pages: 0,
+      attempts: 0,
+      actor: request.actor,
+      created_at: now.toISOString(),
+      started_at: null,
+      finished_at: null,
+      report: { note_ids: [], paths: [] },
+    };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO jobs (id, kind, status, body, created_at) VALUES (?, ?, ?, ?, ?)",
+      job.id,
+      job.kind,
+      job.status,
+      JSON.stringify(job),
+      now.getTime(),
+    );
+    await this.audit(job.actor, `${jobAuditName(kind)}_started`, null, null, "ok", [], null, 0, JSON.stringify({ job_id: job.id, kind, dry_run: dryRun, source: request.source ?? "api" }));
+    await this.ctx.storage.setAlarm(Date.now());
+    return { ok: true, status: 202, data: { job_id: job.id, kind, status: "queued" } };
+  }
+
+  async getJob(id: string): Promise<ApiResult> {
+    const job = this.loadJob(id);
+    if (!job) return failure(new VaultError("not_found", "Job not found"));
+    return { ok: true, data: jobView(job) };
+  }
+
+  // The admin-only report of a job: the note ids and paths it matched. GET /v1/admin/jobs/:id omits them.
+  async jobReport(id: string): Promise<ApiResult> {
+    const job = this.loadJob(id);
+    if (!job) return failure(new VaultError("not_found", "Job not found"));
+    return { ok: true, data: { job_id: job.id, kind: job.kind, status: job.status, note_ids: job.report.note_ids, paths: job.report.paths } };
+  }
+
+  async alarm(): Promise<void> {
+    configure(this.env);
+    await this.serialize(() => this.replayIntents());
+    this.ctx.storage.sql.exec("DELETE FROM operations WHERE created_at < ?", Date.now() - OPERATION_TTL_MS);
+    const job = this.activeJob();
+    if (job) await this.serialize(() => this.jobStep(job.id));
+    const next = this.activeJob();
+    await this.ctx.storage.setAlarm(next ? Date.now() + next.attempts * 1000 : Date.now() + 60_000);
+  }
+
+  private serialize<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(work, work);
+    this.tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
     return run;
   }
 
-  async perform(op: WriterOp): Promise<ApiResult> {
-    const run = this.tail.then(() => this.dispatch(op), () => this.dispatch(op));
-    this.tail = run.then(() => undefined, () => undefined);
-    const maintenance = op.kind === "rebuild" || op.kind === "reconcile";
-    const message = op.kind === "rebuild" ? "Rebuild is still running. The reindex audit row records the outcome." : "Write timed out";
+  private launch(opId: string, op: WriterOp, agentId: string, key: string | null): Promise<ApiResult> {
+    if (key) this.ctx.storage.sql.exec("DELETE FROM operations WHERE agent_id = ? AND idem_key = ? AND op_id != ?", agentId, key, opId);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO operations (op_id, agent_id, idem_key, kind, status, result, created_at, finished_at) VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL)
+       ON CONFLICT(op_id) DO UPDATE SET status = 'pending', result = NULL, finished_at = NULL`,
+      opId,
+      agentId,
+      key,
+      op.kind,
+      Date.now(),
+    );
+    const run = this.serialize(() => this.dispatch(op));
+    this.inflight.set(opId, run);
+    void run.then((result) => {
+      this.inflight.delete(opId);
+      this.ctx.storage.sql.exec("UPDATE operations SET status = 'done', result = ?, finished_at = ? WHERE op_id = ?", JSON.stringify(result), Date.now(), opId);
+    });
+    return this.withTimeout(opId, run);
+  }
+
+  private withTimeout(opId: string, run: Promise<ApiResult>): Promise<ApiResult> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(failure(new VaultError("invalid", message))), maintenance ? MAINTENANCE_TIMEOUT_MS : WRITE_TIMEOUT_MS);
-      run.then(
-        (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        () => {
-          clearTimeout(timer);
-          resolve(failure(new VaultError("invalid", "Write failed")));
-        },
-      );
+      const timer = setTimeout(() => resolve({ ok: true, status: 202, data: { pending: true, operation_id: opId } }), writeTimeoutMs(this.env));
+      void run.then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      });
     });
   }
 
@@ -196,15 +451,11 @@ export class VaultWriter extends DurableObject<Env> {
       case "restore":
         return this.restore(op);
       case "purge":
-        return this.purge(op.id, op.path, op.actor, true);
+        return this.purge(op.id, op.path, op.actor, true, "purge");
       case "bootstrap":
         return this.bootstrap(op);
       case "external":
         return this.external(op);
-      case "rebuild":
-        return this.rebuild(op.actor);
-      case "reconcile":
-        return this.reconcile();
       case "replay":
         return this.replayIntents().then((data) => ({ ok: true as const, data }));
       case "cleanup":
@@ -216,109 +467,95 @@ export class VaultWriter extends DurableObject<Env> {
 
   private async fact(op: Extract<WriterOp, { kind: "fact" }>): Promise<ApiResult> {
     const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
-    if (replay) return { ok: true, data: replay };
+    if (replay) return replay;
     const owner = op.scope === "shared" ? "shared" : op.actor.agentId;
-    const path = op.scope === "shared" ? `profile/facts/${op.key}.md` : `bots/${op.actor.agentId}/facts/${op.key}.md`;
-    const existing = await this.noteByOwnerKey(owner, op.key);
+    const basePath = factPath(op.actor.agentId, op.scope, op.key);
+    const active = await this.noteByOwnerKey(owner, op.key);
+    const activeSegment = active ? sensitiveSegment(active.path) : null;
+    let route = op.reroute;
+    if (activeSegment) {
+      // A fact that already lives in a sensitive folder stays there, and updating it needs write access to that folder.
+      if (!grantsAllow(op.grants, activeSegment)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
+      route = activeSegment;
+    }
+    const path = active && (activeSegment || !route) ? active.path : route ? reroutedPath(route, basePath) : basePath;
+    // A neutral active fact that receives sensitive text moves: the shared path is tombstoned and the
+    // fact continues under a new id in the sensitive folder.
+    const moving = Boolean(route && active && !activeSegment);
+    const existing = moving ? await this.noteByPath(path) : active;
+    if (moving && existing && existing.status !== "active" && existing.status !== "superseded") {
+      throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
+    }
+    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
+    const sensitivity = route ? "sensitive" : "normal";
+    const rerouted = rerouteFields(route);
+    const status = route ? 201 : 200;
     const statementHash = await sha256Hex(normalizeStatement(op.statement));
-    if (existing && existing.statement_hash === statementHash && existing.status === "active") {
-      await this.env.DB.prepare("UPDATE notes SET last_confirmed_at = ? WHERE id = ?").bind(new Date().toISOString(), existing.id).run();
-      const data = { id: existing.id, path: existing.path, outcome: "deduped", etag: existing.r2_etag };
-      await this.remember(op.actor.agentId, op.idempotencyKey, data);
-      return { ok: true, data };
+    if (active && !moving && active.statement_hash === statementHash) {
+      await this.env.DB.prepare("UPDATE notes SET last_confirmed_at = ? WHERE id = ?").bind(new Date().toISOString(), active.id).run();
+      const data = { id: active.id, path: active.path, outcome: "deduped", etag: active.r2_etag, ...rerouted };
+      await this.remember(op.actor.agentId, op.idempotencyKey, data, status);
+      return withStatus(data, status);
     }
     // Tie-break is (observed_at, server written_at). Equal observed_at lets the incoming write win:
     // the Durable Object serializes writes, so this call is the later server write.
-    const incomingNewer = !existing?.observed_at || Date.parse(op.observedAt) >= Date.parse(existing.observed_at);
-    const crossBot = Boolean(existing && existing.last_writer !== op.actor.agentId);
-    const conflict = Boolean(existing && crossBot && within24h(existing.observed_at, op.observedAt) && existing.statement_hash !== statementHash);
-    const id = existing?.id ?? ulid();
-    const markdown = this.factMarkdown({
-      id,
-      path,
-      owner,
-      key: op.key,
-      statement: op.statement,
-      domain: op.domain,
-      sensitivity: op.sensitivity,
-      observedAt: op.observedAt,
-      confidence: op.confidence,
-      tags: op.tags,
-      links: op.links,
-      source: op.actor.agentId,
-      idempotencyKey: op.idempotencyKey,
-      status: "active",
-      supersedes: null,
-    });
-    if (existing && !incomingNewer) {
-      const loserTs = await this.snapshotBytes(existing, markdown, op.actor.agentId, "superseded");
-      if (conflict) await this.flagConflict(op.key, existing.id, loserTs, op.actor, op.observedAt, existing.observed_at);
-      const data = {
-        id: existing.id,
-        path: existing.path,
-        outcome: conflict ? "conflict_flagged" : "superseded_older",
-        etag: existing.r2_etag,
-      };
-      await this.remember(op.actor.agentId, op.idempotencyKey, data);
-      await this.audit(op.actor, "write_fact", existing.path, existing.id, "ok", [], await sha256Hex(markdown), markdown.length);
-      return { ok: true, data };
+    const incomingNewer = !active?.observed_at || Date.parse(op.observedAt) >= Date.parse(active.observed_at);
+    const crossBot = Boolean(active && active.last_writer !== op.actor.agentId);
+    const conflict = Boolean(active && crossBot && within24h(active.observed_at, op.observedAt) && active.statement_hash !== statementHash);
+    const facts = { key: op.key, owner, statement: op.statement, domain, sensitivity, observedAt: op.observedAt, confidence: op.confidence, tags: op.tags, links: op.links, source: op.actor.agentId, idempotencyKey: op.idempotencyKey };
+    if (moving && !incomingNewer) {
+      // The newer neutral fact stays active. The older sensitive observation is kept in the sensitive
+      // folder as superseded, never in the neutral fact's history.
+      const id = existing?.id ?? ulid();
+      const markdown = this.factMarkdown({ ...facts, id, status: "superseded", supersedes: null });
+      const saved = await this.saveMarkdown({
+        ...factSave(id, path, markdown, facts, statementHash, op.actor),
+        ifMatch: existing?.r2_etag ?? null,
+        create: !existing,
+        reason: existing ? "updated" : "created",
+        action: "reroute",
+        detail: rerouteDetail(basePath, route!),
+        remember: rememberFor(op.idempotencyKey, 201, (etag) => ({ id, path, outcome: "superseded_older", etag, ...rerouted })),
+      });
+      if (!saved.ok) return saved;
+      return withStatus({ id, path, outcome: "superseded_older", etag: saved.data.etag, ...rerouted }, 201);
     }
-    const supersedes = existing?.version_ts ?? null;
-    const markdownWithLink = existing
-      ? this.factMarkdown({
-          id,
-          path,
-          owner,
-          key: op.key,
-          statement: op.statement,
-          domain: op.domain,
-          sensitivity: op.sensitivity,
-          observedAt: op.observedAt,
-          confidence: op.confidence,
-          tags: op.tags,
-          links: op.links,
-          source: op.actor.agentId,
-          idempotencyKey: op.idempotencyKey,
-          status: "active",
-          supersedes,
-        })
-      : markdown;
+    if (active && !moving && !incomingNewer) {
+      const loser = this.factMarkdown({ ...facts, id: active.id, status: "active", supersedes: null });
+      const loserTs = await this.snapshotBytes(active, loser, op.actor.agentId, "superseded");
+      if (conflict) await this.flagConflict(op.key, active.id, loserTs, op.actor, op.observedAt, active.observed_at);
+      const data = { id: active.id, path: active.path, outcome: conflict ? "conflict_flagged" : "superseded_older", etag: active.r2_etag, ...rerouted };
+      await this.remember(op.actor.agentId, op.idempotencyKey, data, status);
+      await this.audit(op.actor, "write_fact", active.path, active.id, "ok", [], await this.auditHash(loser), utf8Length(loser));
+      return withStatus(data, status);
+    }
+    const id = existing?.id ?? ulid();
+    const markdown = this.factMarkdown({ ...facts, id, status: "active", supersedes: existing?.version_ts ?? null });
+    const outcome = conflict ? "conflict_flagged" : moving ? "moved" : existing ? "updated" : "created";
+    // A moving fact is saved without its key, the old fact is retired, and then the new one takes
+    // the key, so the unique (owner, fact_key) index never sees two active rows.
     const saved = await this.saveMarkdown({
-      id,
-      path,
-      markdown: markdownWithLink,
-      type: "fact",
-      owner,
-      domain: op.domain,
-      sensitivity: op.sensitivity,
-      factKey: op.key,
-      title: op.key,
-      statementHash,
-      observedAt: op.observedAt,
-      actor: op.actor,
+      ...factSave(id, path, markdown, facts, statementHash, op.actor),
+      factKey: moving ? null : op.key,
       ifMatch: existing?.r2_etag ?? null,
       create: !existing,
       reason: existing ? "updated" : "created",
-      action: "write_fact",
-      idempotencyKey: op.idempotencyKey,
-      journal: null,
+      action: route ? "reroute" : "write_fact",
+      detail: route ? rerouteDetail(basePath, route) : null,
+      remember: rememberFor(op.idempotencyKey, status, (etag) => ({ id, path, outcome, etag, ...rerouted })),
     });
     if (!saved.ok) return saved;
-    if (conflict && existing) await this.flagConflict(op.key, id, existing.version_ts ?? existing.id, op.actor, op.observedAt, existing.observed_at);
+    if (moving && active) {
+      await this.retireMoved(active, path, op.actor, true);
+      await this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id).run();
+    }
+    if (conflict && active) await this.flagConflict(op.key, id, active.version_ts ?? active.id, op.actor, op.observedAt, active.observed_at);
     if (op.scope === "shared") await this.refreshSummary(op.actor);
-    const data = {
-      id,
-      path,
-      outcome: conflict ? "conflict_flagged" : existing ? "updated" : "created",
-      etag: saved.data.etag,
-    };
-    await this.remember(op.actor.agentId, op.idempotencyKey, data);
-    return { ok: true, data };
+    return withStatus({ id, path, outcome, etag: saved.data.etag, ...rerouted }, status);
   }
 
   private factMarkdown(input: {
     id: string;
-    path: string;
     owner: string;
     key: string;
     statement: string;
@@ -359,13 +596,20 @@ export class VaultWriter extends DurableObject<Env> {
 
   private async journal(op: Extract<WriterOp, { kind: "journal" }>): Promise<ApiResult> {
     const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
-    if (replay) return { ok: true, data: replay };
-    const stamp = etStamp(op.at, this.env.TZ_DISPLAY || "UTC");
-    const sensitive = op.sensitivity === "sensitive";
-    if (sensitive && op.target !== "own") {
-      throw new VaultError("invalid", "A sensitive journal entry stays in your own journal. Shared day files stay normal.");
-    }
-    const path = journalPath(op.actor.agentId, op.target, stamp.date, sensitive && op.target === "own");
+    if (replay) return replay;
+    const stamp = etStamp(op.at, vaultTimeZone(this.env));
+    const route = op.reroute;
+    // A rerouted entry goes to the writer's day file in the sensitive folder. The requested day
+    // file gets no entry and no placeholder.
+    const requested = journalPath(op.actor.agentId, op.target, stamp.date);
+    const path = route ? sensitiveJournalPath(route, op.actor.agentId, stamp.date) : requested;
+    const decisions = !route && op.target === "decisions";
+    const type = decisions ? "decision" : "journal";
+    const owner = route || op.target === "own" ? op.actor.agentId : "shared";
+    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
+    const sensitivity = route ? "sensitive" : "normal";
+    const rerouted = rerouteFields(route);
+    const status = route ? 201 : 200;
     const entryId = ulid();
     const body = guardJournalBody(op.body).trim();
     const mac = await journalMac(this.env, entryId, op.actor.agentId, op.title, body);
@@ -391,15 +635,16 @@ export class VaultWriter extends DurableObject<Env> {
         : buildMarkdown(
             {
               vault_id: ulid(),
-              type: op.target === "decisions" ? "decision" : "journal",
-              owner: op.target === "own" ? op.actor.agentId : "shared",
+              type,
+              owner,
               status: "active",
               source: op.actor.agentId,
+              created_at: stamp.iso,
               updated_at: stamp.iso,
-              sensitivity: sensitive ? "sensitive" : "normal",
-              domain: op.domain,
+              sensitivity,
+              domain,
             },
-            `${op.target === "decisions" ? "# Decisions\n\n" : `# ${stamp.date}\n\n`}${entry}\n`,
+            `${decisions ? "# Decisions\n\n" : `# ${stamp.date}\n\n`}${entry}\n`,
           );
       if (current && !markdown.startsWith(previous)) throw new VaultError("invalid", "Journal append would rewrite earlier entries");
       const id = current?.id ?? stringField(parseMarkdown(markdown).frontmatter.vault_id) ?? ulid();
@@ -407,28 +652,25 @@ export class VaultWriter extends DurableObject<Env> {
         id,
         path,
         markdown,
-        type: op.target === "decisions" ? "decision" : "journal",
-        owner: op.target === "own" ? op.actor.agentId : "shared",
-        domain: op.domain,
-        sensitivity: sensitive ? "sensitive" : "normal",
+        type,
+        owner,
+        domain,
+        sensitivity,
         factKey: null,
-        title: current?.title ?? (op.target === "decisions" ? "Decisions" : stamp.date),
+        title: current?.title ?? (decisions ? "Decisions" : stamp.date),
         statementHash: null,
         observedAt: stamp.iso,
         actor: op.actor,
         ifMatch: current?.r2_etag ?? null,
         create: !current,
         reason: current ? "appended" : "created",
-        action: "append_journal",
-        idempotencyKey: null,
+        action: route ? "journal_reroute" : "append_journal",
+        detail: route ? rerouteDetail(requested, route) : null,
         journal: { id: entryId, title: op.title, at: stamp.iso, idempotencyKey: op.idempotencyKey },
+        remember: rememberFor(op.idempotencyKey, status, (etag) => ({ entry_id: entryId, path, block_ref: `^${entryId}`, etag, ...rerouted })),
         allowRetry: true,
       });
-      if (saved.ok) {
-        const data = { entry_id: entryId, path, block_ref: `^${entryId}`, etag: saved.data.etag };
-        await this.remember(op.actor.agentId, op.idempotencyKey, data);
-        return { ok: true, data };
-      }
+      if (saved.ok) return withStatus({ entry_id: entryId, path, block_ref: `^${entryId}`, etag: saved.data.etag, ...rerouted }, status);
       if (saved.error.code !== "conflict_etag" || attempt === 3) return saved;
     }
     return failure(new VaultError("conflict_etag", "Journal changed while appending"));
@@ -438,68 +680,95 @@ export class VaultWriter extends DurableObject<Env> {
     if (isAppendOnlyPath(op.path) || isFactPath(op.path) || op.path === "profile/summary.md") {
       throw new VaultError("invalid", "That path is append-only or server-managed");
     }
-    const existing = await this.noteByPath(op.path);
+    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    if (replay) return replay;
+    const route = op.reroute;
+    const path = route ? reroutedPath(route, op.path) : op.path;
+    const original = route ? await this.noteByPath(op.path) : null;
+    const existing = await this.noteByPath(path);
+    if (original && original.status !== "active") {
+      throw new VaultError("conflict_etag", `Cannot write to a ${original.status} note`, [original.status]);
+    }
     if (existing && existing.status !== "active") {
       throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
     }
-    if (existing && normalizeEtag(op.ifMatch) !== normalizeEtag(existing.r2_etag)) {
-      throw new VaultError("conflict_etag", existing ? "if_match does not match the current etag" : "if_match does not match");
+    const moving = Boolean(route && original);
+    if (moving) {
+      // An update that adds sensitive text moves the note. The caller's if_match is for the note it named.
+      if (normalizeEtag(op.ifMatch) !== normalizeEtag(original!.r2_etag)) throw new VaultError("conflict_etag", "if_match does not match the current etag");
+      if (existing) throw new VaultError("conflict_etag", "if_match does not match the current etag");
+    } else if (existing) {
+      // Updating a note that was rerouted needs write access to its sensitive folder.
+      if (route && !grantsAllow(op.grants, route)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
+      if (normalizeEtag(op.ifMatch) !== normalizeEtag(existing.r2_etag)) throw new VaultError("conflict_etag", "if_match does not match the current etag");
     }
     const id = existing?.id ?? ulid();
     const now = new Date().toISOString();
+    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
+    const sensitivity = route ? "sensitive" : op.sensitivity;
+    const createdAt = existing ? (stringField(parseFrontmatter(existing.frontmatter).created_at) ?? existing.created_at) : now;
     const markdown = buildMarkdown(
       {
         ...stripReserved(op.extra),
         vault_id: id,
         type: op.noteType,
-        owner: ownerForPath(op.path),
-        domain: op.domain,
-        sensitivity: op.sensitivity,
+        owner: ownerForPath(path),
+        domain,
+        sensitivity,
         status: "active",
         source: op.actor.agentId,
+        created_at: createdAt,
         updated_at: now,
         tags: stringList(op.extra.tags),
         aliases: stringList(op.extra.aliases),
+        vault_idempotency: op.idempotencyKey,
       },
       op.body,
     );
+    const outcome = moving ? "moved" : existing ? "updated" : "created";
+    const rerouted = rerouteFields(route);
+    const status = route ? 201 : 200;
     const saved = await this.saveMarkdown({
       id,
-      path: op.path,
+      path,
       markdown,
       type: op.noteType,
-      owner: ownerForPath(op.path),
-      domain: op.domain,
-      sensitivity: op.sensitivity,
+      owner: ownerForPath(path),
+      domain,
+      sensitivity,
       factKey: null,
-      title: stringField(op.extra.title) ?? titleFromBody(op.body, op.path),
+      title: stringField(op.extra.title) ?? titleFromBody(op.body, path),
       statementHash: null,
       observedAt: stringField(op.extra.observed_at) ?? now,
       actor: op.actor,
       ifMatch: existing?.r2_etag ?? null,
       create: !existing,
       reason: existing ? "updated" : "created",
-      action: "write_note",
-      idempotencyKey: null,
+      action: route ? "reroute" : "write_note",
+      detail: route ? rerouteDetail(op.path, route) : null,
       journal: null,
+      createdAt,
+      remember: rememberFor(op.idempotencyKey, status, (etag) => ({ id, path, etag, outcome, ...rerouted })),
     });
     if (!saved.ok) return saved;
-    return { ok: true, data: { id, path: op.path, etag: saved.data.etag, outcome: existing ? "updated" : "created" } };
+    if (moving) await this.retireMoved(original!, path, op.actor, true);
+    return withStatus({ id, path, etag: saved.data.etag, outcome, ...rerouted }, status);
   }
 
   private async forget(op: Extract<WriterOp, { kind: "forget" }>): Promise<ApiResult> {
+    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    if (replay) return replay;
     const note = await this.resolveNote(op.id, op.path);
     if (!note) throw new VaultError("not_found", "Note not found");
     if (note.status === "forgotten") {
-      return { ok: true, data: { id: note.id, path: note.path, status: "forgotten" } };
+      const data = { id: note.id, path: note.path, status: "forgotten" };
+      await this.remember(op.actor.agentId, op.idempotencyKey, data, 200);
+      return { ok: true, data };
     }
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
-    const day = etStamp(now).date;
-    const stub = buildMarkdown(
-      { vault_id: note.id, type: note.type, owner: note.owner, status: "forgotten", sensitivity: note.sensitivity },
-      `Forgotten on ${day}: ${op.reason}`,
-    );
+    // The stub carries no caller text. The reason stays in the tombstone row, which only the admin reads.
+    const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
     await this.snapshotBytes(note, note.body, op.actor.agentId, "forgotten");
     const hash = await sha256Hex(stub);
     const intentId = ulid();
@@ -516,31 +785,28 @@ export class VaultWriter extends DurableObject<Env> {
       this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
       throw new VaultError("conflict_etag", "Note changed while forgetting");
     }
+    const data = { id: note.id, path: note.path, status: "forgotten" };
     await this.env.DB.batch([
       this.env.DB.prepare(
-        `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', r2_etag = ?, updated_at = ?, version_ts = ?, last_writer = ?
+        `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', r2_etag = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?
          WHERE id = ?`,
-      ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), hash, etag.etag, now, etag.versionTs, op.actor.agentId, note.id),
+      ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), hash, etag.etag, now, etag.versionTs, op.actor.agentId, this.gen(), note.id),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare(
-        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash, path) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(note_id) DO UPDATE SET at = excluded.at, reason = excluded.reason, content_hash = excluded.content_hash`,
-      ).bind(note.id, now, op.actor.agentId, op.reason, note.content_hash),
+      ).bind(note.id, now, op.actor.agentId, op.reason, (await this.auditHash(note.body)) ?? note.content_hash, note.path),
       this.env.DB.prepare(
         `INSERT INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, 'forgotten')`,
       ).bind(note.id, etag.versionTs, r2KeyFor(this.prefix(), note.path), hash, op.actor.agentId),
-      ...chunkIds.map((chunkId) =>
-        this.env.DB.prepare(
-          `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) VALUES (?, ?, ?)
-           ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
-        ).bind(chunkId, note.id, now),
-      ),
+      ...this.vectorDeletes(chunkIds, note.id, now),
+      ...this.rememberStatements(op.actor.agentId, op.idempotencyKey, data, 200),
     ]);
     this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
-    await this.audit(op.actor, "forget", note.path, note.id, "ok", [], hash, stub.length);
+    await this.audit(op.actor, "forget", note.path, note.id, "ok", [], await this.auditHash(stub), utf8Length(stub));
     await this.enqueue({ kind: "forget", note_id: note.id, chunk_ids: chunkIds });
-    return { ok: true, data: { id: note.id, path: note.path, status: "forgotten" } };
+    return { ok: true, data };
   }
 
   private async restore(op: Extract<WriterOp, { kind: "restore" }>): Promise<ApiResult> {
@@ -572,7 +838,6 @@ export class VaultWriter extends DurableObject<Env> {
       create: false,
       reason: "restore",
       action: "restore",
-      idempotencyKey: null,
       journal: null,
     });
     if (!saved.ok) return saved;
@@ -585,15 +850,15 @@ export class VaultWriter extends DurableObject<Env> {
       const key = r2KeyFor(this.prefix(), file.path);
       const existing = await this.env.VAULT.head(key);
       if (existing) continue;
-      await this.indexBytes({
-        path: file.path,
-        markdown: file.markdown,
-        etag: null,
-        actor: op.actor,
-        action: "bootstrap",
-        write: true,
-        reason: "created",
-      });
+      const id = ulid();
+      const current = parseMarkdown(file.markdown);
+      const markdown = buildMarkdown(
+        { ...current.frontmatter, vault_id: id, type: inferType(file.path), owner: ownerForPath(file.path), status: "active" },
+        current.body,
+      );
+      const put = await this.putVault(file.path, markdown, id, null);
+      if (!put) throw new VaultError("conflict_etag", "Bootstrap object already exists");
+      await this.indexBytes({ path: file.path, markdown, etag: put.etag, actor: op.actor, action: "bootstrap", reason: "created", metaId: id });
       created.push(file.path);
     }
     return { ok: true, data: { created } };
@@ -622,297 +887,147 @@ export class VaultWriter extends DurableObject<Env> {
     const objectEtag = normalizeEtag(object.etag);
     const metaId = object.customMetadata?.["vault-id"] ?? "";
     if (note && objectEtag && objectEtag === normalizeEtag(note.r2_etag) && metaId === note.id) {
+      await object.body?.cancel();
       return { ok: true, data: { skipped: true, reason: "unchanged" } };
     }
+    if (object.size > FILE_LIMIT_BYTES) {
+      await object.body?.cancel();
+      await this.audit(actor, "external_skipped", path, note?.id ?? null, "skipped", ["file_too_large"], null, object.size, detail);
+      return { ok: true, data: { skipped: true, reason: "file_too_large" } };
+    }
     const markdown = await object.text();
-    return this.indexBytes({
-      path,
-      markdown,
-      etag: objectEtag,
-      actor,
-      action: actionName,
-      write: false,
-      reason: "external-edit",
-      detail,
-    });
+    return this.indexBytes({ path, markdown, etag: objectEtag, actor, action: actionName, reason: "external-edit", detail, metaId: metaId || null });
   }
 
+  // An outside delete forgets the note like the API does: the D1 body becomes a stub, so no reader
+  // gets the old text back. The last indexed body is kept in history for the admin token.
   private async externalDelete(path: string, actor: Actor, detail: string): Promise<ApiResult> {
     const note = await this.noteByPath(path);
     if (!note) return { ok: true, data: { skipped: true, reason: "unknown_delete" } };
     if (note.status === "forgotten") return { ok: true, data: { id: note.id, path, status: "forgotten" } };
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
+    await this.snapshotBytes(note, note.body, actor.agentId, "external_delete");
+    const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
     await this.env.DB.batch([
-      this.env.DB.prepare("UPDATE notes SET status = 'forgotten', updated_at = ?, last_writer = ? WHERE id = ?").bind(now, actor.agentId, note.id),
+      this.env.DB.prepare(
+        `UPDATE notes SET status = 'forgotten', body = ?, frontmatter = ?, content_hash = ?, r2_etag = NULL, updated_at = ?, last_writer = ?, index_gen = ? WHERE id = ?`,
+      ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), now, actor.agentId, this.gen(), note.id),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
+      this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
       this.env.DB.prepare(
-        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash) VALUES (?, ?, ?, 'external_delete', ?)
+        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash, path) VALUES (?, ?, ?, 'external_delete', ?, ?)
          ON CONFLICT(note_id) DO UPDATE SET at = excluded.at, reason = excluded.reason`,
-      ).bind(note.id, now, actor.agentId, note.content_hash),
-      ...chunkIds.map((chunkId) =>
-        this.env.DB.prepare(
-          `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) VALUES (?, ?, ?)
-           ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
-        ).bind(chunkId, note.id, now),
-      ),
+      ).bind(note.id, now, actor.agentId, (await this.auditHash(note.body)) ?? note.content_hash, path),
+      ...this.vectorDeletes(chunkIds, note.id, now),
     ]);
-    await this.audit(actor, "external_delete", path, note.id, "ok", [], note.content_hash, 0, detail);
+    await this.audit(actor, "external_delete", path, note.id, "ok", [], await this.auditHash(note.body), 0, detail);
     return { ok: true, data: { id: note.id, path, status: "forgotten" } };
   }
 
-  // Audits reindex_started first, then one reindex row after the rebuild ends, ok or failed, with counts and duration.
-  private async rebuild(actor: Actor): Promise<ApiResult> {
-    const started = Date.now();
-    const progress: RebuildProgress = { phase: "stage", files: 0, notes: 0, versions: 0, tombstones: 0, history_reads: 0 };
-    await this.audit(actor, "reindex_started", null, null, "ok", [], null, 0);
-    try {
-      await this.rebuildIndex(actor.requestId, progress);
-    } catch (err) {
-      const code = err instanceof VaultError ? err.code : "error";
-      const detail = { ...progress, duration_ms: Date.now() - started, error: errorText(err) };
-      await this.audit(actor, "reindex", null, null, "failed", [code], null, 0, JSON.stringify(detail)).catch(() => undefined);
-      logEvent({ event: "reindex_failed", name: err instanceof Error ? err.name : "error", phase: progress.phase });
-      throw err;
-    }
-    const { phase: _phase, ...counts } = progress;
-    const data = { ...counts, imported: counts.files, duration_ms: Date.now() - started };
-    await this.audit(actor, "reindex", null, null, "ok", [], null, 0, JSON.stringify(data));
-    return { ok: true, data };
-  }
-
-  // Stages every vault file, then swaps the live tables and the history rows in one D1 batch, so a
-  // failure part way leaves the live index as it was. Rows go to D1 as JSON arrays, a few statements
-  // per megabyte, because one query per chunk or history file outran the request deadline on a
-  // vault of about 150 notes.
-  private async rebuildIndex(requestId: string, progress: RebuildProgress): Promise<void> {
-    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId, ipCountry: null };
-    const live = await this.liveNoteIds();
-    const known = await this.knownHistory();
-    await this.prepareStage();
-    const assigned = new Map<string, string>();
-    const factKeys = new Set<string>();
-    const tombstones: { id: string; hash: string }[] = [];
-    let rows = new StageRows();
-    let cursor: string | undefined;
-    do {
-      const page = await this.env.VAULT.list({ prefix: this.prefix(), cursor, limit: 1000 });
-      const keys = page.objects.map((object) => object.key).filter((key) => key.endsWith(".md") && vaultPathFromKey(this.prefix(), key));
-      for (const files of slices(keys, R2_READ_CONCURRENCY)) {
-        const loaded = await Promise.all(
-          files.map(async (key) => {
-            const file = await this.env.VAULT.get(key);
-            return file ? { key, text: await file.text(), etag: normalizeEtag(file.etag), metaId: file.customMetadata?.["vault-id"] ?? null } : null;
-          }),
-        );
-        for (const file of loaded) {
-          if (!file) continue;
-          const path = vaultPathFromKey(this.prefix(), file.key)!;
-          const staged = await this.stageFile(path, file.text, file.etag, file.metaId, actor, live, assigned, factKeys);
-          if (staged.tombstone) tombstones.push(staged.tombstone);
-          if (!rows.add(staged)) {
-            await this.flushStage(rows);
-            rows = new StageRows();
-            rows.add(staged);
-          }
-          progress.files += 1;
-        }
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    await this.flushStage(rows);
-    progress.phase = "history";
-    const versions = await this.stageHistory(assigned, known, progress);
-    progress.phase = "swap";
-    progress.tombstones = tombstones.length;
-    const now = new Date().toISOString();
-    await this.env.DB.batch([
-      this.env.DB.prepare("DELETE FROM links"),
-      this.env.DB.prepare("DELETE FROM journal_entries"),
-      this.env.DB.prepare("DELETE FROM note_versions"),
-      this.env.DB.prepare("DELETE FROM chunks"),
-      this.env.DB.prepare("DELETE FROM idempotency"),
-      this.env.DB.prepare("DELETE FROM notes"),
-      this.env.DB.prepare("INSERT INTO notes SELECT * FROM notes_stage"),
-      this.env.DB.prepare("INSERT INTO chunks SELECT * FROM chunks_stage"),
-      this.env.DB.prepare(
-        `INSERT OR IGNORE INTO journal_entries (id, note_id, agent_id, at, title, block_ref, idempotency_key)
-         SELECT id, note_id, agent_id, at, title, block_ref, idempotency_key FROM journal_stage`,
-      ),
-      this.env.DB.prepare(
-        `INSERT OR IGNORE INTO idempotency (agent_id, key, response, at)
-         SELECT agent_id, idempotency_key,
-           json_object('entry_id', id, 'block_ref', block_ref, 'path', path),
-           at
-         FROM journal_stage WHERE idempotency_key IS NOT NULL`,
-      ),
-      ...jsonSlices(tombstones.map((row) => [row.id, row.hash])).map((json) =>
-        this.env.DB.prepare(
-          `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash)
-           SELECT json_extract(value, '$[0]'), ?, 'rebuild', 'forgotten', json_extract(value, '$[1]') FROM json_each(?) WHERE 1
-           ON CONFLICT(note_id) DO NOTHING`,
-        ).bind(now, json),
-      ),
-      ...jsonSlices(versions).map((json) => this.env.DB.prepare(jsonInsert("INSERT OR IGNORE INTO note_versions", VERSION_COLUMNS)).bind(json)),
-      this.env.DB.prepare("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')"),
-    ]);
-    progress.versions = versions.length;
-    await this.env.DB.batch([
-      this.env.DB.prepare("DROP TABLE journal_stage"),
-      this.env.DB.prepare("DROP TABLE chunks_stage"),
-      this.env.DB.prepare("DROP TABLE notes_stage"),
-    ]);
-    const count = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>();
-    progress.phase = "done";
-    progress.notes = count?.n ?? 0;
-  }
-
-  private async prepareStage(): Promise<void> {
-    await this.env.DB.batch([
-      this.env.DB.prepare("DROP TABLE IF EXISTS journal_stage"),
-      this.env.DB.prepare("DROP TABLE IF EXISTS chunks_stage"),
-      this.env.DB.prepare("DROP TABLE IF EXISTS notes_stage"),
-      this.env.DB.prepare("CREATE TABLE notes_stage AS SELECT * FROM notes WHERE 0"),
-      this.env.DB.prepare("CREATE TABLE chunks_stage AS SELECT * FROM chunks WHERE 0"),
-      this.env.DB.prepare(
-        `CREATE TABLE journal_stage (
-          id TEXT PRIMARY KEY,
-          note_id TEXT NOT NULL,
-          agent_id TEXT NOT NULL,
-          at TEXT NOT NULL,
-          title TEXT NOT NULL,
-          block_ref TEXT NOT NULL,
-          idempotency_key TEXT,
-          path TEXT NOT NULL
-        )`,
-      ),
-    ]);
-  }
-
-  private async liveNoteIds(): Promise<{ byPath: Map<string, string>; byId: Map<string, string> }> {
-    const rows = await this.env.DB.prepare("SELECT id, path FROM notes").all<{ id: string; path: string }>();
-    const byPath = new Map<string, string>();
-    const byId = new Map<string, string>();
-    for (const row of rows.results ?? []) {
-      byPath.set(row.path, row.id);
-      byId.set(row.id, row.path);
-    }
-    return { byPath, byId };
-  }
-
-  // History objects are write-once and their key carries the first 8 hex of the content hash. A row
-  // D1 already holds for that key keeps its hash, writer, and reason. Anything else is read from R2.
-  private async knownHistory(): Promise<Map<string, { content_hash: string; writer: string; reason: string | null }>> {
-    const rows = await this.env.DB.prepare("SELECT r2_key, content_hash, writer, reason FROM note_versions WHERE r2_key LIKE 'sys/history/%'").all<{
-      r2_key: string;
-      content_hash: string;
-      writer: string;
-      reason: string | null;
-    }>();
-    return new Map((rows.results ?? []).map((row) => [row.r2_key, row]));
-  }
-
-  private async stageHistory(
-    assigned: Map<string, string>,
-    known: Map<string, { content_hash: string; writer: string; reason: string | null }>,
-    progress: RebuildProgress,
-  ): Promise<JsonValue[][]> {
-    const versions: JsonValue[][] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await this.env.VAULT.list({ prefix: "sys/history/", cursor, limit: 1000 });
-      const wanted = page.objects
-        .map((object) => ({ key: object.key, parsed: /^sys\/history\/([^/]+)\/([^-]+)-([0-9a-f]{8})\.md$/.exec(object.key) }))
-        .filter((item): item is { key: string; parsed: RegExpExecArray } => Boolean(item.parsed && assigned.has(item.parsed[1]!)));
-      for (const items of slices(wanted, R2_READ_CONCURRENCY)) {
-        const resolved = await Promise.all(
-          items.map(async ({ key, parsed }) => {
-            const row = known.get(key);
-            if (row && hash8(row.content_hash) === parsed[3]) return [parsed[1]!, parsed[2]!, key, row.content_hash, row.writer, row.reason];
-            const file = await this.env.VAULT.get(key);
-            progress.history_reads += 1;
-            if (!file) return null;
-            return [parsed[1]!, parsed[2]!, key, await sha256Hex(await file.text()), "rebuild", "history"];
-          }),
-        );
-        for (const row of resolved) if (row) versions.push(row);
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    progress.versions = versions.length;
-    return versions;
-  }
-
-  private async stageFile(
-    path: string,
-    markdown: string,
-    etag: string | null,
-    metaId: string | null,
-    actor: Actor,
-    live: { byPath: Map<string, string>; byId: Map<string, string> },
-    assigned: Map<string, string>,
-    factKeys: Set<string>,
-  ): Promise<StagedFile> {
-    const parsed = parseMarkdown(markdown);
+  // A stored file at a non-sensitive path whose text classifies as sensitive moves to the
+  // sensitive folder before anything indexes it at the requested path: the new object is
+  // written, the old object is deleted, and the old path gets a tombstone that only the admin
+  // can follow.
+  private async moveStoredFile(input: {
+    path: string;
+    markdown: string;
+    etag: string | null;
+    route: string;
+    actor: Actor;
+    action: string;
+    detail?: string | null;
+  }): Promise<ApiResult> {
+    const target = reroutedPath(input.route, input.path);
+    const source = await this.noteByPath(input.path);
+    const atTarget = await this.noteByPath(target);
+    const parsed = parseMarkdown(input.markdown);
     const fm = parsed.frontmatter;
-    const id = stagedNoteId(path, stringField(fm.vault_id) ?? null, metaId, live, assigned);
-    assigned.set(id, path);
-    const status = noteStatus(fm);
-    const type = stringField(fm.type) ?? inferType(path);
-    const owner = stringField(fm.owner) ?? ownerForPath(path);
-    const domain = domainOf(path) ?? stringField(fm.domain) ?? null;
-    const title = stringField(fm.key) ?? stringField(fm.title) ?? titleFromBody(parsed.body, path);
-    // Two active files for one fact key would break the unique index and the whole swap. The first path keeps the key.
-    let factKey = type === "fact" ? (stringField(fm.key) ?? null) : null;
-    if (factKey && status === "active") {
-      const slot = `${owner}\u0000${factKey}`;
-      if (factKeys.has(slot)) factKey = null;
-      else factKeys.add(slot);
+    const fileId = stringField(fm.vault_id) ?? null;
+    let id = atTarget?.id ?? null;
+    if (!id && !source && fileId) {
+      const clash = await this.env.DB.prepare("SELECT path FROM notes WHERE id = ?").bind(fileId).first<{ path: string }>();
+      if (!clash) id = fileId;
     }
-    const now = new Date().toISOString();
-    const hash = await sha256Hex(markdown);
-    const note: JsonValue[] = [
+    id ??= ulid();
+    const domain = input.route === RESTRICTED ? null : input.route;
+    const type = stringField(fm.type) ?? inferType(input.path);
+    const owner = ownerForPath(target);
+    const markdown = buildMarkdown({ ...fm, vault_id: id, type, owner, status: "active", sensitivity: "sensitive", domain }, parsed.body);
+    let ifMatch = atTarget?.r2_etag ?? null;
+    if (!atTarget) {
+      const orphan = await this.env.VAULT.head(r2KeyFor(this.prefix(), target));
+      if (orphan) ifMatch = normalizeEtag(orphan.etag);
+    }
+    const again = parseMarkdown(markdown);
+    const saved = await this.saveMarkdown({
       id,
-      path,
+      path: target,
+      markdown,
       type,
       owner,
       domain,
-      storedSensitivity(fm, domain),
-      factKey,
-      title,
-      markdown,
-      JSON.stringify(fm),
-      hash,
-      type === "fact" ? await sha256Hex(statementOnly(parsed.body)) : null,
-      etag,
-      r2KeyFor(this.prefix(), path),
-      status,
-      stringField(fm.observed_at) ?? null,
-      now,
-      stringField(fm.updated_at) ?? now,
-      versionStamp(),
-      stringField(fm.source) ?? actor.agentId,
-    ];
-    const chunks: JsonValue[][] =
-      status === "active" ? chunkMarkdown(path, title, parsed.body).map((chunk) => [`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, path, chunk.tokenCount]) : [];
-    const journal: JsonValue[][] = [];
-    if (type === "journal" || type === "decision") {
-      for (const entry of journalEntries(markdown)) {
-        const agent = entry.agent || owner;
-        if (!(await journalMacMatches(this.env, { ...entry, agent }))) continue;
-        journal.push([entry.id, id, agent, now, entry.title, `^${entry.id}`, entry.idempotency, path]);
-      }
+      sensitivity: "sensitive",
+      factKey: type === "fact" ? (stringField(fm.key) ?? null) : null,
+      title: stringField(fm.key) ?? stringField(fm.title) ?? titleFromBody(again.body, target),
+      statementHash: type === "fact" ? await sha256Hex(statementOnly(again.body)) : null,
+      observedAt: stringField(fm.observed_at) ?? null,
+      actor: input.actor,
+      ifMatch,
+      create: !atTarget,
+      reason: atTarget ? "updated" : "created",
+      action: "reroute_move",
+      journal: null,
+      detail: JSON.stringify({ requested_path: input.path, sensitive_domain: input.route, source_action: input.action }),
+    });
+    if (!saved.ok) return saved;
+    if (type === "journal" || type === "decision") await restoreJournalMarkers(this.env, id, target, markdown, owner);
+    if (source && source.status !== "forgotten") {
+      await this.retireMoved(source, target, input.actor, false);
+    } else if (!source) {
+      await this.env.DB.prepare(
+        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash, moved_to, path) VALUES (?, ?, ?, 'removed', ?, ?, ?)`,
+      )
+        .bind(ulid(), new Date().toISOString(), input.actor.agentId, (await this.auditHash(input.markdown)) ?? (await sha256Hex(input.markdown)), target, input.path)
+        .run();
     }
-    return { note, chunks, journal, tombstone: status === "forgotten" ? { id, hash } : null };
+    const key = r2KeyFor(this.prefix(), input.path);
+    const head = await this.env.VAULT.head(key);
+    if (head && (!input.etag || normalizeEtag(head.etag) === normalizeEtag(input.etag))) await this.env.VAULT.delete(key);
+    return { ok: true, data: { moved: true, path: target, requested_path: input.path, sensitive_domain: input.route } };
   }
 
-  private async flushStage(rows: StageRows): Promise<void> {
-    const statements: D1PreparedStatement[] = [];
-    if (rows.notes.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT INTO notes_stage", NOTE_COLUMNS)).bind(rows.json("notes")));
-    if (rows.chunks.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT INTO chunks_stage", CHUNK_COLUMNS)).bind(rows.json("chunks")));
-    if (rows.journal.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT OR IGNORE INTO journal_stage", JOURNAL_STAGE_COLUMNS)).bind(rows.json("journal")));
-    if (statements.length) await this.env.DB.batch(statements);
+  // Tombstones the path a note moved away from. Its history keeps only the earlier versions: the
+  // last indexed body is snapshotted, and version rows that point at the live object are dropped,
+  // because that object is now a stub or gone. Readers other than the admin get 404 at the old
+  // path, and nothing they can read names the new one.
+  private async retireMoved(note: NoteRow, target: string, actor: Actor, keepStub: boolean): Promise<void> {
+    const now = new Date().toISOString();
+    const chunkIds = await this.chunkIds(note.id);
+    if (note.status === "active") await this.snapshotBytes(note, note.body, actor.agentId, "moved");
+    const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
+    let etag: string | null = null;
+    if (keepStub) {
+      const put = await this.putVault(note.path, stub, note.id, note.r2_etag);
+      etag = put?.etag ?? null;
+    }
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', fact_key = NULL, r2_etag = ?, updated_at = ?, last_writer = ?, index_gen = ?
+         WHERE id = ?`,
+      ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), etag, now, actor.agentId, this.gen(), note.id),
+      this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
+      this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
+      this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
+      this.env.DB.prepare(
+        `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash, moved_to, path) VALUES (?, ?, ?, 'removed', ?, ?, ?)
+         ON CONFLICT(note_id) DO UPDATE SET at = excluded.at, reason = excluded.reason, moved_to = excluded.moved_to, path = excluded.path`,
+      ).bind(note.id, now, actor.agentId, (await this.auditHash(note.body)) ?? note.content_hash, target, note.path),
+      ...this.vectorDeletes(chunkIds, note.id, now),
+    ]);
+    await this.audit(actor, "reroute_tombstone", note.path, note.id, "ok", [], await this.auditHash(stub), utf8Length(stub));
+    await this.enqueue({ kind: "forget", note_id: note.id, chunk_ids: chunkIds });
   }
 
   private async cleanup(op: Extract<WriterOp, { kind: "cleanup" }>): Promise<ApiResult> {
@@ -933,7 +1048,7 @@ export class VaultWriter extends DurableObject<Env> {
       const owned = row.path.includes(op.runId) || row.owner.includes(op.runId);
       const stripped = owned ? null : stripRunContent(row.body, op.runId);
       if (owned || stripped?.empty) {
-        await this.purge(row.id, row.path, op.actor, false);
+        await this.purge(row.id, row.path, op.actor, false, "purge");
         purged += 1;
         continue;
       }
@@ -956,7 +1071,6 @@ export class VaultWriter extends DurableObject<Env> {
         create: false,
         reason: "cleanup",
         action: "cleanup_rewrite",
-        idempotencyKey: null,
         journal: null,
       });
       if (!saved.ok) return saved;
@@ -969,6 +1083,8 @@ export class VaultWriter extends DurableObject<Env> {
     await this.env.DB.prepare("DELETE FROM idempotency WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM links WHERE target LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM conflicts WHERE fact_key LIKE ? ESCAPE '\\'").bind(like).run();
+    await this.env.DB.prepare("DELETE FROM tombstones WHERE path LIKE ? ESCAPE '\\' OR moved_to LIKE ? ESCAPE '\\'").bind(like, like).run();
+    this.ctx.storage.sql.exec("DELETE FROM operations WHERE agent_id LIKE ? ESCAPE '\\'", like);
     const runVersions = await this.env.DB.prepare("SELECT r2_key FROM note_versions WHERE writer LIKE ? ESCAPE '\\'")
       .bind(like)
       .all<{ r2_key: string }>();
@@ -1004,30 +1120,10 @@ export class VaultWriter extends DurableObject<Env> {
     return { ok: true, data: { purged, rewritten, remaining_notes: remaining.notes, remaining_objects: remaining.objects } };
   }
 
-  private async saveMarkdown(input: {
-    id: string;
-    path: string;
-    markdown: string;
-    type: string;
-    owner: string;
-    domain: string | null;
-    sensitivity: "normal" | "sensitive";
-    factKey: string | null;
-    title: string;
-    statementHash: string | null;
-    observedAt: string | null;
-    actor: Actor;
-    ifMatch: string | null;
-    create: boolean;
-    reason: string;
-    action: string;
-    idempotencyKey: string | null;
-    journal: { id: string; title: string; at: string; idempotencyKey: string | null } | null;
-    allowRetry?: boolean;
-    skipPut?: boolean;
-    storedEtag?: string | null;
-    detail?: string | null;
-  }): Promise<ApiResult<{ etag: string }>> {
+  private async saveMarkdown(input: SaveInput): Promise<ApiResult<{ etag: string }>> {
+    if (utf8Length(input.markdown) > FILE_LIMIT_BYTES) {
+      throw new VaultError("payload_too_large", "The stored file would pass the file size limit", ["file"], { limit: "file" });
+    }
     const existing = input.create ? null : await this.noteByPath(input.path);
     const appending = input.reason === "appended" || input.reason === "conflict";
     if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
@@ -1045,9 +1141,7 @@ export class VaultWriter extends DurableObject<Env> {
         new Date().toISOString(),
       );
     }
-    const put = input.skipPut
-      ? { etag: input.storedEtag ?? "", versionTs: versionStamp() }
-      : await this.putVault(input.path, input.markdown, input.id, input.create ? null : input.ifMatch);
+    const put = input.skipPut ? { etag: input.storedEtag ?? "", versionTs: versionStamp() } : await this.putVault(input.path, input.markdown, input.id, input.ifMatch);
     if (!put || (input.skipPut && !input.storedEtag)) {
       if (!input.skipPut) this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
       if (input.allowRetry) return failure(new VaultError("conflict_etag", "Concurrent write changed the object"));
@@ -1057,20 +1151,20 @@ export class VaultWriter extends DurableObject<Env> {
     const parsed = parseMarkdown(input.markdown);
     const status = noteStatus(parsed.frontmatter);
     const frontmatter = JSON.stringify(parsed.frontmatter);
-    const chunks = appending && existing ? [] : chunkMarkdown(input.path, input.title, parsed.body);
-    const appendedChunks = appending && existing ? chunkMarkdown(input.path, input.title, input.markdown.startsWith(existing.body) ? input.markdown.slice(existing.body.length) : parsed.body) : [];
-    const linkSource = appending && existing && input.markdown.startsWith(existing.body) ? input.markdown.slice(existing.body.length) : parsed.body;
-    const links = await this.resolvedLinks(input.id, linkTargets(linkSource));
+    const appendedText = appending && existing && input.markdown.startsWith(existing.body) ? input.markdown.slice(existing.body.length) : null;
+    const chunks = appending && existing ? chunkMarkdown(input.path, input.title, appendedText ?? parsed.body) : chunkMarkdown(input.path, input.title, parsed.body);
+    const links = await this.resolvedLinks(input.id, input.path, linkTargets(appendedText ?? parsed.body));
     const versionTs = versionStamp();
     const r2Key = r2KeyFor(this.prefix(), input.path);
-    const statements = [];
+    const gen = this.gen();
+    const statements: D1PreparedStatement[] = [];
     if (input.create) {
       statements.push(
         this.env.DB.prepare(
           `INSERT INTO notes (
             id, path, type, owner, domain, sensitivity, fact_key, title, body, frontmatter, content_hash, statement_hash,
-            r2_etag, r2_key, status, observed_at, created_at, updated_at, version_ts, last_writer, last_confirmed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            r2_etag, r2_key, status, observed_at, created_at, updated_at, version_ts, last_writer, last_confirmed_at, index_gen
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           input.id,
           input.path,
@@ -1088,18 +1182,19 @@ export class VaultWriter extends DurableObject<Env> {
           r2Key,
           status,
           input.observedAt,
-          now,
+          input.createdAt ?? stringField(parsed.frontmatter.created_at) ?? now,
           now,
           versionTs,
           input.actor.agentId,
           now,
+          gen,
         ),
       );
     } else {
       statements.push(
         this.env.DB.prepare(
           `UPDATE notes SET type = ?, owner = ?, domain = ?, sensitivity = ?, fact_key = ?, title = ?, body = ?, frontmatter = ?,
-           content_hash = ?, statement_hash = ?, r2_etag = ?, status = ?, observed_at = ?, updated_at = ?, version_ts = ?, last_writer = ?
+           content_hash = ?, statement_hash = ?, r2_etag = ?, status = ?, observed_at = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?
            WHERE id = ?`,
         ).bind(
           input.type,
@@ -1118,6 +1213,7 @@ export class VaultWriter extends DurableObject<Env> {
           now,
           versionTs,
           input.actor.agentId,
+          gen,
           input.id,
         ),
       );
@@ -1139,8 +1235,7 @@ export class VaultWriter extends DurableObject<Env> {
         const prior = await this.env.DB.prepare("SELECT COALESCE(MAX(n), -1) AS n FROM chunks WHERE note_id = ?").bind(input.id).first<{ n: number }>();
         nextChunk = (prior?.n ?? -1) + 1;
       }
-      const written = appending && existing ? appendedChunks : chunks;
-      for (const chunk of written) {
+      for (const chunk of chunks) {
         const n = appending && existing ? nextChunk++ : chunk.n;
         statements.push(
           this.env.DB.prepare(
@@ -1182,20 +1277,13 @@ export class VaultWriter extends DurableObject<Env> {
         input.action,
         input.path,
         input.id,
-        hash,
-        input.markdown.length,
+        await this.auditHash(input.markdown),
+        utf8Length(input.markdown),
         input.actor.ipCountry,
         input.detail ?? null,
       ),
     );
-    if (input.idempotencyKey) {
-      statements.push(
-        this.env.DB.prepare(
-          `INSERT INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(agent_id, key) DO UPDATE SET response = excluded.response, at = excluded.at`,
-        ).bind(input.actor.agentId, input.idempotencyKey, JSON.stringify({ pending: true }), now),
-      );
-    }
+    if (input.remember) statements.push(...this.rememberStatements(input.actor.agentId, input.remember.key, input.remember.data(put.etag), input.remember.status));
     try {
       await this.env.DB.batch(statements);
       if (!input.skipPut) this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
@@ -1217,76 +1305,62 @@ export class VaultWriter extends DurableObject<Env> {
       }
       throw err;
     }
-    await this.backfillLinks(input.id, input.path, input.factKey, stringList(parsed.frontmatter.aliases));
+    if (!input.path.startsWith("sensitive/")) await this.backfillLinks(input.id, input.path, input.factKey, stringList(parsed.frontmatter.aliases));
     await this.enqueue({ kind: "agent-index", note_id: input.id, path: input.path });
     await this.env.DB.prepare("UPDATE notes SET index_enqueued_at = ? WHERE id = ?").bind(new Date().toISOString(), input.id).run();
     return { ok: true, data: { etag: put.etag } };
   }
 
+  // Indexes a stored file: an outside edit, a reconcile, a replayed intent, or bootstrap. Sensitive
+  // text at a non-sensitive path is moved before it is indexed there.
   private async indexBytes(input: {
     path: string;
     markdown: string;
     etag: string | null;
     actor: Actor;
     action: string;
-    write: boolean;
     reason: string;
     detail?: string | null;
+    metaId?: string | null;
   }): Promise<ApiResult> {
     const parsed = parseMarkdown(input.markdown);
-    let markdown = input.markdown;
     const existing = await this.noteByPath(input.path);
-    let id = existing?.id ?? stringField(parsed.frontmatter.vault_id) ?? ulid();
+    const status = noteStatus(parsed.frontmatter);
+    const outside = input.action === "external_put" || input.action === "external_copy";
+    // Until the quarantine migration has run, nothing automated turns a quarantined row active again.
+    if (existing?.status === "quarantined" && !outside) return { ok: true, data: { skipped: true, reason: "quarantined" } };
+    if (status === "active" && !inSensitiveFolder(input.path) && !isServerDocument(input.path)) {
+      const route = frontmatterRoute(parsed.frontmatter, input.markdown);
+      if (route) {
+        return this.moveStoredFile({ path: input.path, markdown: input.markdown, etag: input.etag, route, actor: input.actor, action: input.action, detail: input.detail });
+      }
+    }
+    let markdown = input.markdown;
+    let etag = input.etag;
+    const fileId = stringField(parsed.frontmatter.vault_id);
+    let id = existing?.id ?? fileId ?? input.metaId ?? ulid();
+    let writeBack = false;
     if (!existing) {
       const clash = await this.env.DB.prepare("SELECT path FROM notes WHERE id = ?").bind(id).first<{ path: string }>();
       if (clash && clash.path !== input.path) {
         id = ulid();
-        markdown = buildMarkdown({ ...parsed.frontmatter, vault_id: id }, parsed.body);
-        if (!input.write) {
-          const put = await this.putVault(input.path, markdown, id, input.etag);
-          if (put) input = { ...input, etag: put.etag };
-        }
+        writeBack = true;
       }
     }
-    if (input.write) {
-      const current = parseMarkdown(markdown);
-      if (!stringField(current.frontmatter.vault_id)) {
-        markdown = buildMarkdown(
-          {
-            ...current.frontmatter,
-            vault_id: id,
-            type: stringField(current.frontmatter.type) ?? inferType(input.path),
-            owner: stringField(current.frontmatter.owner) ?? ownerForPath(input.path),
-            status: stringField(current.frontmatter.status) ?? "active",
-          },
-          current.body,
-        );
-      }
-      const put = await this.putVault(input.path, markdown, id, null);
-      if (!put) throw new VaultError("conflict_etag", "Bootstrap object already exists");
-      input = { ...input, etag: put.etag };
-    } else if (!stringField(parsed.frontmatter.vault_id) && input.action === "external_edit") {
-      const fm: Frontmatter = {
-        ...parsed.frontmatter,
-        vault_id: id,
-        type: stringField(parsed.frontmatter.type) ?? inferType(input.path),
-        owner: stringField(parsed.frontmatter.owner) ?? ownerForPath(input.path),
-        status: stringField(parsed.frontmatter.status) ?? "active",
-        sensitivity: stringField(parsed.frontmatter.sensitivity) ?? storedSensitivity(parsed.frontmatter, domainOf(input.path)),
-        source: stringField(parsed.frontmatter.source) ?? "external",
-        updated_at: stringField(parsed.frontmatter.updated_at) ?? new Date().toISOString(),
-      };
-      markdown = buildMarkdown(fm, parsed.body);
-      const put = await this.putVault(input.path, markdown, id, input.etag);
-      if (put) input = { ...input, etag: put.etag };
+    // A file created or copied outside the API gets its vault_id written into its frontmatter, so
+    // a later rebuild keeps the same id.
+    if ((outside || input.action === "reconcile") && (writeBack || fileId !== id)) {
+      markdown = buildMarkdown({ ...parsed.frontmatter, vault_id: id }, parsed.body);
+      const put = await this.putVault(input.path, markdown, id, etag);
+      if (put) etag = put.etag;
+      else markdown = input.markdown;
     }
     const again = parseMarkdown(markdown);
     const type = stringField(again.frontmatter.type) ?? inferType(input.path);
     const owner = stringField(again.frontmatter.owner) ?? ownerForPath(input.path);
     const domain = domainOf(input.path) ?? stringField(again.frontmatter.domain) ?? null;
-    const sensitivity = storedSensitivity(again.frontmatter, domain);
+    const sensitivity = storedSensitivity(again.frontmatter, input.path, domain);
     const title = stringField(again.frontmatter.key) ?? stringField(again.frontmatter.title) ?? titleFromBody(again.body, input.path);
-    const existingRow = await this.noteByPath(input.path);
     const saved = await this.saveMarkdown({
       id,
       path: input.path,
@@ -1300,23 +1374,24 @@ export class VaultWriter extends DurableObject<Env> {
       statementHash: type === "fact" ? await sha256Hex(statementOnly(again.body)) : null,
       observedAt: stringField(again.frontmatter.observed_at) ?? null,
       actor: input.actor,
-      ifMatch: existingRow?.r2_etag ?? input.etag,
-      create: !existingRow,
+      ifMatch: existing?.r2_etag ?? etag,
+      create: !existing,
       reason: input.reason,
       action: input.action,
-      idempotencyKey: null,
       journal: null,
       skipPut: true,
-      storedEtag: input.etag,
+      storedEtag: etag,
       detail: input.detail ?? null,
     });
     if (saved.ok && (type === "journal" || type === "decision")) await restoreJournalMarkers(this.env, id, input.path, markdown, owner);
     return saved;
   }
 
+  // profile/summary.md lists active shared facts that are normal and carry no domain tag.
   private async refreshSummary(actor: Actor): Promise<void> {
     const rows = await this.env.DB.prepare(
-      `SELECT fact_key, body FROM notes WHERE owner = 'shared' AND type = 'fact' AND status = 'active' AND sensitivity = 'normal' ORDER BY fact_key`,
+      `SELECT fact_key, body FROM notes WHERE owner = 'shared' AND type = 'fact' AND status = 'active' AND sensitivity = 'normal'
+         AND domain IS NULL AND path LIKE 'profile/facts/%' ORDER BY fact_key`,
     ).all<{ fact_key: string; body: string }>();
     const lines = ["# Profile", ""];
     for (const row of rows.results ?? []) {
@@ -1355,7 +1430,6 @@ export class VaultWriter extends DurableObject<Env> {
       create: !existing,
       reason: "summary",
       action: "summary",
-      idempotencyKey: null,
       journal: null,
     });
   }
@@ -1391,7 +1465,6 @@ export class VaultWriter extends DurableObject<Env> {
       create: !existing,
       reason: "conflict",
       action: "conflict",
-      idempotencyKey: null,
       journal: null,
     });
   }
@@ -1423,38 +1496,56 @@ export class VaultWriter extends DurableObject<Env> {
     return { etag: normalizeEtag(object.etag) ?? object.etag, versionTs: versionStamp() };
   }
 
-  private async purge(id: string | undefined, path: string | undefined, actor: Actor, audit: boolean): Promise<ApiResult> {
+  // Hard-erases one note: the vault object, sys/history/<id>/, and every D1 row for it, leaving a
+  // tombstone with an HMAC hash and the reason. Matching is by exact id and r2 key only.
+  private async purge(id: string | undefined, path: string | undefined, actor: Actor, audit: boolean, reason: string): Promise<ApiResult> {
     const note = await this.resolveNote(id, path);
     if (!note) return { ok: true, data: { purged: false } };
+    await this.eraseRow(note, actor, reason);
+    if (audit) await this.audit(actor, "purge", note.path, note.id, "ok", [], null, 0);
+    return { ok: true, data: { purged: true, id: note.id, path: note.path } };
+  }
+
+  private async eraseRow(note: NoteRow, actor: Actor, reason: string): Promise<void> {
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
-    const keys = [note.r2_key];
-    let cursor: string | undefined;
-    do {
-      const history = await this.env.VAULT.list({ prefix: `sys/history/${note.id}/`, cursor, limit: 200 });
-      keys.push(...history.objects.map((object) => object.key));
-      cursor = history.truncated ? history.cursor : undefined;
-    } while (cursor);
-    if (keys.length) await this.env.VAULT.delete(keys);
+    const live = await this.env.VAULT.get(note.r2_key);
+    const liveText = live ? await live.text() : null;
+    const hash = (await this.auditHash(liveText ?? note.body)) ?? note.content_hash;
+    const keys = [note.r2_key, ...(await this.historyKeys(note.id))];
+    await this.env.VAULT.delete(keys);
     await this.env.DB.batch([
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ? OR dst_note_id = ?").bind(note.id, note.id),
       this.env.DB.prepare("DELETE FROM journal_entries WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare(
-        `INSERT INTO tombstones (note_id, at, by_agent, reason, purged_at, content_hash) VALUES (?, ?, ?, 'purge', ?, ?)
-         ON CONFLICT(note_id) DO UPDATE SET purged_at = excluded.purged_at, content_hash = excluded.content_hash`,
-      ).bind(note.id, now, actor.agentId, now, note.content_hash),
-      ...chunkIds.map((chunkId) =>
-        this.env.DB.prepare(
-          `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) VALUES (?, ?, ?)
-           ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
-        ).bind(chunkId, note.id, now),
-      ),
+        `INSERT INTO tombstones (note_id, at, by_agent, reason, purged_at, content_hash, path) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(note_id) DO UPDATE SET reason = excluded.reason, purged_at = excluded.purged_at, content_hash = excluded.content_hash`,
+      ).bind(note.id, now, actor.agentId, reason, now, hash, note.path),
+      ...this.vectorDeletes(chunkIds, note.id, now),
       this.env.DB.prepare("DELETE FROM notes WHERE id = ?").bind(note.id),
     ]);
-    if (audit) await this.audit(actor, "purge", note.path, note.id, "ok", [], note.content_hash, 0);
-    return { ok: true, data: { purged: true, id: note.id, path: note.path } };
+  }
+
+  private async historyKeys(id: string): Promise<string[]> {
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const history = await this.env.VAULT.list({ prefix: `sys/history/${id}/`, cursor, limit: 500 });
+      keys.push(...history.objects.map((object) => object.key));
+      cursor = history.truncated ? history.cursor : undefined;
+    } while (cursor);
+    return keys;
+  }
+
+  private vectorDeletes(chunkIds: string[], noteId: string, now: string): D1PreparedStatement[] {
+    return chunkIds.map((chunkId) =>
+      this.env.DB.prepare(
+        `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) VALUES (?, ?, ?)
+         ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
+      ).bind(chunkId, noteId, now),
+    );
   }
 
   private async enqueue(body: Record<string, unknown>): Promise<void> {
@@ -1463,6 +1554,13 @@ export class VaultWriter extends DurableObject<Env> {
     } catch (err) {
       logEvent({ event: "queue_send_failed", name: err instanceof Error ? err.name : "error" });
     }
+  }
+
+  // Audit hashes are HMAC-SHA256 under AUDIT_KEY, so a hash in the log cannot be checked against a
+  // guessed text. Without the key the hash is left out rather than stored as a plain digest.
+  private async auditHash(text: string): Promise<string | null> {
+    if (!this.env.AUDIT_KEY) return null;
+    return hmacSha256Hex(this.env.AUDIT_KEY, text);
   }
 
   private async audit(
@@ -1520,15 +1618,7 @@ export class VaultWriter extends DurableObject<Env> {
       }
       const actor: Actor = { agentId: "replay", tokenId: "replay", client: "replay", requestId: ulid(), ipCountry: null };
       try {
-        await this.indexBytes({
-          path: row.path,
-          markdown,
-          etag: normalizeEtag(object.etag),
-          actor,
-          action: "replay",
-          write: false,
-          reason: "replay",
-        });
+        await this.indexBytes({ path: row.path, markdown, etag: normalizeEtag(object.etag), actor, action: "replay", reason: "replay" });
         this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", row.op_id);
         replayed += 1;
       } catch (err) {
@@ -1538,84 +1628,723 @@ export class VaultWriter extends DurableObject<Env> {
     return { replayed, dropped };
   }
 
-  private async reconcile(): Promise<ApiResult> {
-    let updated = 0;
-    let cursor: string | undefined;
-    const actor: Actor = { agentId: "reconcile", tokenId: "reconcile", client: "reconcile", requestId: ulid(), ipCountry: null };
-    do {
-      const page = await this.env.VAULT.list({ prefix: this.prefix(), cursor, limit: 100 });
-      for (const object of page.objects) {
-        if (!object.key.endsWith(".md")) continue;
-        const path = vaultPathFromKey(this.prefix(), object.key);
-        if (!path) continue;
-        const note = await this.noteByPath(path);
-        const etag = normalizeEtag(object.etag);
-        if (note && etag && etag === normalizeEtag(note.r2_etag)) continue;
-        const file = await this.env.VAULT.get(object.key);
-        if (!file) continue;
-        const markdown = await file.text();
-        await this.indexBytes({
-          path,
-          markdown,
-          etag: normalizeEtag(file.etag),
-          actor,
-          action: "reconcile",
-          write: false,
-          reason: "reconcile",
-        });
-        updated += 1;
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    const forgotten = await this.reconcileMissing(actor);
-    return { ok: true, data: { updated, forgotten } };
+  // ---- Jobs ---------------------------------------------------------------------------------
+
+  private activeJob(): Job | null {
+    const row = this.ctx.storage.sql
+      .exec<{ body: string }>("SELECT body FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at LIMIT 1")
+      .toArray()[0];
+    return row ? (JSON.parse(row.body) as Job) : null;
   }
 
-  private async reconcileMissing(actor: Actor): Promise<number> {
-    const cap = 200;
-    const cursor = (await this.ctx.storage.get<string>("reconcile_d1_path")) ?? "";
-    const rows = await this.env.DB.prepare(
-      "SELECT path, r2_key FROM notes WHERE status = 'active' AND path > ? ORDER BY path LIMIT ?",
-    )
-      .bind(cursor, cap)
-      .all<{ path: string; r2_key: string }>();
-    const list = rows.results ?? [];
-    let forgotten = 0;
-    for (const row of list) {
-      const head = await this.env.VAULT.head(row.r2_key);
-      if (head) continue;
-      await this.externalDelete(row.path, actor, JSON.stringify({ reason: "missing_object" }));
-      forgotten += 1;
-    }
-    if (list.length < cap) await this.ctx.storage.delete("reconcile_d1_path");
-    else await this.ctx.storage.put("reconcile_d1_path", list[list.length - 1]!.path);
-    return forgotten;
+  private loadJob(id: string): Job | null {
+    const row = this.ctx.storage.sql.exec<{ body: string }>("SELECT body FROM jobs WHERE id = ?", id).toArray()[0];
+    return row ? (JSON.parse(row.body) as Job) : null;
   }
+
+  private saveJob(job: Job): void {
+    this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, body = ? WHERE id = ?", job.status, JSON.stringify(job), job.id);
+  }
+
+  private state(key: string): string | null {
+    return this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM writer_state WHERE key = ?", key).toArray()[0]?.value ?? null;
+  }
+
+  private setState(key: string, value: string): void {
+    this.ctx.storage.sql.exec("INSERT INTO writer_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
+  }
+
+  // Every write stamps notes.index_gen with the current generation. A rebuild bumps it, restamps
+  // every row it reads back from R2, and sweeps the rows still on an older generation.
+  private gen(): number {
+    return Number(this.state("index_gen") ?? "0") || 0;
+  }
+
+  private retiredAt(): string | null {
+    return this.state("quarantine_retired_at");
+  }
+
+  private async quarantineRecordsExist(): Promise<boolean> {
+    const row = await this.env.DB.prepare("SELECT 1 AS hit FROM notes WHERE status = 'quarantined' LIMIT 1").first<{ hit: number }>();
+    if (row) return true;
+    const records = await this.env.VAULT.list({ prefix: "sys/quarantine/", limit: 1 });
+    return records.objects.length > 0;
+  }
+
+  // The count a production erase must confirm: quarantined D1 rows plus sys/quarantine/ records.
+  private async quarantineCount(): Promise<number> {
+    const rows = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM notes WHERE status = 'quarantined'").first<{ n: number }>();
+    let records = 0;
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.VAULT.list({ prefix: "sys/quarantine/", cursor, limit: 1000 });
+      records += page.objects.length;
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return (rows?.n ?? 0) + records;
+  }
+
+  private async jobStep(id: string): Promise<void> {
+    const job = this.loadJob(id);
+    if (!job || (job.status !== "queued" && job.status !== "running")) return;
+    if (job.status === "queued") {
+      job.status = "running";
+      job.started_at = new Date().toISOString();
+      job.started_ms = Date.now();
+    }
+    const deadline = Date.now() + PAGE_BUDGET_MS;
+    try {
+      const done =
+        job.kind === "reconcile" ? await this.reconcileStep(job, deadline) : job.kind === "quarantine-erase" ? await this.eraseStep(job, deadline) : await this.rebuildStep(job, deadline);
+      job.pages += 1;
+      job.attempts = 0;
+      job.error = null;
+      if (done) await this.finishJob(job);
+      this.saveJob(job);
+    } catch (err) {
+      job.attempts += 1;
+      job.error = errorText(err);
+      logEvent({ event: "job_page_failed", kind: job.kind, phase: job.phase, attempts: job.attempts });
+      if (job.attempts >= MAX_JOB_ATTEMPTS) {
+        job.status = "failed";
+        job.finished_at = new Date().toISOString();
+        const detail = { job_id: job.id, phase: job.phase, ...job.counts, duration_ms: Date.now() - job.started_ms, error: job.error };
+        await this.audit(job.actor, jobAuditName(job.kind), null, null, "failed", [err instanceof VaultError ? err.code : "error"], null, 0, JSON.stringify(detail)).catch(
+          () => undefined,
+        );
+      }
+      this.saveJob(job);
+    }
+  }
+
+  private async finishJob(job: Job): Promise<void> {
+    job.status = "done";
+    job.phase = "done";
+    job.finished_at = new Date().toISOString();
+    job.counts.duration_ms = Date.now() - job.started_ms;
+    if (job.kind === "quarantine-erase" && !job.dry_run && !this.retiredAt()) this.setState("quarantine_retired_at", job.finished_at);
+    const detail: Record<string, unknown> = { job_id: job.id, ...job.counts };
+    if (job.kind === "quarantine-erase") {
+      detail.dry_run = job.dry_run;
+      detail.note_ids = job.report.note_ids.slice(0, 200);
+    }
+    await this.audit(job.actor, jobAuditName(job.kind), null, null, "ok", [], null, 0, JSON.stringify(detail));
+  }
+
+  private count(job: Job, name: string, by = 1): void {
+    job.counts[name] = (job.counts[name] ?? 0) + by;
+  }
+
+  // Rebuild: files, then history, then a sweep of rows no file accounts for, then links, then the
+  // FTS index, then orphaned quarantine records once the migration has run.
+  private async rebuildStep(job: Job, deadline: number): Promise<boolean> {
+    if (job.phase === "start") {
+      job.gen = this.gen() + 1;
+      this.setState("index_gen", String(job.gen));
+      for (const name of ["files", "notes", "versions", "tombstones", "history_reads", "moved", "swept", "links", "skipped"]) job.counts[name] = 0;
+      job.phase = "files";
+      job.cursor = null;
+    }
+    switch (job.phase) {
+      case "files":
+        if (await this.rebuildFiles(job, deadline)) this.nextPhase(job, "history");
+        return false;
+      case "history":
+        if (await this.rebuildHistory(job, deadline)) this.nextPhase(job, "sweep");
+        return false;
+      case "sweep":
+        if (await this.rebuildSweep(job)) this.nextPhase(job, "links");
+        return false;
+      case "links":
+        if (await this.rebuildLinks(job)) this.nextPhase(job, "fts");
+        return false;
+      case "fts":
+        await this.env.DB.prepare("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')").run();
+        this.nextPhase(job, "quarantine");
+        return false;
+      case "quarantine":
+        if (!(await this.deleteQuarantineOrphans(job))) return false;
+        job.counts.notes = (await this.env.DB.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>())?.n ?? 0;
+        job.counts.imported = job.counts.files ?? 0;
+        return true;
+      default:
+        return true;
+    }
+  }
+
+  private nextPhase(job: Job, phase: string): void {
+    job.phase = phase;
+    job.cursor = null;
+  }
+
+  private async rebuildFiles(job: Job, deadline: number): Promise<boolean> {
+    const prefix = this.prefix();
+    const gen = job.gen;
+    const page = await this.env.VAULT.list({ prefix, startAfter: job.cursor ?? undefined, limit: PAGE_OBJECTS });
+    const entries = page.objects.map((object) => ({ object, path: object.key.endsWith(".md") ? vaultPathFromKey(prefix, object.key) : null }));
+    const live = await this.rowsByPath(entries.flatMap((entry) => (entry.path ? [entry.path] : [])));
+    // Pick how far into the page this step goes: every object, unless the file text passes the byte cap.
+    let take = 0;
+    let bytes = 0;
+    for (const entry of entries) {
+      if (entry.path && !isCurrent(live.get(entry.path), entry.object.etag, gen)) bytes += entry.object.size;
+      if (take > 0 && bytes > PAGE_BYTES) break;
+      take += 1;
+    }
+    const chosen = entries.slice(0, take);
+    const loads = chosen.filter((entry) => entry.path && !isCurrent(live.get(entry.path), entry.object.etag, gen));
+    const texts = new Map<string, { text: string; etag: string | null; metaId: string | null }>();
+    let loadedUpTo = chosen.length;
+    for (const group of slices(loads, R2_READ_CONCURRENCY)) {
+      if (Date.now() > deadline && texts.size > 0) {
+        loadedUpTo = chosen.indexOf(group[0]!);
+        break;
+      }
+      const files = await Promise.all(
+        group.map(async (entry) => {
+          const file = await this.env.VAULT.get(entry.object.key);
+          return file ? { key: entry.object.key, text: await file.text(), etag: normalizeEtag(file.etag), metaId: file.customMetadata?.["vault-id"] ?? null } : null;
+        }),
+      );
+      for (const file of files) if (file) texts.set(file.key, file);
+    }
+    const processed = chosen.slice(0, loadedUpTo);
+    const loaded = processed.flatMap((entry) => {
+      const file = texts.get(entry.object.key);
+      return entry.path && file ? [{ path: entry.path, ...file }] : [];
+    });
+    const parsedFiles = loaded.map((file) => ({ ...file, parsed: parseMarkdown(file.text) }));
+    const candidates = new Set<string>();
+    for (const file of parsedFiles) {
+      const fromFile = stringField(file.parsed.frontmatter.vault_id);
+      if (fromFile) candidates.add(fromFile);
+      if (file.metaId) candidates.add(file.metaId);
+    }
+    const byId = await this.rowsById([...candidates]);
+    const factSlots = parsedFiles.flatMap((file) => {
+      const fm = file.parsed.frontmatter;
+      const key = stringField(fm.key);
+      const type = stringField(fm.type) ?? inferType(file.path);
+      return type === "fact" && key ? [`${stringField(fm.owner) ?? ownerForPath(file.path)}\u0000${key}`] : [];
+    });
+    const claims = await this.factClaims(factSlots);
+    const rows = emptyRows();
+    const assigned = new Map<string, string>();
+    const claimed = new Map<string, string>();
+    const keepAlive: string[] = [];
+    const moves: { path: string; text: string; etag: string | null; route: string }[] = [];
+    const now = new Date().toISOString();
+    let pending = 0;
+    for (const entry of processed) if (entry.path && isCurrent(live.get(entry.path), entry.object.etag, gen)) this.count(job, "files");
+    for (const file of parsedFiles) {
+      const row = live.get(file.path);
+      if (utf8Length(file.text) > FILE_LIMIT_BYTES) {
+        this.count(job, "skipped");
+        if (row) keepAlive.push(row.id);
+        continue;
+      }
+      const fm = file.parsed.frontmatter;
+      const status = noteStatus(fm);
+      if (status === "active" && !inSensitiveFolder(file.path) && !isServerDocument(file.path)) {
+        const route = frontmatterRoute(fm, file.text);
+        if (route) {
+          moves.push({ path: file.path, text: file.text, etag: file.etag, route });
+          continue;
+        }
+      }
+      const id = pickNoteId(file.path, [stringField(fm.vault_id) ?? null, row?.id ?? null, file.metaId?.trim() || null], byId, assigned);
+      assigned.set(id, file.path);
+      if (row && row.id !== id) rows.replaced.push(row.id);
+      const type = stringField(fm.type) ?? inferType(file.path);
+      const owner = stringField(fm.owner) ?? ownerForPath(file.path);
+      const domain = domainOf(file.path) ?? stringField(fm.domain) ?? null;
+      const title = stringField(fm.key) ?? stringField(fm.title) ?? titleFromBody(file.parsed.body, file.path);
+      // Two active files for one fact key would break the unique index. The first path in listing order keeps the key.
+      let factKey = type === "fact" ? (stringField(fm.key) ?? null) : null;
+      if (factKey && status === "active") {
+        const slot = `${owner}\u0000${factKey}`;
+        const holder = claims.get(slot);
+        if (claimed.has(slot)) factKey = null;
+        else if (holder && holder.id !== id && holder.index_gen === gen) factKey = null;
+        else {
+          if (holder && holder.id !== id) rows.unkeyed.push(holder.id);
+          claimed.set(slot, id);
+        }
+      }
+      const hash = await sha256Hex(file.text);
+      const createdAt = row?.created_at ?? stringField(fm.created_at) ?? stringField(fm.updated_at) ?? now;
+      rows.notes.push([
+        id,
+        file.path,
+        type,
+        owner,
+        domain,
+        storedSensitivity(fm, file.path, domain),
+        factKey,
+        title,
+        file.text,
+        JSON.stringify(fm),
+        hash,
+        type === "fact" ? await sha256Hex(statementOnly(file.parsed.body)) : null,
+        file.etag,
+        r2KeyFor(prefix, file.path),
+        status,
+        stringField(fm.observed_at) ?? null,
+        createdAt,
+        stringField(fm.updated_at) ?? now,
+        versionStamp(),
+        stringField(fm.source) ?? "rebuild",
+        gen,
+      ]);
+      if (status === "active") {
+        for (const chunk of chunkMarkdown(file.path, title, file.parsed.body)) rows.chunks.push([`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, file.path, chunk.tokenCount]);
+        for (const target of linkTargets(file.parsed.body)) rows.links.push([id, target]);
+      }
+      const rerouted = rerouteFields(sensitiveSegment(file.path));
+      const replyStatus = file.path.startsWith("sensitive/") ? 201 : 200;
+      if (type === "journal" || type === "decision") {
+        for (const entry of journalEntries(file.text)) {
+          const agent = entry.agent || owner;
+          if (!(await journalMacMatches(this.env, { ...entry, agent }))) continue;
+          rows.journal.push([entry.id, id, agent, now, entry.title, `^${entry.id}`, entry.idempotency]);
+          if (entry.idempotency) {
+            rows.idempotency.push([agent, entry.idempotency, stored(replyStatus, { entry_id: entry.id, path: file.path, block_ref: `^${entry.id}`, ...rerouted }), now]);
+          }
+        }
+      } else {
+        const key = stringField(fm.vault_idempotency);
+        const agent = stringField(fm.source);
+        if (key && agent) rows.idempotency.push([agent, key, stored(replyStatus, { id, path: file.path, etag: file.etag, outcome: "restored", ...rerouted }), now]);
+      }
+      if (status === "forgotten") {
+        rows.tombstones.push([id, hash]);
+        this.count(job, "tombstones");
+      }
+      this.count(job, "files");
+      // A file's text lands in its note row and again in its chunks.
+      pending += utf8Length(file.text) * 2;
+      if (pending > 1_500_000) {
+        await this.flushRows(rows, now);
+        Object.assign(rows, emptyRows());
+        pending = 0;
+      }
+    }
+    await this.flushRows(rows, now);
+    if (keepAlive.length) await this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE id IN (SELECT value FROM json_each(?))").bind(gen, JSON.stringify(keepAlive)).run();
+    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId: job.actor.requestId, ipCountry: null };
+    for (const move of moves) {
+      await this.moveStoredFile({ path: move.path, markdown: move.text, etag: move.etag, route: move.route, actor, action: "rebuild" });
+      this.count(job, "moved");
+      this.count(job, "files");
+    }
+    const last = processed.at(-1);
+    if (last) job.cursor = last.object.key;
+    return processed.length === entries.length && !page.truncated;
+  }
+
+  private async flushRows(rows: StagedRows, now: string): Promise<void> {
+    const db = this.env.DB;
+    const statements: D1PreparedStatement[] = [];
+    const ids = (list: string[]) => JSON.stringify(list);
+    if (rows.replaced.length) {
+      const replaced = ids(rows.replaced);
+      statements.push(
+        db.prepare(
+          `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) SELECT id, note_id, ? FROM chunks WHERE note_id IN (SELECT value FROM json_each(?)) AND 1
+           ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
+        ).bind(now, replaced),
+        db.prepare("DELETE FROM links WHERE src_note_id IN (SELECT value FROM json_each(?))").bind(replaced),
+        db.prepare("DELETE FROM journal_entries WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
+        db.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
+        db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
+        db.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(replaced),
+      );
+    }
+    if (rows.unkeyed.length) statements.push(db.prepare("UPDATE notes SET fact_key = NULL WHERE id IN (SELECT value FROM json_each(?))").bind(ids(rows.unkeyed)));
+    const staged = rows.notes.map((row) => String(row[0]));
+    for (const json of jsonSlices(rows.notes)) {
+      statements.push(
+        db.prepare(
+          `${jsonInsert("INSERT INTO notes", NOTE_COLUMNS)} WHERE 1
+           ON CONFLICT(id) DO UPDATE SET ${NOTE_UPDATE_COLUMNS.map((column) => `${column} = excluded.${column}`).join(", ")}`,
+        ).bind(json),
+      );
+    }
+    if (staged.length) {
+      const stagedIds = ids(staged);
+      statements.push(db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
+      statements.push(db.prepare("DELETE FROM links WHERE src_note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
+      const entryIds = JSON.stringify(rows.journal.map((row) => row[0]));
+      statements.push(
+        db.prepare(
+          `DELETE FROM journal_entries WHERE (note_id IN (SELECT value FROM json_each(?)) AND id NOT IN (SELECT value FROM json_each(?)))
+             OR (id IN (SELECT value FROM json_each(?)) AND note_id NOT IN (SELECT value FROM json_each(?)))`,
+        ).bind(stagedIds, entryIds, entryIds, stagedIds),
+      );
+    }
+    for (const json of jsonSlices(rows.chunks)) statements.push(db.prepare(jsonInsert("INSERT INTO chunks", CHUNK_COLUMNS)).bind(json));
+    for (const json of jsonSlices(rows.links)) {
+      statements.push(db.prepare(`INSERT OR IGNORE INTO links (src_note_id, target, dst_note_id) SELECT ${jsonSelect(["src", "target"])}, NULL FROM json_each(?)`).bind(json));
+    }
+    for (const json of jsonSlices(rows.journal)) statements.push(db.prepare(jsonInsert("INSERT OR IGNORE INTO journal_entries", JOURNAL_COLUMNS)).bind(json));
+    for (const json of jsonSlices(rows.idempotency)) statements.push(db.prepare(jsonInsert("INSERT OR IGNORE INTO idempotency", ["agent_id", "key", "response", "at"])).bind(json));
+    for (const json of jsonSlices(rows.tombstones)) {
+      statements.push(
+        db.prepare(
+          `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash)
+           SELECT json_extract(value, '$[0]'), ?, 'rebuild', 'forgotten', json_extract(value, '$[1]') FROM json_each(?) WHERE 1
+           ON CONFLICT(note_id) DO NOTHING`,
+        ).bind(now, json),
+      );
+    }
+    if (statements.length) await db.batch(statements);
+  }
+
+  private async rowsByPath(paths: string[]): Promise<Map<string, { id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string }>> {
+    if (!paths.length) return new Map();
+    const rows = await this.env.DB.prepare("SELECT id, path, r2_etag, index_gen, created_at FROM notes WHERE path IN (SELECT value FROM json_each(?))")
+      .bind(JSON.stringify(paths))
+      .all<{ id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string }>();
+    return new Map((rows.results ?? []).map((row) => [row.path, row]));
+  }
+
+  private async rowsById(ids: string[]): Promise<Map<string, { id: string; path: string }>> {
+    if (!ids.length) return new Map();
+    const rows = await this.env.DB.prepare("SELECT id, path FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(JSON.stringify(ids)).all<{ id: string; path: string }>();
+    return new Map((rows.results ?? []).map((row) => [row.id, row]));
+  }
+
+  private async factClaims(slots: string[]): Promise<Map<string, { id: string; index_gen: number | null }>> {
+    if (!slots.length) return new Map();
+    const rows = await this.env.DB.prepare(
+      `SELECT id, owner, fact_key, index_gen FROM notes WHERE status = 'active' AND fact_key IS NOT NULL
+         AND owner || char(0) || fact_key IN (SELECT value FROM json_each(?))`,
+    )
+      .bind(JSON.stringify(slots))
+      .all<{ id: string; owner: string; fact_key: string; index_gen: number | null }>();
+    return new Map((rows.results ?? []).map((row) => [`${row.owner}\u0000${row.fact_key}`, row]));
+  }
+
+  // History objects are write-once and their key carries the first 8 hex of the content hash. A
+  // version row D1 already holds is kept. Anything else is read from R2 once.
+  private async rebuildHistory(job: Job, deadline: number): Promise<boolean> {
+    const page = await this.env.VAULT.list({ prefix: "sys/history/", startAfter: job.cursor ?? undefined, limit: 1000 });
+    const parsed = page.objects
+      .map((object) => ({ key: object.key, match: /^sys\/history\/([^/]+)\/([^-]+)-([0-9a-f]{8})\.md$/.exec(object.key) }))
+      .filter((item): item is { key: string; match: RegExpExecArray } => Boolean(item.match));
+    const noteIds = [...new Set(parsed.map((item) => item.match[1]!))];
+    const known = new Set<string>();
+    if (noteIds.length) {
+      const rows = await this.env.DB.prepare("SELECT id FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(JSON.stringify(noteIds)).all<{ id: string }>();
+      for (const row of rows.results ?? []) known.add(row.id);
+    }
+    const wanted = parsed.filter((item) => known.has(item.match[1]!));
+    const have = new Set<string>();
+    if (wanted.length) {
+      const rows = await this.env.DB.prepare("SELECT r2_key FROM note_versions WHERE r2_key IN (SELECT value FROM json_each(?))")
+        .bind(JSON.stringify(wanted.map((item) => item.key)))
+        .all<{ r2_key: string }>();
+      for (const row of rows.results ?? []) have.add(row.r2_key);
+    }
+    const versions: JsonValue[][] = [];
+    let reads = 0;
+    let lastKey: string | null = null;
+    let stopped = false;
+    const missing = wanted.filter((item) => !have.has(item.key));
+    const reading = new Set(missing.slice(0, HISTORY_READS_PER_PAGE).map((item) => item.key));
+    for (const group of slices(missing.filter((item) => reading.has(item.key)), R2_READ_CONCURRENCY)) {
+      if (Date.now() > deadline && reads > 0) {
+        stopped = true;
+        break;
+      }
+      const resolved = await Promise.all(
+        group.map(async ({ key, match }) => {
+          const file = await this.env.VAULT.get(key);
+          return file ? [match[1]!, match[2]!, key, await sha256Hex(await file.text()), "rebuild", "history"] : null;
+        }),
+      );
+      reads += group.length;
+      for (const row of resolved) if (row) versions.push(row);
+      lastKey = group.at(-1)!.key;
+    }
+    job.counts.history_reads = (job.counts.history_reads ?? 0) + reads;
+    // The page ends at the first missing row that was not read, so the next page starts there.
+    const cutoff = stopped || missing.length > reading.size ? (lastKey ?? null) : null;
+    const counted = cutoff === null ? wanted : wanted.filter((item) => item.key <= cutoff);
+    this.count(job, "versions", counted.length);
+    for (const json of jsonSlices(versions)) await this.env.DB.prepare(jsonInsert("INSERT OR IGNORE INTO note_versions", VERSION_COLUMNS)).bind(json).run();
+    if (cutoff !== null) {
+      job.cursor = cutoff;
+      return false;
+    }
+    job.cursor = page.objects.at(-1)?.key ?? job.cursor;
+    return !page.truncated;
+  }
+
+  private async rebuildSweep(job: Job): Promise<boolean> {
+    const rows = await this.env.DB.prepare("SELECT id FROM notes WHERE index_gen IS NULL OR index_gen < ? LIMIT 100").bind(job.gen).all<{ id: string }>();
+    const stale = (rows.results ?? []).map((row) => row.id);
+    if (!stale.length) return true;
+    const json = JSON.stringify(stale);
+    const now = new Date().toISOString();
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `INSERT INTO vector_delete_queue (chunk_id, note_id, requested_at) SELECT id, note_id, ? FROM chunks WHERE note_id IN (SELECT value FROM json_each(?)) AND 1
+         ON CONFLICT(chunk_id) DO UPDATE SET requested_at = excluded.requested_at`,
+      ).bind(now, json),
+      this.env.DB.prepare("DELETE FROM links WHERE src_note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare("DELETE FROM journal_entries WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(json),
+    ]);
+    this.count(job, "swept", stale.length);
+    return stale.length < 100;
+  }
+
+  // Re-resolves every wikilink target to a note id, so backlinks match the rebuilt notes. A link
+  // from outside sensitive/ never resolves into it.
+  private async rebuildLinks(job: Job): Promise<boolean> {
+    const after = Number(job.cursor ?? "0");
+    const rows = await this.env.DB.prepare("SELECT rowid AS r FROM links WHERE rowid > ? ORDER BY rowid LIMIT ?").bind(after, LINK_ROWS_PER_PAGE).all<{ r: number }>();
+    const list = (rows.results ?? []).map((row) => row.r);
+    if (!list.length) return true;
+    const first = list[0]!;
+    const last = list.at(-1)!;
+    const file = "(CASE WHEN links.target LIKE '%.md' THEN links.target ELSE links.target || '.md' END)";
+    const fence = "(n.path NOT LIKE 'sensitive/%' OR (SELECT s.path FROM notes s WHERE s.id = links.src_note_id) LIKE 'sensitive/%')";
+    await this.env.DB.prepare(
+      `UPDATE links SET dst_note_id = COALESCE(
+         (SELECT n.id FROM notes n WHERE n.id != links.src_note_id AND n.status = 'active' AND ${fence}
+            AND (n.path = links.target OR n.path = ${file} OR n.fact_key = links.target OR n.path LIKE '%/' || ${file}) LIMIT 1),
+         (SELECT n.id FROM notes n, json_each(CASE WHEN json_valid(n.frontmatter) THEN n.frontmatter ELSE '{}' END, '$.aliases') a
+            WHERE n.id != links.src_note_id AND n.status = 'active' AND ${fence} AND lower(a.value) = lower(links.target) LIMIT 1))
+       WHERE rowid BETWEEN ? AND ?`,
+    )
+      .bind(first, last)
+      .run();
+    this.count(job, "links", list.length);
+    job.cursor = String(last);
+    return list.length < LINK_ROWS_PER_PAGE;
+  }
+
+  // Once the quarantine migration has run, any sys/quarantine/ record left over is deleted. Before it
+  // has run, nothing here touches quarantine data.
+  private async deleteQuarantineOrphans(job: Job): Promise<boolean> {
+    if (!this.retiredAt()) return true;
+    const page = await this.env.VAULT.list({ prefix: "sys/quarantine/", limit: 100 });
+    const keys = page.objects.map((object) => object.key);
+    if (keys.length) {
+      await this.env.VAULT.delete(keys);
+      this.count(job, "orphans_deleted", keys.length);
+    }
+    if (page.truncated) return false;
+    if (job.counts.orphans_deleted) {
+      await this.audit(job.actor, "quarantine_orphans_deleted", null, null, "ok", [], null, 0, JSON.stringify({ job_id: job.id, deleted: job.counts.orphans_deleted }));
+    }
+    return true;
+  }
+
+  // Reconcile: index files whose etag differs from D1, then forget rows whose object is missing.
+  private async reconcileStep(job: Job, deadline: number): Promise<boolean> {
+    if (job.phase === "start") {
+      for (const name of ["scanned", "updated", "moved", "forgotten"]) job.counts[name] = 0;
+      this.nextPhase(job, "files");
+    }
+    const actor: Actor = { agentId: "reconcile", tokenId: "reconcile", client: "reconcile", requestId: job.actor.requestId, ipCountry: null };
+    if (job.phase === "files") {
+      const prefix = this.prefix();
+      const page = await this.env.VAULT.list({ prefix, startAfter: job.cursor ?? undefined, limit: PAGE_OBJECTS });
+      const live = await this.rowsByPath(page.objects.flatMap((object) => {
+        const path = object.key.endsWith(".md") ? vaultPathFromKey(prefix, object.key) : null;
+        return path ? [path] : [];
+      }));
+      let stopped = false;
+      for (const object of page.objects) {
+        if (Date.now() > deadline) {
+          stopped = true;
+          break;
+        }
+        await this.reconcileObject(job, object, live, actor);
+        job.cursor = object.key;
+      }
+      if (!stopped && !page.truncated) this.nextPhase(job, "missing");
+      return false;
+    }
+    if (job.phase === "missing") {
+      const rows = await this.env.DB.prepare("SELECT path, r2_key FROM notes WHERE status = 'active' AND path > ? ORDER BY path LIMIT ?")
+        .bind(job.cursor ?? "", PAGE_OBJECTS)
+        .all<{ path: string; r2_key: string }>();
+      const list = rows.results ?? [];
+      for (const group of slices(list, R2_READ_CONCURRENCY)) {
+        const heads = await Promise.all(group.map((row) => this.env.VAULT.head(row.r2_key)));
+        for (const [index, head] of heads.entries()) {
+          if (head) continue;
+          await this.externalDelete(group[index]!.path, actor, JSON.stringify({ reason: "missing_object" }));
+          this.count(job, "forgotten");
+        }
+      }
+      if (list.length) job.cursor = list.at(-1)!.path;
+      if (list.length < PAGE_OBJECTS) this.nextPhase(job, "quarantine");
+      return false;
+    }
+    if (job.phase === "quarantine") return this.deleteQuarantineOrphans(job);
+    return true;
+  }
+
+  private async reconcileObject(job: Job, object: R2Object, live: Map<string, { r2_etag: string | null }>, actor: Actor): Promise<void> {
+    const path = object.key.endsWith(".md") ? vaultPathFromKey(this.prefix(), object.key) : null;
+    if (!path) return;
+    this.count(job, "scanned");
+    const row = live.get(path);
+    if (row && normalizeEtag(row.r2_etag) && normalizeEtag(row.r2_etag) === normalizeEtag(object.etag)) return;
+    if (object.size > FILE_LIMIT_BYTES) return;
+    const file = await this.env.VAULT.get(object.key);
+    if (!file) return;
+    const result = await this.indexBytes({ path, markdown: await file.text(), etag: normalizeEtag(file.etag), actor, action: "reconcile", reason: "reconcile" });
+    if (result.ok && result.data.moved) this.count(job, "moved");
+    else if (result.ok && !result.data.skipped) this.count(job, "updated");
+  }
+
+  // Quarantine retirement. Lists D1 rows with status 'quarantined' and sys/quarantine/ records,
+  // matches by exact note id or path, and hard-erases what matched. A dry run only counts.
+  private async eraseStep(job: Job, deadline: number): Promise<boolean> {
+    const actor: Actor = { agentId: "migration", tokenId: job.actor.tokenId, client: "migration", requestId: job.actor.requestId, ipCountry: null };
+    if (job.phase === "start") {
+      for (const name of ["records", "quarantined_notes", "unindexed_matches", "erased", "orphans_deleted", "errors", "alert_file", "total"]) job.counts[name] = 0;
+      this.nextPhase(job, "notes");
+    }
+    if (job.phase === "notes") {
+      const rows = await this.env.DB.prepare("SELECT * FROM notes WHERE status = 'quarantined' AND path > ? ORDER BY path LIMIT 25").bind(job.cursor ?? "").all<NoteRow>();
+      const list = rows.results ?? [];
+      for (const row of list) {
+        this.count(job, "quarantined_notes");
+        this.reportNote(job, row.id, row.path);
+        if (!job.dry_run) {
+          await this.eraseRow(row, actor, "quarantine_retired");
+          this.count(job, "erased");
+        }
+        job.cursor = row.path;
+        if (Date.now() > deadline) return false;
+      }
+      if (list.length < 25) this.nextPhase(job, "records");
+      return false;
+    }
+    if (job.phase === "records") {
+      const page = await this.env.VAULT.list({ prefix: "sys/quarantine/", startAfter: job.cursor ?? undefined, limit: PAGE_OBJECTS });
+      for (const object of page.objects) {
+        if (Date.now() > deadline) return false;
+        this.count(job, "records");
+        await this.eraseRecord(job, object.key, actor);
+        job.cursor = object.key;
+      }
+      if (!page.truncated) this.nextPhase(job, "alert");
+      return false;
+    }
+    if (job.phase === "alert") {
+      const row = await this.noteByPath("inbox/quarantine.md");
+      const key = r2KeyFor(this.prefix(), "inbox/quarantine.md");
+      if (row) {
+        job.counts.alert_file = 1;
+        if (!job.dry_run) await this.eraseRow(row, actor, "quarantine_retired");
+      } else if (await this.env.VAULT.head(key)) {
+        job.counts.alert_file = 1;
+        if (!job.dry_run) await this.env.VAULT.delete(key);
+      }
+      job.counts.total = (job.counts.records ?? 0) + (job.counts.quarantined_notes ?? 0);
+      return true;
+    }
+    return true;
+  }
+
+  private async eraseRecord(job: Job, key: string, actor: Actor): Promise<void> {
+    const object = await this.env.VAULT.get(key);
+    let record: { path?: unknown; content_hash?: unknown } | null = null;
+    try {
+      const parsed = object ? (JSON.parse(await object.text()) as unknown) : null;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) record = parsed as { path?: unknown; content_hash?: unknown };
+    } catch {
+      record = null;
+    }
+    const path = typeof record?.path === "string" ? record.path : null;
+    if (!record || !path || !/^[A-Za-z0-9][A-Za-z0-9_./-]*\.md$/.test(path) || path.includes("..")) {
+      // A record that does not parse is an error, never a match.
+      this.count(job, "errors");
+      if (job.errors.length < 100) job.errors.push(`unparsed_record:${key}`);
+      if (!job.dry_run) await this.env.VAULT.delete(key);
+      return;
+    }
+    const erasedHere = job.report.paths.includes(path);
+    const row = erasedHere ? null : await this.noteByPath(path);
+    let matched = erasedHere || row?.status === "quarantined";
+    if (!erasedHere && !row) {
+      // No D1 row: the object at that exact path is the quarantined file, unless its HMAC shows it changed since.
+      const file = await this.env.VAULT.get(r2KeyFor(this.prefix(), path));
+      if (file) {
+        const text = await file.text();
+        const recorded = typeof record.content_hash === "string" ? record.content_hash : null;
+        const current = await this.auditHash(text);
+        if (!recorded || !current || recorded === current) {
+          matched = true;
+          this.count(job, "unindexed_matches");
+          const id = stringField(parseMarkdown(text).frontmatter.vault_id) ?? file.customMetadata?.["vault-id"] ?? null;
+          this.reportNote(job, id ?? "", path);
+          if (!job.dry_run) {
+            const keys = [r2KeyFor(this.prefix(), path), ...(id ? await this.historyKeys(id) : [])];
+            await this.env.VAULT.delete(keys);
+            await this.env.DB.prepare(
+              `INSERT INTO tombstones (note_id, at, by_agent, reason, purged_at, content_hash, path) VALUES (?, ?, ?, 'quarantine_retired', ?, ?, ?)
+               ON CONFLICT(note_id) DO UPDATE SET reason = excluded.reason, purged_at = excluded.purged_at`,
+            )
+              .bind(id || ulid(), new Date().toISOString(), actor.agentId, new Date().toISOString(), current ?? (await sha256Hex(text)), path)
+              .run();
+            this.count(job, "erased");
+          }
+        }
+      }
+    }
+    if (!matched) this.count(job, "orphans_deleted");
+    if (!job.dry_run) await this.env.VAULT.delete(key);
+  }
+
+  private reportNote(job: Job, id: string, path: string): void {
+    if (job.report.paths.length >= 1000) return;
+    if (id) job.report.note_ids.push(id);
+    job.report.paths.push(path);
+  }
+
+  // ---- Lookups ------------------------------------------------------------------------------
 
   private cleanupAllowed(): boolean {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
   }
 
-  private async replay(agentId: string, key: string | null): Promise<{ [key: string]: JsonValue } | null> {
+  private async replay(agentId: string, key: string | null): Promise<ApiResult | null> {
     if (!key) return null;
     const row = await this.env.DB.prepare("SELECT response, at FROM idempotency WHERE agent_id = ? AND key = ?")
       .bind(agentId, key)
       .first<{ response: string; at: string }>();
     if (!row) return null;
-    if (Date.now() - Date.parse(row.at) > 7 * 24 * 60 * 60 * 1000) return null;
-    const parsed = JSON.parse(row.response) as { [key: string]: JsonValue };
+    if (Date.now() - Date.parse(row.at) > OPERATION_TTL_MS) return null;
+    const parsed = JSON.parse(row.response) as { v?: number; status?: number; data?: { [key: string]: JsonValue }; pending?: boolean };
     if (parsed.pending) return null;
-    return parsed;
+    if (parsed.v === 2 && parsed.data) return withStatus(parsed.data, parsed.status ?? 200);
+    return { ok: true, data: parsed as { [key: string]: JsonValue } };
   }
 
-  private async remember(agentId: string, key: string | null, data: Record<string, unknown>): Promise<void> {
-    if (!key) return;
-    await this.env.DB.prepare(
-      `INSERT INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(agent_id, key) DO UPDATE SET response = excluded.response, at = excluded.at`,
-    )
-      .bind(agentId, key, JSON.stringify(data), new Date().toISOString())
-      .run();
+  private rememberStatements(agentId: string, key: string | null, data: { [key: string]: JsonValue }, status: number): D1PreparedStatement[] {
+    if (!key) return [];
+    return [
+      this.env.DB.prepare(
+        `INSERT INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(agent_id, key) DO UPDATE SET response = excluded.response, at = excluded.at`,
+      ).bind(agentId, key, stored(status, data), new Date().toISOString()),
+    ];
+  }
+
+  private async remember(agentId: string, key: string | null, data: { [key: string]: JsonValue }, status: number): Promise<void> {
+    const statements = this.rememberStatements(agentId, key, data, status);
+    if (statements.length) await this.env.DB.batch(statements);
   }
 
   private async noteByPath(path: string): Promise<NoteRow | null> {
@@ -1639,24 +2368,25 @@ export class VaultWriter extends DurableObject<Env> {
     return (rows.results ?? []).map((row) => row.id);
   }
 
-  private async resolvedLinks(srcId: string, targets: string[]): Promise<{ target: string; dst: string | null }[]> {
+  private async resolvedLinks(srcId: string, srcPath: string, targets: string[]): Promise<{ target: string; dst: string | null }[]> {
     const links: { target: string; dst: string | null }[] = [];
     for (const target of targets) {
-      links.push({ target, dst: await this.lookupTarget(target, srcId) });
+      links.push({ target, dst: await this.lookupTarget(target, srcId, srcPath.startsWith("sensitive/")) });
     }
     return links;
   }
 
-  private async lookupTarget(target: string, except: string): Promise<string | null> {
+  private async lookupTarget(target: string, except: string, fromSensitive: boolean): Promise<string | null> {
     const file = target.endsWith(".md") ? target : `${target}.md`;
+    const fence = fromSensitive ? "" : "AND path NOT LIKE 'sensitive/%'";
     const row = await this.env.DB.prepare(
-      `SELECT id FROM notes WHERE id != ? AND status = 'active' AND (path = ? OR path = ? OR fact_key = ? OR path LIKE ?) LIMIT 1`,
+      `SELECT id FROM notes WHERE id != ? AND status = 'active' ${fence} AND (path = ? OR path = ? OR fact_key = ? OR path LIKE ?) LIMIT 1`,
     )
       .bind(except, target, file, target, `%/${file}`)
       .first<{ id: string }>();
     if (row) return row.id;
     const candidates = await this.env.DB.prepare(
-      "SELECT id, frontmatter FROM notes WHERE id != ? AND status = 'active' AND instr(lower(frontmatter), lower(?)) > 0 LIMIT 20",
+      `SELECT id, frontmatter FROM notes WHERE id != ? AND status = 'active' ${fence} AND instr(lower(frontmatter), lower(?)) > 0 LIMIT 20`,
     )
       .bind(except, `"${target.toLowerCase()}"`)
       .all<{ id: string; frontmatter: string }>();
@@ -1742,19 +2472,137 @@ export class VaultWriter extends DurableObject<Env> {
   }
 }
 
+function idempotencyKeyOf(op: WriterOp): string | null {
+  if (op.kind === "fact" || op.kind === "journal" || op.kind === "note" || op.kind === "forget") return op.idempotencyKey;
+  return null;
+}
+
+function jobRunning(id: string): VaultError {
+  return new VaultError("job_running", "A job is already running", [id], { job_id: id });
+}
+
+function jobAuditName(kind: JobKind): string {
+  if (kind === "reconcile") return "reconcile";
+  if (kind === "quarantine-erase") return "quarantine_erase";
+  return "reindex";
+}
+
+function jobView(job: Job): { [key: string]: JsonValue } {
+  return {
+    job_id: job.id,
+    kind: job.kind,
+    status: job.status,
+    phase: job.phase,
+    dry_run: job.dry_run,
+    progress: { phase: job.phase, pages: job.pages, cursor: job.cursor },
+    pages: job.pages,
+    counts: job.counts,
+    cursor: job.cursor,
+    errors: job.errors,
+    error: job.error,
+    created_at: job.created_at,
+    started_at: job.started_at,
+    finished_at: job.finished_at,
+  };
+}
+
+function grantsAllow(grants: Grants, segment: string): boolean {
+  if (grants.admin) return true;
+  if (segment === RESTRICTED) return false;
+  return grants.sensitive.includes(segment);
+}
+
+function rerouteFields(route: string | null): { [key: string]: JsonValue } {
+  return route ? { rerouted: true, sensitive_domain: route } : {};
+}
+
+function withStatus(data: { [key: string]: JsonValue }, status: number): ApiResult {
+  return status === 200 ? { ok: true, data } : { ok: true, data, status };
+}
+
+function stored(status: number, data: { [key: string]: JsonValue }): string {
+  return JSON.stringify({ v: 2, status, data });
+}
+
+function rememberFor(key: string | null, status: number, data: (etag: string) => { [key: string]: JsonValue }): SaveInput["remember"] {
+  return key ? { key, status, data } : null;
+}
+
+function rerouteDetail(requested: string, domain: string): string {
+  return JSON.stringify({ requested_path: requested, sensitive_domain: domain });
+}
+
+function factSave(
+  id: string,
+  path: string,
+  markdown: string,
+  facts: { key: string; owner: string; domain: string | null; sensitivity: string; observedAt: string },
+  statementHash: string,
+  actor: Actor,
+): Omit<SaveInput, "ifMatch" | "create" | "reason" | "action"> {
+  return {
+    id,
+    path,
+    markdown,
+    type: "fact",
+    owner: facts.owner,
+    domain: facts.domain,
+    sensitivity: facts.sensitivity === "sensitive" ? "sensitive" : "normal",
+    factKey: facts.key,
+    title: facts.key,
+    statementHash,
+    observedAt: facts.observedAt,
+    actor,
+    journal: null,
+  };
+}
+
+function forgottenStub(note: { id: string; type: string; owner: string; sensitivity: string }, day: string): string {
+  return buildMarkdown({ vault_id: note.id, type: note.type, owner: note.owner, status: "forgotten", sensitivity: note.sensitivity }, `Forgotten on ${day}.`);
+}
+
+function isCurrent(row: { index_gen: number | null; r2_etag: string | null } | undefined, etag: string, gen: number): boolean {
+  return Boolean(row && row.index_gen === gen && normalizeEtag(row.r2_etag) && normalizeEtag(row.r2_etag) === normalizeEtag(etag));
+}
+
+// Keeps the id in the file, then the id D1 had for the path, then the R2 metadata id, unless another
+// path already owns it in D1 or earlier in this page. A copied file gets a fresh id.
+function pickNoteId(path: string, candidates: (string | null)[], byId: Map<string, { path: string }>, assigned: Map<string, string>): string {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const livePath = byId.get(candidate)?.path;
+    const stagedPath = assigned.get(candidate);
+    if ((!livePath || livePath === path) && (!stagedPath || stagedPath === path)) return candidate;
+  }
+  return ulid();
+}
+
+function parseFrontmatter(json: string): Frontmatter {
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Frontmatter) : {};
+  } catch {
+    return {};
+  }
+}
+
 function normalizeEtag(etag: string | null | undefined): string | null {
   if (!etag) return null;
   const value = etag.trim().replace(/^W\//, "").replaceAll('"', "");
   return value || null;
 }
 
-function noteStatus(frontmatter: Frontmatter): "active" | "forgotten" {
-  return stringField(frontmatter.status) === "forgotten" ? "forgotten" : "active";
+// Status comes from the file. `quarantined` is kept as it is so that nothing reactivates it.
+function noteStatus(frontmatter: Frontmatter): "active" | "forgotten" | "quarantined" | "superseded" {
+  const status = stringField(frontmatter.status);
+  if (status === "forgotten" || status === "quarantined" || status === "superseded") return status;
+  return "active";
 }
 
-function storedSensitivity(frontmatter: Frontmatter, domain: string | null): "normal" | "sensitive" {
+function storedSensitivity(frontmatter: Frontmatter, path: string, domain: string | null): "normal" | "sensitive" {
+  if (inSensitiveFolder(path)) return "sensitive";
   if (stringField(frontmatter.sensitivity) === "sensitive") return "sensitive";
-  return domain !== null && SENSITIVE_DOMAINS.has(domain) ? "sensitive" : "normal";
+  return domain !== null && !isOrdinaryDomain(domain) ? "sensitive" : "normal";
 }
 
 function normalizeStatement(value: string): string {
@@ -1764,7 +2612,7 @@ function normalizeStatement(value: string): string {
 function stripReserved(extra: Frontmatter): Frontmatter {
   const out: Frontmatter = {};
   for (const [key, value] of Object.entries(extra)) {
-    if (key.startsWith("vault_") || key === "status" || key === "owner" || key === "type" || key === "sensitivity" || key === "summary" || key === "domain") continue;
+    if (key.startsWith("vault_") || ["status", "owner", "type", "sensitivity", "summary", "domain", "created_at", "updated_at", "source"].includes(key)) continue;
     out[key] = value;
   }
   return out;
@@ -1822,6 +2670,7 @@ async function journalMacMatches(env: Env, entry: JournalEntry): Promise<boolean
 }
 
 export async function restoreJournalMarkers(env: Env, noteId: string, path: string, markdown: string, agentHint: string): Promise<void> {
+  const sensitive = path.startsWith("sensitive/");
   for (const entry of journalEntries(markdown)) {
     const agent = entry.agent || agentHint;
     if (!(await journalMacMatches(env, { ...entry, agent }))) continue;
@@ -1832,113 +2681,11 @@ export async function restoreJournalMarkers(env: Env, noteId: string, path: stri
       .bind(entry.id, noteId, agent, at, entry.title, `^${entry.id}`, entry.idempotency)
       .run();
     if (entry.idempotency) {
-      await env.DB.prepare(`INSERT OR IGNORE INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)`).bind(
-        agent,
-        entry.idempotency,
-        JSON.stringify({ entry_id: entry.id, block_ref: `^${entry.id}`, path }),
-        at,
-      ).run();
+      const data = { entry_id: entry.id, block_ref: `^${entry.id}`, path, ...rerouteFields(sensitive ? sensitiveSegment(path) : null) };
+      await env.DB.prepare(`INSERT OR IGNORE INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)`).bind(agent, entry.idempotency, stored(sensitive ? 201 : 200, data), at).run();
     }
   }
 }
-
-type StagedFile = {
-  note: JsonValue[];
-  chunks: JsonValue[][];
-  journal: JsonValue[][];
-  tombstone: { id: string; hash: string } | null;
-};
-
-// Pre-serialized rows per stage table. add() refuses a file that would push a table past the byte cap.
-class StageRows {
-  notes: string[] = [];
-  chunks: string[] = [];
-  journal: string[] = [];
-  private bytes = { notes: 0, chunks: 0, journal: 0 };
-
-  add(file: StagedFile): boolean {
-    const parts = {
-      notes: [JSON.stringify(file.note)],
-      chunks: file.chunks.map((row) => JSON.stringify(row)),
-      journal: file.journal.map((row) => JSON.stringify(row)),
-    };
-    const sizes = { notes: byteLength(parts.notes), chunks: byteLength(parts.chunks), journal: byteLength(parts.journal) };
-    const empty = this.notes.length === 0;
-    if (!empty && (Object.keys(sizes) as (keyof typeof sizes)[]).some((table) => this.bytes[table] + sizes[table] > STAGE_JSON_BYTES)) return false;
-    for (const table of Object.keys(sizes) as (keyof typeof sizes)[]) {
-      this[table].push(...parts[table]);
-      this.bytes[table] += sizes[table];
-    }
-    return true;
-  }
-
-  json(table: "notes" | "chunks" | "journal"): string {
-    return `[${this[table].join(",")}]`;
-  }
-}
-
-function byteLength(parts: string[]): number {
-  let total = 0;
-  for (const part of parts) total += new TextEncoder().encode(part).length + 1;
-  return total;
-}
-
-function jsonInsert(verb: string, columns: string[]): string {
-  const values = columns.map((_, index) => `json_extract(value, '$[${index}]')`).join(", ");
-  return `${verb} (${columns.join(", ")}) SELECT ${values} FROM json_each(?)`;
-}
-
-function jsonSlices(rows: JsonValue[][]): string[] {
-  const out: string[] = [];
-  let parts: string[] = [];
-  let bytes = 0;
-  for (const row of rows) {
-    const part = JSON.stringify(row);
-    const size = new TextEncoder().encode(part).length + 1;
-    if (parts.length && bytes + size > STAGE_JSON_BYTES) {
-      out.push(`[${parts.join(",")}]`);
-      parts = [];
-      bytes = 0;
-    }
-    parts.push(part);
-    bytes += size;
-  }
-  if (parts.length) out.push(`[${parts.join(",")}]`);
-  return out;
-}
-
-function slices<T>(items: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let index = 0; index < items.length; index += size) out.push(items.slice(index, index + size));
-  return out;
-}
-
-// Keeps the id in the file, then the id D1 had for the path, then the R2 metadata id, unless another
-// path already owns it in D1 or earlier in this rebuild. A copied file gets a fresh id.
-function stagedNoteId(
-  path: string,
-  fromFile: string | null,
-  metaId: string | null,
-  live: { byPath: Map<string, string>; byId: Map<string, string> },
-  assigned: Map<string, string>,
-): string {
-  const candidates = [fromFile, live.byPath.get(path) ?? null, metaId?.trim() || null].filter((value): value is string => Boolean(value));
-  for (const candidate of candidates) {
-    const livePath = live.byId.get(candidate);
-    const stagedPath = assigned.get(candidate);
-    if ((!livePath || livePath === path) && (!stagedPath || stagedPath === path)) return candidate;
-  }
-  return ulid();
-}
-
-type RebuildProgress = {
-  phase: "stage" | "swap" | "history" | "done";
-  files: number;
-  notes: number;
-  versions: number;
-  tombstones: number;
-  history_reads: number;
-};
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return `${err.name}: ${err.message}`.slice(0, 300);
@@ -1970,3 +2717,4 @@ function stripRunContent(markdown: string, runId: string): { markdown: string; e
   const next = Object.keys(parsed.frontmatter).length > 0 ? buildMarkdown(parsed.frontmatter, body) : body ? `${body}\n` : "";
   return { markdown: next, empty, changed: true };
 }
+

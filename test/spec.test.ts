@@ -1,7 +1,7 @@
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { ADMIN, mcp, mint, nid, resetVault, rest, testEnv, type Envelope } from "./helpers";
+import { ADMIN, mcp, mint, nid, resetVault, rest, runJob, testEnv, type Envelope } from "./helpers";
 
 let readerX = "";
 let financeRw = "";
@@ -70,8 +70,11 @@ describe("HiveAttic acceptance", () => {
       method: "POST",
       body: JSON.stringify({ key: `health-${nid()}`, statement: `Shared health fact ${marker}`, observed_at: "2026-01-01T00:00:00Z", scope: "shared", domain: "health" }),
     });
-    expect(fact.status).toBe(200);
+    // A declared sensitive domain on a shared fact moves it into the sensitive folder.
+    expect(fact.status, fact.text).toBe(201);
+    expect(fact.json.data?.rerouted).toBe(true);
     const factPath = String(fact.json.data?.path ?? "");
+    expect(factPath.startsWith("sensitive/health/profile/facts/")).toBe(true);
     expect((await rest(`/v1/notes?path=${encodeURIComponent(factPath)}`, financeRo)).status).toBe(404);
     expect(results((await rest(`/v1/search?q=${marker}`, financeRo)).json).some((row) => row.path === factPath)).toBe(false);
     const listed = await rest("/v1/list?prefix=domains/finance/", readerX);
@@ -81,7 +84,8 @@ describe("HiveAttic acceptance", () => {
     expect(results(hybrid.json).some((row) => row.path === path)).toBe(true);
   });
 
-  // HiveAttic does not filter content. Bots must never write secrets, and the server stores what it is sent.
+  // T-02, T-03, and T-04 are retired: HiveAttic does not filter content. These keep the ids and check that
+  // content is stored as written. Bots must never write secrets; the server stores what it is sent.
   it("T-02 content containing a key-like string is accepted and stored", async () => {
     const samples = [
       "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
@@ -122,7 +126,7 @@ describe("HiveAttic acceptance", () => {
     const cases = [
       { path: `shared/card-${nid()}.md`, body: "Card 4242424242424242 on file", fragment: "4242424242424242" },
       { path: `shared/card-spaced-${nid()}.md`, body: "card 4242 4242 4242 4242", fragment: "4242 4242 4242 4242" },
-      { path: `shared/acct-${nid()}.md`, body: "The brokerage account 5839201746 is on file.", fragment: "5839201746" },
+      { path: `shared/acct-${nid()}.md`, body: "Account 5839201746 is on file.", fragment: "5839201746" },
       { path: `shared/iban-${nid()}.md`, body: "IBAN GB82WEST12345698765432", fragment: "GB82WEST12345698765432" },
     ];
     for (const item of cases) {
@@ -141,7 +145,7 @@ describe("HiveAttic acceptance", () => {
     expect(ssn.json.ok, ssn.text).toBe(true);
     const shared = await rest("/v1/journal", sharedWriter, {
       method: "POST",
-      body: JSON.stringify({ target: "shared", title: "call", body: "Reached the bank at 206-555-0142 about account 5839201746", at: "2026-03-01T16:00:00Z" }),
+      body: JSON.stringify({ target: "shared", title: "call", body: "Called about account 5839201746 and routing 021000021", at: "2026-03-01T16:00:00Z" }),
     });
     expect(shared.status, shared.text).toBe(200);
     expect(String(shared.json.data?.path)).toMatch(/^journal\//);
@@ -235,6 +239,25 @@ describe("HiveAttic acceptance", () => {
     expect(stale.status).toBe(409);
     expect(stale.json.error?.code).toBe("conflict_etag");
   }, 180_000);
+
+  it("T-06 the shared day file takes parallel appends from seven tokens, in file order", async () => {
+    const tokens: string[] = [];
+    for (let slot = 0; slot < 7; slot++) tokens.push(await mint(`t06-day-${slot}`, ["read:shared", "write:shared"], `t06-day-${slot}`));
+    const at = "2099-06-02T16:00:00.000Z";
+    for (let run = 0; run < 5; run++) {
+      const batch = await Promise.all(
+        tokens.map((token, slot) => rest("/v1/journal", token, { method: "POST", body: JSON.stringify({ target: "shared", title: `r${run}s${slot}`, body: `shared-${run}-${slot}`, at }) })),
+      );
+      for (const response of batch) expect(response.status, response.text).toBe(200);
+    }
+    const path = "journal/2099/06/2099-06-02.md";
+    const markdown = String((await rest(`/v1/notes?path=${path}`, tokens[0]!)).json.data?.markdown ?? "");
+    for (let run = 0; run < 5; run++) for (let slot = 0; slot < 7; slot++) expect(markdown.split(`shared-${run}-${slot}\n`).length - 1).toBe(1);
+    const refs = [...markdown.matchAll(/\^([0-9A-HJKMNP-TV-Z]{26})/g)].map((match) => `^${match[1]}`);
+    expect(refs.length).toBe(35);
+    const order = await rest(`/v1/admin/journal-order?path=${path}`, ADMIN);
+    expect(order.json.data?.block_refs).toEqual(refs);
+  });
 
   it("T-07 append-only journal and audit log", async () => {
     const at = "2026-07-01T16:00:00.000Z";
@@ -348,8 +371,8 @@ describe("HiveAttic acceptance", () => {
     )
       .bind("junknotfromr2junknotfromr201", `shared/junk-${nid()}.md`, "vault/shared/junk.md", now, now)
       .run();
-    const rebuilt = await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" });
-    expect(rebuilt.status).toBe(200);
+    const rebuilt = await runJob("/v1/admin/reindex");
+    expect(rebuilt.job.data?.status, JSON.stringify(rebuilt.job)).toBe("done");
     const after = await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>();
     expect(after?.n).toBe(before?.n);
     const junk = await testEnv().DB.prepare("SELECT id FROM notes WHERE id = ?").bind("junknotfromr2junknotfromr201").first();

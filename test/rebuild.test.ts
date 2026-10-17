@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv } from "./helpers";
 
 // A live T-12 reindex returned an error on a staging vault of roughly this size. These tests
 // rebuild a vault that size, count the D1 and R2 round trips the writer makes, and check the
@@ -22,15 +22,19 @@ beforeAll(async () => {
 });
 
 describe("rebuild at realistic volume", () => {
-  it("rebuilds about 150 notes with history in a bounded number of round trips and audits the result", async () => {
+  it("rebuilds about 150 notes with history as a paged job, in a bounded number of round trips, and audits the result", async () => {
     await resetVault();
     const vault = await seedVault();
     const before = await snapshot(vault);
 
     const stats: Stats = { d1Calls: 0, d1Statements: 0, r2Gets: 0, r2Lists: 0, sql: [] };
-    const rebuilt = await withInstrumentedWriter(stats, () => rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" }));
-    console.log(`rebuild round trips: ${JSON.stringify({ ...stats, sql: undefined, ...rebuilt.json.data })}`);
-    expect(rebuilt.status, rebuilt.text).toBe(200);
+    const rebuilt = await withInstrumentedWriter(stats, () => runJob("/v1/admin/reindex"));
+    const job = rebuilt.job.data ?? {};
+    const data = (job.counts ?? {}) as Record<string, unknown>;
+    console.log(`rebuild round trips: ${JSON.stringify({ ...stats, sql: undefined, pages: job.pages, ...data })}`);
+    expect(job.status, JSON.stringify(rebuilt.job)).toBe("done");
+    // More than one page: the writer lock is released between pages.
+    expect(Number(job.pages)).toBeGreaterThan(1);
 
     const after = await snapshot(vault);
     expect(after.notes).toBe(before.notes);
@@ -38,21 +42,22 @@ describe("rebuild at realistic volume", () => {
     expect(after.journalRefs).toEqual(before.journalRefs);
     expect(after.history).toEqual(before.history);
     expect(after.statuses).toEqual(before.statuses);
+    expect(after.links).toEqual(before.links);
 
-    const data = rebuilt.json.data ?? {};
     expect(data.notes).toBe(before.notes);
     expect(data.files).toBe(before.notes);
     expect(data.versions).toBe(before.historyObjects);
     expect(data.tombstones).toBe(1);
+    expect(data.swept).toBe(0);
     expect(typeof data.duration_ms).toBe("number");
 
     // Remote D1 and R2 calls each cost milliseconds from a Durable Object. A rebuild that issues one
-    // query per chunk and one read per history file outruns the request deadline on a vault this size.
+    // query per chunk and one read per history file outruns its budget on a vault this size.
     expect(stats.d1Calls).toBeLessThan(40);
     expect(stats.r2Gets).toBeLessThanOrEqual(before.notes);
     expect(data.history_reads).toBe(0);
 
-    const audits = await auditRows(String(rebuilt.json.request_id));
+    const audits = await auditRows(rebuilt.requestId);
     expect(audits.map((row) => `${row.action}:${row.outcome}`)).toEqual(["reindex_started:ok", "reindex:ok"]);
     const detail = JSON.parse(audits[1]!.detail ?? "{}") as Record<string, unknown>;
     expect(detail.notes).toBe(before.notes);
@@ -75,16 +80,18 @@ describe("rebuild at realistic volume", () => {
     expect(String(day.json.data?.markdown)).toContain(`${vault.marker} after rebuild`);
   }, 240_000);
 
-  it("rebuilds from R2 alone when D1 has lost its version rows", async () => {
+  it("rebuilds from R2 alone when D1 has lost its version rows, links, and idempotency rows", async () => {
     await resetVault();
     const vault = await seedVault(40);
     const before = await snapshot(vault);
-    await testEnv().DB.prepare("DELETE FROM note_versions").run();
+    const db = testEnv().DB;
+    await db.batch([db.prepare("DELETE FROM note_versions"), db.prepare("DELETE FROM links"), db.prepare("DELETE FROM idempotency")]);
     const stats: Stats = { d1Calls: 0, d1Statements: 0, r2Gets: 0, r2Lists: 0, sql: [] };
-    const rebuilt = await withInstrumentedWriter(stats, () => rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" }));
-    expect(rebuilt.status, rebuilt.text).toBe(200);
-    expect(rebuilt.json.data?.versions).toBe(before.historyObjects);
-    expect(rebuilt.json.data?.history_reads).toBe(before.historyObjects);
+    const rebuilt = await withInstrumentedWriter(stats, () => runJob("/v1/admin/reindex"));
+    const data = (rebuilt.job.data?.counts ?? {}) as Record<string, unknown>;
+    expect(rebuilt.job.data?.status, JSON.stringify(rebuilt.job)).toBe("done");
+    expect(data.versions).toBe(before.historyObjects);
+    expect(data.history_reads).toBe(before.historyObjects);
     const after = await snapshot(vault);
     expect(after.notes).toBe(before.notes);
     expect(after.search).toEqual(before.search);
@@ -92,35 +99,43 @@ describe("rebuild at realistic volume", () => {
       before.history.map(({ note_id, version_ts, r2_key, content_hash }) => ({ note_id, version_ts, r2_key, content_hash })),
     );
     expect(after.history.every((row) => row.writer === "rebuild" && row.reason === "history")).toBe(true);
+    // The links table is rebuilt from the files, backlinks included.
+    expect(after.links).toEqual(before.links);
+    expect(after.links.some((link) => link.endsWith(":resolved"))).toBe(true);
+    // Idempotency rows come back from journal markers and fact frontmatter.
+    const retry = await rest("/v1/journal", writer, { method: "POST", body: JSON.stringify(vault.idempotent.body) });
+    expect(retry.json.data?.entry_id).toBe(vault.idempotent.entryId);
+    const factRetry = await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify(vault.idempotentFact.body) });
+    expect(factRetry.json.data?.id).toBe(vault.idempotentFact.id);
+    expect((await db.prepare("SELECT COUNT(*) AS n FROM notes WHERE fact_key = ?").bind(vault.idempotentFact.body.key).first<{ n: number }>())?.n).toBe(1);
   }, 240_000);
 
-  it("a failed rebuild leaves the live index alone and audits the failure with its phase and counts", async () => {
+  it("a failed rebuild page leaves the live index usable and audits the failure with its phase and counts", async () => {
     await resetVault();
     const vault = await seedVault(20);
     const before = await snapshot(vault);
     const stats: Stats = { d1Calls: 0, d1Statements: 0, r2Gets: 0, r2Lists: 0, sql: [] };
-    const rebuilt = await withInstrumentedWriter(stats, () => rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" }), (sql) =>
-      /INSERT INTO notes SELECT/i.test(sql),
-    );
-    expect(rebuilt.status).toBe(400);
+    const rebuilt = await withInstrumentedWriter(stats, () => runJob("/v1/admin/reindex"), (sql) => /INSERT INTO notes \(id, path/i.test(sql) && /json_each/.test(sql));
+    expect(rebuilt.job.data?.status).toBe("failed");
+    expect(String(rebuilt.job.data?.error)).toContain("injected");
     const after = await snapshot(vault);
     expect(after.notes).toBe(before.notes);
     expect(after.search).toEqual(before.search);
     expect(after.history).toEqual(before.history);
-    const audits = await auditRows(String(rebuilt.json.request_id));
+    const audits = await auditRows(rebuilt.requestId);
     expect(audits.map((row) => `${row.action}:${row.outcome}`)).toEqual(["reindex_started:ok", "reindex:failed"]);
     const detail = JSON.parse(audits[1]!.detail ?? "{}") as Record<string, unknown>;
-    expect(detail.phase).toBe("swap");
-    expect(detail.files).toBe(before.notes);
+    expect(detail.phase).toBe("files");
+    expect(typeof detail.files).toBe("number");
     expect(typeof detail.duration_ms).toBe("number");
     expect(String(detail.error)).toContain("injected");
-    const retry = await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" });
-    expect(retry.status, retry.text).toBe(200);
+    const retry = await runJob("/v1/admin/reindex");
+    expect(retry.job.data?.status).toBe("done");
     expect((await snapshot(vault)).search).toEqual(before.search);
   }, 240_000);
 
-  // An Obsidian "duplicate file" copies the frontmatter: same vault_id, same fact key. Before the
-  // rebuild staged ids and fact keys in memory, both copies were inserted and the swap failed on a key.
+  // An Obsidian "duplicate file" copies the frontmatter: same vault_id, same fact key. Both copies
+  // must survive a rebuild after D1 lost the original, with distinct ids and one owner of the key.
   it("duplicated files that share a vault_id or a fact key survive a rebuild after D1 lost the original", async () => {
     await resetVault();
     const marker = `qxtwin${nid()}`;
@@ -152,8 +167,8 @@ describe("rebuild at realistic volume", () => {
       db.prepare("DELETE FROM links WHERE src_note_id = ?").bind(id),
       db.prepare("DELETE FROM notes WHERE id = ?").bind(id),
     ]);
-    const rebuilt = await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" });
-    expect(rebuilt.status, rebuilt.text).toBe(200);
+    const rebuilt = await runJob("/v1/admin/reindex");
+    expect(rebuilt.job.data?.status, JSON.stringify(rebuilt.job)).toBe("done");
     const rows = await db.prepare("SELECT id, path, fact_key FROM notes WHERE path IN (?, ?, ?, ?)").bind(firstPath, copyPath, factPath, factCopy).all<{ id: string; path: string; fact_key: string | null }>();
     const byPath = new Map((rows.results ?? []).map((row) => [row.path, row]));
     expect(byPath.size).toBe(4);
@@ -171,6 +186,7 @@ type Vault = {
   updated: string[];
   dayPath: string;
   idempotent: { body: Record<string, unknown>; entryId: string };
+  idempotentFact: { body: { key: string } & Record<string, unknown>; id: string };
 };
 
 async function seedVault(noteCount = 110): Promise<Vault> {
@@ -240,13 +256,24 @@ async function seedVault(noteCount = 110): Promise<Vault> {
     method: "POST",
     body: JSON.stringify({ target: "own", title: "private", body: `${marker} private`, at: "2099-06-08T12:00:00Z", sensitivity: "sensitive" }),
   });
-  expect(sensitive.status, sensitive.text).toBe(200);
-  expect(String(sensitive.json.data?.path)).toContain("/journal-sensitive/");
+  expect(sensitive.status, sensitive.text).toBe(201);
+  expect(String(sensitive.json.data?.path)).toBe("sensitive/restricted/journal/volume-writer/2099-06-08.md");
+  const factBody = { key: `${marker}-idem`, statement: `${marker} keyed fact`, observed_at: "2026-03-01T00:00:00Z", scope: "own", idempotency_key: `${marker}-fact-key` };
+  const keyedFact = await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify(factBody) });
+  expect(keyedFact.status, keyedFact.text).toBe(200);
+  paths.push(String(keyedFact.json.data?.path));
   const forgotten = `shared/volume/${marker}-forgotten.md`;
   await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path: forgotten, body: `${marker} forget me`, type: "note" }) });
   expect((await rest("/v1/forget", writer, { method: "POST", body: JSON.stringify({ path: forgotten, reason: "volume" }) })).status).toBe(200);
   paths.push(forgotten, dayPath, "shared/decisions.md", String(idem.json.data?.path), String(sensitive.json.data?.path));
-  return { marker, paths, updated, dayPath, idempotent: { body: idempotentBody, entryId: String(idem.json.data?.entry_id) } };
+  return {
+    marker,
+    paths,
+    updated,
+    dayPath,
+    idempotent: { body: idempotentBody, entryId: String(idem.json.data?.entry_id) },
+    idempotentFact: { body: factBody, id: String(keyedFact.json.data?.id) },
+  };
 }
 
 type VersionRow = { note_id: string; version_ts: string; r2_key: string; content_hash: string; writer: string; reason: string | null };
@@ -260,6 +287,7 @@ async function snapshot(vault: Vault): Promise<{
   journalRefs: string[];
   history: VersionRow[];
   statuses: string[];
+  links: string[];
 }> {
   const db = testEnv().DB;
   const notes = (await db.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>())?.n ?? 0;
@@ -269,6 +297,15 @@ async function snapshot(vault: Vault): Promise<{
     (await db.prepare("SELECT note_id, version_ts, r2_key, content_hash, writer, reason FROM note_versions WHERE r2_key LIKE 'sys/history/%' ORDER BY note_id, version_ts").all<VersionRow>())
       .results ?? [];
   const statuses = (await db.prepare("SELECT path || ':' || status || ':' || sensitivity AS s FROM notes ORDER BY path").all<{ s: string }>()).results?.map((row) => row.s) ?? [];
+  const links =
+    (
+      await db
+        .prepare(
+          `SELECT s.path || ' -> ' || l.target || ':' || CASE WHEN d.path IS NULL THEN 'open' ELSE 'resolved' END AS l
+           FROM links l JOIN notes s ON s.id = l.src_note_id LEFT JOIN notes d ON d.id = l.dst_note_id ORDER BY 1`,
+        )
+        .all<{ l: string }>()
+    ).results?.map((row) => row.l) ?? [];
   let historyObjects = 0;
   let cursor: string | undefined;
   do {
@@ -276,7 +313,7 @@ async function snapshot(vault: Vault): Promise<{
     historyObjects += page.objects.length;
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
-  return { notes, historyObjects, search, journalRefs, history, statuses };
+  return { notes, historyObjects, search, journalRefs, history, statuses, links };
 }
 
 async function history(path: string): Promise<{ version_ts?: string; body?: string }[]> {

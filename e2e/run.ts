@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { CopyObjectCommand, DeleteObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -9,15 +10,20 @@ type SubResponse = { label: string; via: "rest" | "mcp"; status: number | null; 
 type Check = { name: string; status: Status; detail?: string; responses: SubResponse[] };
 type Case = { id: string; status: Status; details: string; duration_ms: number; checks: Check[] };
 
-const prodBase = (process.env.HIVEATTIC_BASE_URL ?? "").replace(/\/$/, "");
-const stagingBase = (process.env.HIVEATTIC_STAGING_BASE_URL ?? "").replace(/\/$/, "");
+// Staging only, and fail-closed. The harness reads HIVEATTIC_STAGING_* names and nothing else for
+// its target and tokens. It never falls back to an unprefixed name, and it refuses to start when
+// one of the production names is set at all, so a stray prod token in the shell cannot be used.
+const PROD_NAMED = ["HIVEATTIC_BASE_URL", "HIVEATTIC_ADMIN_TOKEN", "HIVEATTIC_REVIEWER_TOKEN", "HIVEATTIC_E2E_READ_ONLY", "HIVEATTIC_E2E_MODE"];
+const PROD_HOSTS = new Set(["hiveattic.example.workers.dev", "hiveattic.com", "vault.hiveattic.com"]);
+const stagingBase = (process.env.HIVEATTIC_STAGING_BASE_URL ?? "").trim().replace(/\/$/, "");
 const stagingAdmin = process.env.HIVEATTIC_STAGING_ADMIN_TOKEN ?? "";
-const prodAdmin = process.env.HIVEATTIC_ADMIN_TOKEN ?? "";
-const suppliedReviewer = process.env.HIVEATTIC_REVIEWER_TOKEN ?? "";
-const readOnly = /^(1|true|yes|read-only)$/i.test(process.env.HIVEATTIC_E2E_READ_ONLY ?? "") || process.env.HIVEATTIC_E2E_MODE === "read-only";
+const suppliedReviewer = process.env.HIVEATTIC_STAGING_REVIEWER_TOKEN ?? "";
 const outPath = process.env.HIVEATTIC_E2E_OUT ?? "e2e-results/results.json";
 const writeRoot = stagingBase;
 const admin = stagingAdmin;
+// The only wrangler command the harness runs is a tail of the staging worker, and it names this config.
+const STAGING_CONFIG = process.env.HIVEATTIC_STAGING_WRANGLER_CONFIG?.trim() || "wrangler.staging.example.jsonc";
+const JOB_CEILING_MS = 10 * 60 * 1000;
 
 const dryRun = process.argv.includes("--dry-run") || process.env.HIVEATTIC_E2E_DRY_RUN === "1";
 const runId = `e2e${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`;
@@ -29,9 +35,13 @@ let financeRw = "";
 let financeRo = "";
 let chief = "";
 let sharedWriter = "";
+let sharedReader = "";
+let healthReader = "";
 let dlqDepth: number | null = null;
 let stagingOk = false;
 let exitCode = 0;
+let tailChild: ChildProcess | null = null;
+let tailText = "";
 
 class StopRun extends Error {
   exitStatus: number;
@@ -39,6 +49,49 @@ class StopRun extends Error {
     super(message);
     this.exitStatus = exitStatus;
   }
+}
+
+// A staging target is the hiveattic-staging workers.dev host over https. A dry run talks to a local mock only.
+function stagingUrlProblem(raw: string, dry: boolean): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return "HIVEATTIC_STAGING_BASE_URL is not a URL";
+  }
+  const host = url.hostname.toLowerCase();
+  if (dry) return host === "127.0.0.1" || host === "localhost" ? null : "a dry run only talks to a local mock on 127.0.0.1 or localhost";
+  if (PROD_HOSTS.has(host)) return `${host} is a production host`;
+  if (!/^hiveattic-staging[.-]/.test(host) || !host.endsWith(".workers.dev")) return "the staging URL must be the hiveattic-staging workers.dev host";
+  if (url.protocol !== "https:") return "the staging URL must use https";
+  return null;
+}
+
+function stagingBucketProblem(bucket: string | undefined): string | null {
+  if (!bucket) return "R2_BUCKET is not set";
+  return /^hiveattic-staging-[a-z0-9-]+$/.test(bucket) ? null : `R2_BUCKET ${bucket} is not a hiveattic-staging-* bucket`;
+}
+
+function refuseIfMisconfigured(): void {
+  const prodSet = PROD_NAMED.filter((name) => (process.env[name] ?? "").trim() !== "");
+  if (prodSet.length) {
+    throw new StopRun(2, `Refusing to run: ${prodSet.join(", ")} ${prodSet.length === 1 ? "is" : "are"} set. This harness reads only HIVEATTIC_STAGING_* names. Unset them first.`);
+  }
+  if (!stagingBase || !stagingAdmin) {
+    throw new StopRun(2, "Refusing to run: set HIVEATTIC_STAGING_BASE_URL and HIVEATTIC_STAGING_ADMIN_TOKEN. A dry run needs a local mock URL.");
+  }
+  const urlProblem = stagingUrlProblem(stagingBase, dryRun);
+  if (urlProblem) throw new StopRun(2, `Refusing to run: ${urlProblem}.`);
+  const r2 = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT", "R2_BUCKET"];
+  if (r2.some((name) => process.env[name])) {
+    const bucketProblem = stagingBucketProblem(process.env.R2_BUCKET);
+    if (bucketProblem) throw new StopRun(2, `Refusing to run: ${bucketProblem}. Unset every R2_* name to skip T-11.`);
+  }
+  const worker = process.env.HIVEATTIC_WORKER_NAME?.trim();
+  if (worker && !worker.startsWith("hiveattic-staging")) throw new StopRun(2, `Refusing to run: HIVEATTIC_WORKER_NAME ${worker} is not the staging worker.`);
+  if (!/staging/.test(STAGING_CONFIG)) throw new StopRun(2, `Refusing to run: HIVEATTIC_STAGING_WRANGLER_CONFIG ${STAGING_CONFIG} is not a staging config.`);
+  const dlq = process.env.HIVEATTIC_DLQ_NAME?.trim();
+  if (dlq && !dlq.includes("staging")) throw new StopRun(2, `Refusing to run: HIVEATTIC_DLQ_NAME ${dlq} is not a staging queue.`);
 }
 
 async function assertStaging(): Promise<void> {
@@ -49,7 +102,7 @@ async function assertStaging(): Promise<void> {
 }
 
 async function prepare(): Promise<void> {
-  reviewer = suppliedReviewer || (await mint("reviewer", [], `${runId}-reviewer`, "reviewer"));
+  reviewer = suppliedReviewer || (await mint(`${runId}-reviewer`, [], `${runId}-reviewer`, "reviewer"));
   readerX = await mint(`${runId}-reader-x`, ["read:shared", "read:own", "write:own", "read:domain/x", "write:domain/x"], `${runId}-reader-x`);
   financeRw = await mint(
     `${runId}-finance-rw`,
@@ -59,21 +112,10 @@ async function prepare(): Promise<void> {
   financeRo = await mint(`${runId}-finance-ro`, ["read:shared", "read:own", "write:own", "read:domain/finance", "read:sensitive/finance"], `${runId}-finance-ro`);
   chief = await mint(`${runId}-chief`, ["read:shared", "read:inbox", "read:sensitive:summary/health", "read:sensitive:summary/finance"], `${runId}-chief`);
   sharedWriter = await mint(`${runId}-shared-writer`, ["read:shared", "read:own", "write:own", "write:shared", "write:decisions"], `${runId}-shared-writer`);
+  sharedReader = await mint(`${runId}-shared-reader`, ["read:shared"], `${runId}-shared-reader`);
+  healthReader = await mint(`${runId}-health-reader`, ["read:shared", "read:sensitive/health"], `${runId}-health-reader`);
   const boot = await rest("/v1/admin/bootstrap", admin, "POST", {});
   if (boot.status !== 200) throw new Error(`bootstrap ${boot.status}`);
-}
-
-async function readOnlyReviewer(): Promise<Check[]> {
-  const root = prodBase || stagingBase;
-  const who = await rest("/v1/whoami", suppliedReviewer, "GET", undefined, root);
-  const search = await rest("/v1/search?q=vault", suppliedReviewer, "GET", undefined, root);
-  dlqDepth = await readDlqDepth();
-  return [
-    check("whoami", who.status === 200 && who.json.data?.admin === false, `status ${who.status}`, { who }),
-    check("search", search.status === 200, `status ${search.status}`, { search }),
-    check("no writes sent", true),
-    check("dlq depth", typeof dlqDepth === "number", dlqDepth === null ? "DLQ depth was not readable" : `depth ${dlqDepth}`),
-  ];
 }
 
 async function scopeCase(): Promise<Check[]> {
@@ -130,65 +172,71 @@ async function scopeCase(): Promise<Check[]> {
 }
 
 // HiveAttic does not filter content. Bots must never write secrets; these samples are fake and the server stores them as sent.
-async function keyLikeCase(): Promise<Check[]> {
-  const sample = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
-  const path = `shared/${runId}-keylike.md`;
-  const written = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `prefix ${sample} ${runId}keylike`, type: "note" });
-  const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedWriter);
+
+// Filter-removal smoke, in place of the retired T-02, T-03, and T-04. HiveAttic does not filter
+// content. These samples are fake: each write is accepted and stored as written, and neither
+// Workers Logs nor tail echo a body. Bots must still never write real secrets.
+async function filterSmokeCase(): Promise<Check[]> {
+  const started = Date.now();
+  const samples = [
+    { label: "fake key", text: "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789" },
+    { label: "test card", text: "4242 4242 4242 4242" },
+    { label: "password line", text: "password: x" },
+    { label: "employer text", text: "Contoso Q3 roadmap for the Qx account team" },
+  ];
+  const checks: Check[] = [];
+  const fragments: string[] = [];
+  for (const sample of samples) {
+    const marker = `${runId}smoke${fragments.length}`;
+    const path = `shared/${runId}-smoke-${fragments.length}.md`;
+    const body = `${marker} ${sample.text}`;
+    fragments.push(marker);
+    const written = await rest("/v1/notes", sharedWriter, "PUT", { path, body, type: "note" });
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedReader);
+    checks.push(check(`${sample.label} accepted`, written.status === 200 && written.json.data?.rerouted !== true, `status ${written.status}`, { written }));
+    checks.push(check(`${sample.label} stored as written`, read.status === 200 && String(read.json.data?.markdown ?? "").includes(body), undefined, { read }));
+  }
   const client = await mcpClient(sharedWriter);
   try {
-    const mcpPath = `shared/${runId}-keylike-mcp.md`;
-    const viaMcp = await tool(client, "vault_write_note", { path: mcpPath, body: "password: hunter2", type: "note" });
-    const mcpRead = await rest(`/v1/notes?path=${encodeURIComponent(mcpPath)}`, sharedWriter);
-    return [
-      check("rest accepts key-like string", written.status === 200, `status ${written.status}`, { written }),
-      check("key-like string stored", read.status === 200 && String(read.json.data?.markdown ?? "").includes(sample), undefined, { read }),
-      check("mcp accepts password line", viaMcp.ok === true, undefined, { viaMcp }),
-      check("password line stored", String(mcpRead.json.data?.markdown ?? "").includes("hunter2"), undefined, { mcpRead }),
-    ];
+    const mcpPath = `shared/${runId}-smoke-mcp.md`;
+    const viaMcp = await tool(client, "vault_write_note", { path: mcpPath, body: `${runId}smokemcp password: x`, type: "note" });
+    fragments.push(`${runId}smokemcp`);
+    checks.push(check("mcp accepts a password line", viaMcp.ok === true, undefined, { viaMcp }));
   } finally {
     await client.close();
   }
+  const audit = await rest("/v1/admin/audit?limit=50", admin);
+  checks.push(check("audit rows carry no body", audit.status === 200 && !fragments.some((fragment) => audit.text.includes(fragment)), undefined, { audit }));
+  checks.push(await logsOmit("SMOKE", fragments, started));
+  return checks;
 }
 
-async function cardAccountCase(): Promise<Check[]> {
-  const cardNumber = "4242424242424242";
-  const accountNumber = "5839201746";
-  const routingNumber = "021000021";
-  const cardPath = `shared/${runId}-card.md`;
-  const accountPath = `shared/${runId}-acct.md`;
-  const card = await rest("/v1/notes", sharedWriter, "PUT", { path: cardPath, body: `Card ${cardNumber} on file`, type: "note" });
-  const account = await rest("/v1/notes", sharedWriter, "PUT", { path: accountPath, body: `The brokerage account ${accountNumber} is on file.`, type: "note" });
-  const routing = await rest("/v1/facts", sharedWriter, "POST", { key: `${runId}-route`, statement: `routing ${routingNumber}`, observed_at: "2026-01-01T00:00:00Z", scope: "own" });
-  const cardRead = await rest(`/v1/notes?path=${encodeURIComponent(cardPath)}`, sharedWriter);
-  const accountRead = await rest(`/v1/notes?path=${encodeURIComponent(accountPath)}`, sharedWriter);
+// T-15 on staging: health text written to shared/ lands in sensitive/health/, a read:shared token
+// cannot find it, and a health reader can. Breaker's probe covers the full matrix.
+async function rerouteCase(): Promise<Check[]> {
+  const marker = `${runId}reroute`;
+  const path = `shared/${runId}-h-note.md`;
+  const target = `sensitive/health/${path}`;
+  const key = `${runId}-reroute-key`;
+  const written = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `Synthetic flu shot ${marker}`, type: "note", idempotency_key: key });
+  const retry = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `Synthetic flu shot ${marker}`, type: "note", idempotency_key: key });
+  const readerShared = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedReader);
+  const readerTarget = await rest(`/v1/notes?path=${encodeURIComponent(target)}`, sharedReader);
+  const readerSearch = await rest(`/v1/search?q=${marker}`, sharedReader);
+  const writerRead = await rest(`/v1/notes?path=${encodeURIComponent(target)}`, sharedWriter);
+  const healthRead = await rest(`/v1/notes?path=${encodeURIComponent(target)}`, healthReader);
+  const journal = await rest("/v1/journal", sharedWriter, "POST", { target: "shared", title: "health", body: `Synthetic flu shot booked ${marker}j`, at: "2099-06-01T16:00:00Z" });
+  const day = await rest("/v1/notes?path=journal/2099/06/2099-06-01.md", sharedReader);
   return [
-    check("card accepted", card.status === 200, `status ${card.status}`, { card }),
-    check("card stored", String(cardRead.json.data?.markdown ?? "").includes(cardNumber), undefined, { cardRead }),
-    check("account accepted", account.status === 200, `status ${account.status}`, { account }),
-    check("account stored", String(accountRead.json.data?.markdown ?? "").includes(accountNumber), undefined, { accountRead }),
-    check("routing fact accepted", routing.status === 200, `status ${routing.status}`, { routing }),
+    check("health note rerouted with 201", written.status === 201 && written.json.data?.path === target && written.json.data?.sensitive_domain === "health", `status ${written.status}`, { written }),
+    check("idempotent retry returns the same 201", retry.status === 201 && JSON.stringify(retry.json.data) === JSON.stringify(written.json.data), undefined, { retry }),
+    check("read:shared token gets 404 at both paths", readerShared.status === 404 && readerTarget.status === 404, undefined, { readerShared, readerTarget }),
+    check("read:shared search finds nothing", results(readerSearch.json).length === 0, undefined, { readerSearch }),
+    check("writer without read:sensitive/health gets 404", writerRead.status === 404, undefined, { writerRead }),
+    check("health reader reads it", healthRead.status === 200, undefined, { healthRead }),
+    check("shared journal entry rerouted", journal.status === 201 && journal.json.data?.rerouted === true, `status ${journal.status}`, { journal }),
+    check("shared day file has no trace of it", !day.text.includes(`${marker}j`), undefined, { day }),
   ];
-}
-
-async function newestCase(): Promise<Check[]> {
-  const key = `${runId}-city`;
-  const older = await rest("/v1/facts", readerX, "POST", { key, statement: `Lives in cedar ${runId}old`, observed_at: "2020-01-01T00:00:00Z", scope: "own" });
-  const client = await mcpClient(readerX);
-  try {
-    const newer = await tool(client, "vault_write_fact", { key, statement: `Lives in maple ${runId}new`, observed_at: "2024-01-01T00:00:00Z", scope: "own" });
-    const path = `bots/${runId}-reader-x/facts/${key}.md`;
-    const active = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, readerX);
-    const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, admin);
-    const bodies = versions(history.json).map((version) => String(version.body ?? ""));
-    return [
-      check("updated", older.status === 200 && newer.data?.outcome === "updated", undefined, { older, newer }),
-      check("active is newer", String(active.json.data?.markdown ?? "").includes(`${runId}new`) && !String(active.json.data?.markdown ?? "").includes(`${runId}old`), undefined, { active }),
-      check("history has both", bodies.some((body) => body.includes(`${runId}old`)) && bodies.some((body) => body.includes(`${runId}new`)), undefined, { history }),
-    ];
-  } finally {
-    await client.close();
-  }
 }
 
 async function concurrencyCase(): Promise<Check[]> {
@@ -212,8 +260,8 @@ async function concurrencyCase(): Promise<Check[]> {
     );
     sent.push(...batch);
     for (const item of batch) {
-      if (item.status === 429) return [check("seven by one hundred", false, rateLimitDetail(), { sent })];
-      if (item.status !== 200) return [check("seven by one hundred", false, `status ${item.status}`, { sent })];
+      if (item.status === 429) return [check("seven by twenty", false, rateLimitDetail(), { sent })];
+      if (item.status !== 200) return [check("seven by twenty", false, `status ${item.status}`, { sent })];
       const ref = String(item.json.data?.block_ref ?? "");
       if (!ref || seen.has(ref)) return [check("unique block refs", false, "duplicate or missing block_ref", { sent })];
       seen.add(ref);
@@ -233,6 +281,17 @@ async function concurrencyCase(): Promise<Check[]> {
       if (hits.length !== 1) torn += 1;
     }
   }
+  // One batch to the shared day file from seven different tokens.
+  const tokens: string[] = [];
+  for (let slot = 0; slot < 7; slot++) tokens.push(await mint(`${runId}-day-${slot}`, ["read:shared", "write:shared"], `${runId}-day-${slot}`));
+  const sharedAt = "2099-11-12T15:00:00.000Z";
+  const sharedBatch = await Promise.all(tokens.map((token, slot) => rest("/v1/journal", token, "POST", { target: "shared", title: `t${slot}`, body: `${runId}-shared-${slot}`, at: sharedAt })));
+  const sharedPath = "journal/2099/11/2099-11-12.md";
+  const sharedNote = await rest(`/v1/notes?path=${encodeURIComponent(sharedPath)}`, sharedWriter);
+  const sharedMarkdown = String(sharedNote.json.data?.markdown ?? "");
+  const sharedOrder = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(sharedPath)}`, admin);
+  const sharedRefs = Array.isArray(sharedOrder.json.data?.block_refs) ? (sharedOrder.json.data?.block_refs as string[]) : [];
+  const sharedFileOrder = [...sharedMarkdown.matchAll(/\^([0-9A-HJKMNP-TV-Z]{26})/g)].map((match) => `^${match[1]}`);
   const path = `shared/${runId}-etag.md`;
   const created = await rest("/v1/notes", sharedWriter, "PUT", { path, body: "one", type: "note" });
   const etag = String(created.json.data?.etag ?? "");
@@ -241,7 +300,7 @@ async function concurrencyCase(): Promise<Check[]> {
   const fileOrder = [...markdown.matchAll(/\^([0-9A-HJKMNP-TV-Z]{26})/g)].map((match) => `^${match[1]}`);
   const order = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
   const stored = Array.isArray(order.json.data?.block_refs) ? (order.json.data?.block_refs as string[]) : [];
-  const rebuilt = await rest("/v1/admin/reindex", admin, "POST", {});
+  const rebuilt = await runJob("/v1/admin/reindex");
   const after = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
   const afterMarkdown = String(after.json.data?.markdown ?? "");
   let stillMissing = 0;
@@ -250,11 +309,38 @@ async function concurrencyCase(): Promise<Check[]> {
     check("one hundred forty refs", seen.size === batches * 7 && missing === 0, missing ? `${missing} markers missing` : `${seen.size} refs`, { sent, note }),
     check("entries intact", torn === 0, torn ? `${torn} entries were split or duplicated` : undefined, { note }),
     check("journal order", order.status === 200 && stored.join() === fileOrder.join(), `status ${order.status}`, { order }),
+    check(
+      "shared day file from seven tokens",
+      sharedBatch.every((item) => item.status === 200) && sharedRefs.length >= 7 && sharedRefs.join() === sharedFileOrder.join() && tokens.every((_, slot) => sharedMarkdown.includes(`${runId}-shared-${slot}`)),
+      `${sharedRefs.length} refs`,
+      { sharedBatch, sharedOrder },
+    ),
     check("stale etag", stale.status === 409 && stale.json.error?.code === "conflict_etag", `status ${stale.status}`, { created, updated, stale }),
-    check("reindex", rebuilt.status === 200, rebuildDetail(rebuilt), { rebuilt }),
+    check("reindex job", rebuilt.job?.status === "done", jobDetail(rebuilt), { started: rebuilt.started }),
     check("entries survive rebuild", stillMissing === 0 && after.json.data?.status === "active", stillMissing ? `${stillMissing} refs missing after rebuild` : undefined, { after }),
   ];
 }
+
+async function newestCase(): Promise<Check[]> {
+  const key = `${runId}-city`;
+  const older = await rest("/v1/facts", readerX, "POST", { key, statement: `Lives in cedar ${runId}old`, observed_at: "2020-01-01T00:00:00Z", scope: "own" });
+  const client = await mcpClient(readerX);
+  try {
+    const newer = await tool(client, "vault_write_fact", { key, statement: `Lives in maple ${runId}new`, observed_at: "2024-01-01T00:00:00Z", scope: "own" });
+    const path = `bots/${runId}-reader-x/facts/${key}.md`;
+    const active = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, readerX);
+    const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, admin);
+    const bodies = versions(history.json).map((version) => String(version.body ?? ""));
+    return [
+      check("updated", older.status === 200 && newer.data?.outcome === "updated", undefined, { older, newer }),
+      check("active is newer", String(active.json.data?.markdown ?? "").includes(`${runId}new`) && !String(active.json.data?.markdown ?? "").includes(`${runId}old`), undefined, { active }),
+      check("history has both", bodies.some((body) => body.includes(`${runId}old`)) && bodies.some((body) => body.includes(`${runId}new`)), undefined, { history }),
+    ];
+  } finally {
+    await client.close();
+  }
+}
+
 
 async function appendOnlyCase(): Promise<Check[]> {
   const client = await mcpClient(sharedWriter);
@@ -305,16 +391,16 @@ async function forgetCase(): Promise<Check[]> {
   }
 }
 
+
 async function humanEditCase(): Promise<Check[]> {
   if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !process.env.R2_ENDPOINT || !process.env.R2_BUCKET) {
-    return [{ name: "s3 edit", status: "skipped", detail: "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, and R2_BUCKET", responses: [] }];
+    return [{ name: "s3 edit", status: "skipped", detail: "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, and R2_BUCKET (a hiveattic-staging-* bucket)", responses: [] }];
   }
   const bucket = process.env.R2_BUCKET;
   const path = `shared/${runId}-human.md`;
   const created = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `Original ${runId}alpha`, type: "note" });
-  const s3 = s3Client();
   const started = Date.now();
-  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: `vault/${path}`, Body: `Updated ${runId}beta from outside the api\n`, ContentType: "text/markdown" }));
+  await s3Put(bucket, `vault/${path}`, `Updated ${runId}beta from outside the api\n`);
   let found = false;
   let lastSearch: RestResult | undefined;
   while (Date.now() - started < 10_000) {
@@ -323,7 +409,7 @@ async function humanEditCase(): Promise<Check[]> {
       found = true;
       break;
     }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await sleep(400);
   }
   const elapsed = Date.now() - started;
   const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, admin);
@@ -331,7 +417,7 @@ async function humanEditCase(): Promise<Check[]> {
   const dayPath = String(day.json.data?.path ?? "");
   const dayBefore = await rest(`/v1/notes?path=${encodeURIComponent(dayPath)}`, sharedWriter);
   const dayBytes = String(dayBefore.json.data?.markdown ?? "");
-  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: `vault/${dayPath}`, Body: `${dayBytes}\n`, ContentType: "text/markdown" }));
+  await s3Put(bucket, `vault/${dayPath}`, `${dayBytes}\n`);
   let dayActive = false;
   let dayRead: RestResult | undefined;
   const dayStarted = Date.now();
@@ -341,11 +427,43 @@ async function humanEditCase(): Promise<Check[]> {
       dayActive = true;
       break;
     }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await sleep(400);
   }
+  // A fake secret pasted through S3 is not filtered: it stays active and searchable.
+  const keyPath = `shared/${runId}-s3key.md`;
+  await s3Put(bucket, `vault/${keyPath}`, `token sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 ${runId}s3key\n`);
+  let keyActive = false;
+  let keyRead: RestResult | undefined;
+  const keyStarted = Date.now();
+  while (Date.now() - keyStarted < 10_000) {
+    keyRead = await rest(`/v1/notes?path=${encodeURIComponent(keyPath)}`, sharedReader);
+    const hits = results((await rest(`/v1/search?q=${runId}s3key`, sharedReader)).json);
+    if (keyRead.json.data?.status === "active" && hits.some((row) => row.path === keyPath)) {
+      keyActive = true;
+      break;
+    }
+    await sleep(400);
+  }
+  // Health text pasted into shared/ through S3 is moved to sensitive/health/ and never readable at the shared path.
+  const healthPath = `shared/${runId}-h-ext.md`;
+  await s3Put(bucket, `vault/${healthPath}`, `Synthetic flu shot ${runId}s3health\n`);
+  let movedOk = false;
+  let movedRead: RestResult | undefined;
+  let sharedRead: RestResult | undefined;
+  const movedStarted = Date.now();
+  while (Date.now() - movedStarted < 10_000) {
+    movedRead = await rest(`/v1/notes?path=${encodeURIComponent(`sensitive/health/${healthPath}`)}`, healthReader);
+    sharedRead = await rest(`/v1/notes?path=${encodeURIComponent(healthPath)}`, sharedReader);
+    if (movedRead.status === 200 && sharedRead.status === 404) {
+      movedOk = true;
+      break;
+    }
+    await sleep(400);
+  }
+  const healthSearch = await rest(`/v1/search?q=${runId}s3health`, sharedReader);
   const dst = `shared/${runId}-copy.md`;
-  await s3.send(new CopyObjectCommand({ Bucket: bucket, Key: `vault/${dst}`, CopySource: `${bucket}/vault/${path}` }));
-  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: `vault/${path}` }));
+  await s3Copy(bucket, `vault/${dst}`, `${bucket}/vault/${path}`);
+  await s3Delete(bucket, `vault/${path}`);
   let copied = false;
   let sourceForgotten = false;
   let dstRead: RestResult | undefined;
@@ -357,32 +475,33 @@ async function humanEditCase(): Promise<Check[]> {
     copied = dstRead.json.data?.status === "active";
     sourceForgotten = srcRead.json.data?.status === "forgotten";
     if (copied && sourceForgotten) break;
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await sleep(400);
   }
+  const deletedRead = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedWriter);
   const audits = await rest(`/v1/admin/audit?path=${encodeURIComponent(dst)}&limit=20`, admin);
   const sourceAudits = await rest(`/v1/admin/audit?path=${encodeURIComponent(path)}&limit=20`, admin);
   const auditText = JSON.stringify([audits.json.data?.entries, sourceAudits.json.data?.entries]);
-  const settle = await rest("/v1/admin/reconcile", admin, "POST", {});
+  const settle = await runJob("/v1/admin/reconcile");
   const versionsBefore = versions((await rest(`/v1/history?path=${encodeURIComponent(dst)}`, admin)).json).length;
   const auditsBefore = ((await rest(`/v1/admin/audit?path=${encodeURIComponent(dst)}&limit=50`, admin)).json.data?.entries as unknown[] | undefined)?.length ?? 0;
-  const second = await rest("/v1/admin/reconcile", admin, "POST", {});
+  const second = await runJob("/v1/admin/reconcile");
   const versionsAfter = versions((await rest(`/v1/history?path=${encodeURIComponent(dst)}`, admin)).json).length;
   const auditsAfter = ((await rest(`/v1/admin/audit?path=${encodeURIComponent(dst)}&limit=50`, admin)).json.data?.entries as unknown[] | undefined)?.length ?? 0;
   const gonePath = `shared/${runId}-drop.md`;
   const gone = await rest("/v1/notes", sharedWriter, "PUT", { path: gonePath, body: `${runId}dropme`, type: "note" });
-  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: `vault/${gonePath}` }));
-  const dropReconcile = await rest("/v1/admin/reconcile", admin, "POST", {});
+  await s3Delete(bucket, `vault/${gonePath}`);
+  const dropReconcile = await runJob("/v1/admin/reconcile");
   let dropped = false;
   let goneRead: RestResult | undefined;
   const dropStarted = Date.now();
   while (Date.now() - dropStarted < 8_000) {
-    goneRead = await rest(`/v1/notes?path=${encodeURIComponent(gonePath)}`, admin);
+    goneRead = await rest(`/v1/notes?path=${encodeURIComponent(gonePath)}`, sharedWriter);
     const hits = results((await rest(`/v1/search?q=${runId}dropme`, sharedWriter)).json);
     if (goneRead.json.data?.status === "forgotten" && hits.length === 0) {
       dropped = true;
       break;
     }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await sleep(400);
   }
   dlqDepth = await readDlqDepth();
   return [
@@ -390,10 +509,18 @@ async function humanEditCase(): Promise<Check[]> {
     check("keyword searchable within 10s", found && elapsed <= 10_000, `${elapsed}ms`, { lastSearch }),
     check("history snapshot", versions(history.json).some((version) => String(version.body ?? "").includes(`${runId}alpha`)), undefined, { history }),
     check("edited journal stays active", day.status === 200 && dayActive, undefined, { day, dayRead }),
+    check("fake secret via S3 stays active and searchable", keyActive, undefined, { keyRead }),
+    check("health text via S3 is moved out of shared/", movedOk && results(healthSearch.json).length === 0, undefined, { movedRead, sharedRead, healthSearch }),
     check("copy indexed and source forgotten", copied && sourceForgotten, undefined, { dstRead, srcRead }),
+    check("outside delete returns a stub without the body", deletedRead.json.data?.status === "forgotten" && !deletedRead.text.includes(`${runId}beta`), undefined, { deletedRead }),
     check("external audit has no identity", auditText.includes("external_copy") && auditText.includes("external_delete") && auditText.includes("r2-event"), undefined, { audits, sourceAudits }),
-    check("second reconcile is quiet", settle.status === 200 && second.status === 200 && versionsAfter === versionsBefore && auditsAfter === auditsBefore, undefined, { settle, second }),
-    check("missing object is forgotten", gone.status === 200 && dropped, undefined, { gone, dropReconcile, goneRead }),
+    check(
+      "second reconcile is quiet",
+      settle.job?.status === "done" && second.job?.status === "done" && versionsAfter === versionsBefore && auditsAfter === auditsBefore,
+      `${jobDetail(settle)}; ${jobDetail(second)}`,
+      { settle: settle.started, second: second.started },
+    ),
+    check("missing object is forgotten", gone.status === 200 && dropReconcile.job?.status === "done" && dropped, jobDetail(dropReconcile), { gone, goneRead }),
     check("dlq depth", dlqDepth === 0, dlqDepth === null ? "DLQ depth was not readable" : `depth ${dlqDepth}`),
   ];
 }
@@ -403,7 +530,8 @@ async function rebuildCase(): Promise<Check[]> {
   const path = `shared/${runId}-rebuild.md`;
   const created = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `${marker} before`, type: "note" });
   const etag = String(created.json.data?.etag ?? "");
-  const edited = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `${marker} after`, type: "note", if_match: etag });
+  const edited = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `${marker} after [[shared/${runId}-target]]`, type: "note", if_match: etag });
+  const linked = await rest("/v1/notes", sharedWriter, "PUT", { path: `shared/${runId}-target.md`, body: `${marker} target`, type: "note" });
   const journal = await rest("/v1/journal", sharedWriter, "POST", {
     target: "shared",
     title: "one",
@@ -425,13 +553,18 @@ async function rebuildCase(): Promise<Check[]> {
   const forget = await rest("/v1/forget", sharedWriter, "POST", { path: forgottenPath, reason: "rebuild check" });
   const before = await rest(`/v1/search?q=${marker}`, sharedWriter);
   const entriesBefore = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
-  const rebuilt = await rest("/v1/admin/reindex", admin, "POST", {});
-  const audit = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(rebuilt.json.request_id ?? ""))}&limit=10`, admin);
+  // A write that lands while the job runs must survive it.
+  const rebuilt = await runJob("/v1/admin/reindex", {}, async () => {
+    const during = await rest("/v1/notes", sharedWriter, "PUT", { path: `shared/${runId}-during.md`, body: `${marker} during`, type: "note" }, writeRoot, { "idempotency-key": `${runId}-during` });
+    duringWrites.push(during);
+  });
+  const audit = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(rebuilt.started?.json.request_id ?? ""))}&limit=10`, admin);
   const reindexRow = auditEntries(audit.json).find((entry) => entry.action === "reindex");
   const after = await rest(`/v1/search?q=${marker}`, sharedWriter);
   const entriesAfter = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
   const day = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
   const decisions = await rest("/v1/notes?path=shared/decisions.md", sharedWriter);
+  const duringRead = await rest(`/v1/notes?path=${encodeURIComponent(`shared/${runId}-during.md`)}`, sharedWriter);
   const retry = await rest("/v1/journal", readerX, "POST", {
     target: "own",
     title: "once",
@@ -447,13 +580,18 @@ async function rebuildCase(): Promise<Check[]> {
   const appended = await rest("/v1/journal", sharedWriter, "POST", { target: "shared", title: "three", body: `${marker} journal three`, at: "2099-05-05T20:00:00Z" });
   const reread = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
   const markdown = String(reread.json.data?.markdown ?? "");
+  const beforePaths = paths(before.json);
+  const afterPaths = paths(after.json).filter((item) => item !== `shared/${runId}-during.md`);
   return [
-    check("setup writes", [created, edited, journal, journalTwo, toForget, forget].every((item) => item.status === 200), undefined, { created, edited, journal, journalTwo, toForget, forget }),
+    check("setup writes", [created, edited, linked, journal, journalTwo, toForget, forget].every((item) => item.status === 200), undefined, { created, edited, linked, journal, journalTwo, toForget, forget }),
     check("decision write", decision.status === 200, `status ${decision.status}`, { decision }),
     check("own journal write", own.status === 200, `status ${own.status}`, { own }),
-    check("reindex", rebuilt.status === 200, rebuildDetail(rebuilt), { rebuilt }),
+    check("reindex job", rebuilt.job?.status === "done", jobDetail(rebuilt), { started: rebuilt.started }),
     check("reindex audited", reindexRow?.outcome === "ok", reindexRow ? `${reindexRow.outcome} ${reindexRow.detail ?? ""}`.slice(0, 240) : "no reindex audit row", { audit }),
-    check("search matches", paths(before.json).join() === paths(after.json).join() && paths(after.json).includes(path), undefined, { before, after }),
+    duringWrites.length === 0
+      ? { name: "write during the job survives", status: "skipped", detail: "the job finished before the first poll, so no write landed during it", responses: [] }
+      : check("write during the job survives", duringWrites.every((item) => item.status === 200) && duringRead.json.data?.status === "active", `${duringWrites.length} writes`, { duringRead }),
+    check("search matches", beforePaths.join() === afterPaths.join() && afterPaths.includes(path), undefined, { before, after }),
     check("journals stay active", day.json.data?.status === "active" && decisions.json.data?.status === "active", undefined, { day, decisions }),
     check("journal order unchanged", JSON.stringify(entriesBefore.json.data?.block_refs ?? []) === JSON.stringify(entriesAfter.json.data?.block_refs ?? []), undefined, { entriesBefore, entriesAfter }),
     check("idempotent retry", retry.json.data?.entry_id === own.json.data?.entry_id, undefined, { retry }),
@@ -463,24 +601,23 @@ async function rebuildCase(): Promise<Check[]> {
   ];
 }
 
+const duringWrites: RestResult[] = [];
+
 async function cleanupCase(): Promise<Check[]> {
-  const checks: Check[] = [];
-  if (prodBase && prodAdmin) {
-    const denied = await rest("/v1/admin/cleanup", prodAdmin, "POST", { run_id: runId }, prodBase);
-    checks.push(check("prod cleanup is 404", denied.status === 404, `status ${denied.status}`, { denied }));
-  } else {
-    checks.push({ name: "prod cleanup is 404", status: "skipped", detail: "Set HIVEATTIC_BASE_URL and HIVEATTIC_ADMIN_TOKEN to prove prod cleanup returns 404", responses: [] });
-  }
-  const cleaned = await rest("/v1/admin/cleanup", admin, "POST", { run_id: runId });
+  // Cleanup only ever runs against the staging URL the guards accepted. Production is never contacted.
+  const problem = stagingUrlProblem(writeRoot, dryRun);
+  if (problem) return [check("staging cleanup", false, `refused: ${problem}`)];
+  const cleaned = await settled(await rest("/v1/admin/cleanup", admin, "POST", { run_id: runId }));
   const audit = await rest("/v1/admin/audit?limit=30", admin);
   const left = await rest(`/v1/search?q=${runId}`, admin);
-  checks.push(check("staging cleanup", cleaned.status === 200, `status ${cleaned.status}`, { cleaned }));
-  checks.push(check("staging cleanup audited", auditEntries(audit.json).some((entry) => entry.action === "cleanup"), undefined, { audit }));
-  checks.push(check("namespaced notes gone", results(left.json).length === 0, undefined, { left }));
   const remainingNotes = cleaned.json.data?.remaining_notes;
   const remainingObjects = cleaned.json.data?.remaining_objects;
-  checks.push(check("no leftovers", remainingNotes === 0 && remainingObjects === 0, `notes ${remainingNotes} objects ${remainingObjects}`, { cleaned }));
-  return checks;
+  return [
+    check("staging cleanup", cleaned.status === 200, `status ${cleaned.status}`, { cleaned }),
+    check("staging cleanup audited", auditEntries(audit.json).some((entry) => entry.action === "cleanup"), undefined, { audit }),
+    check("namespaced notes gone", results(left.json).length === 0, undefined, { left }),
+    check("no leftovers", remainingNotes === 0 && remainingObjects === 0, `notes ${remainingNotes} objects ${remainingObjects}`, { cleaned }),
+  ];
 }
 
 async function mint(agentId: string, scopes: string[], label: string, preset?: "reviewer"): Promise<string> {
@@ -494,10 +631,10 @@ async function mint(agentId: string, scopes: string[], label: string, preset?: "
 
 type RestResult = { status: number; json: Envelope; text: string };
 
-async function rest(path: string, token: string, method = "GET", body?: unknown, root = writeRoot): Promise<RestResult> {
+async function rest(path: string, token: string, method = "GET", body?: unknown, root = writeRoot, headers: Record<string, string> = {}): Promise<RestResult> {
   const response = await fetch(`${root}${path}`, {
     method,
-    headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
@@ -508,6 +645,84 @@ async function rest(path: string, token: string, method = "GET", body?: unknown,
     json = { ok: false };
   }
   return { status: response.status, json, text };
+}
+
+// A write still running after 25 s answers 202 with an operation id. Wait for its stored result.
+async function settled(response: RestResult): Promise<RestResult> {
+  const operation = response.json.data?.operation_id;
+  if (response.status !== 202 || response.json.data?.pending !== true || typeof operation !== "string") return response;
+  const stop = Date.now() + JOB_CEILING_MS;
+  while (Date.now() < stop) {
+    await sleep(1000);
+    const polled = await rest(`/v1/operations/${operation}`, admin);
+    if (polled.json.data?.status !== "done") continue;
+    const status = Number(polled.json.data?.http_status ?? 200);
+    const result = polled.json.data?.result;
+    const error = polled.json.data?.error;
+    const json: Envelope = result ? { ok: true, data: result as Record<string, unknown>, request_id: response.json.request_id } : { ok: false, error: error as Envelope["error"], request_id: response.json.request_id };
+    return { status, json, text: JSON.stringify(json) };
+  }
+  return response;
+}
+
+type JobRun = { started: RestResult | undefined; job: Record<string, unknown> | undefined; detail: string };
+
+// Admin jobs answer 202 with a job id. Poll GET /v1/admin/jobs/:id until done or failed, for at most ten minutes.
+async function runJob(path: string, body: Record<string, unknown> = {}, whileRunning?: () => Promise<void>): Promise<JobRun> {
+  const started = await rest(path, admin, "POST", body);
+  const id = started.json.data?.job_id;
+  if (started.status !== 202 || typeof id !== "string") {
+    return { started, job: undefined, detail: `start ${started.status} ${started.json.error?.code ?? ""} ${started.json.error?.message ?? ""}`.trim() };
+  }
+  const stop = Date.now() + JOB_CEILING_MS;
+  let ran = false;
+  let last: RestResult | undefined;
+  while (Date.now() < stop) {
+    last = await rest(`/v1/admin/jobs/${id}`, admin);
+    const status = last.json.data?.status;
+    if (status === "done" || status === "failed") return { started, job: last.json.data, detail: String(status) };
+    if (whileRunning && !ran) {
+      ran = true;
+      await whileRunning();
+    }
+    await sleep(1000);
+  }
+  return { started, job: last?.json.data, detail: `job ${id} passed the ten-minute ceiling` };
+}
+
+function jobDetail(run: JobRun): string {
+  if (!run.job) return run.detail;
+  const counts = (run.job.counts ?? {}) as Record<string, unknown>;
+  const parts = [`${String(run.job.kind)} ${String(run.job.status)}`, `pages ${String(run.job.pages)}`];
+  for (const name of ["files", "notes", "versions", "moved", "swept", "updated", "forgotten", "duration_ms"]) if (name in counts) parts.push(`${name} ${String(counts[name])}`);
+  if (run.job.error) parts.push(`error ${String(run.job.error)}`);
+  return parts.join(", ");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Every S3 call goes through these, and each one checks the bucket first.
+function assertStagingBucket(bucket: string): void {
+  const problem = stagingBucketProblem(bucket);
+  if (problem) throw new StopRun(2, `Refusing the S3 call: ${problem}.`);
+}
+
+async function s3Put(bucket: string, key: string, body: string): Promise<void> {
+  assertStagingBucket(bucket);
+  await s3Client().send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: "text/markdown" }));
+}
+
+async function s3Copy(bucket: string, key: string, source: string): Promise<void> {
+  assertStagingBucket(bucket);
+  assertStagingBucket(source.split("/")[0] ?? "");
+  await s3Client().send(new CopyObjectCommand({ Bucket: bucket, Key: key, CopySource: source }));
+}
+
+async function s3Delete(bucket: string, key: string): Promise<void> {
+  assertStagingBucket(bucket);
+  await s3Client().send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }
 
 function s3Client(): S3Client {
@@ -532,7 +747,7 @@ async function tool(client: Client, name: string, args: Record<string, unknown>)
   return JSON.parse(text) as Envelope;
 }
 
-type Envelope = { ok?: boolean; request_id?: string; data?: Record<string, unknown>; error?: { code?: string; message?: string; reasons?: string[] } };
+type Envelope = { ok?: boolean; request_id?: string; data?: Record<string, unknown>; error?: { code?: string; message?: string; reasons?: string[]; limit?: string; job_id?: string } };
 
 function results(json: Envelope): { path?: string }[] {
   const value = json.data?.results;
@@ -551,12 +766,6 @@ function versions(json: Envelope): { version_ts?: string; body?: string }[] {
 function auditEntries(json: Envelope): { action?: string; outcome?: string; detail?: string | null }[] {
   const value = json.data?.entries;
   return Array.isArray(value) ? (value as { action?: string; outcome?: string; detail?: string | null }[]) : [];
-}
-
-function rebuildDetail(rebuilt: RestResult): string {
-  if (rebuilt.status !== 200) return `status ${rebuilt.status} ${rebuilt.json.error?.code ?? ""} ${rebuilt.json.error?.message ?? ""}`.trim();
-  const data = rebuilt.json.data ?? {};
-  return `notes ${String(data.notes)} versions ${String(data.versions)} in ${String(data.duration_ms)} ms`;
 }
 
 type Recorded = RestResult | Envelope | undefined;
@@ -580,8 +789,9 @@ function check(name: string, ok: boolean, detail?: string, responses: Record<str
   return { name, status: ok ? "passed" : "failed", ...(detail ? { detail } : {}), responses: recorded };
 }
 
+// The harness never changes a deployed limit. Forge raises and restores it.
 function rateLimitDetail(): string {
-  return "T-06 sends 140 journal writes in one window. Raise the limit, run the suite, then restore 60 from wrangler.jsonc: pnpm exec wrangler deploy --var RATE_LIMIT_WRITES_PER_MIN:10000 ; pnpm e2e ; pnpm exec wrangler deploy. Set HIVEATTIC_RATE_LIMIT_WRITES_PER_MIN to the deployed value (0 disables the limit) so the suite can stop before the burst.";
+  return "T-06 sends 140 journal writes in one window, more than the default 60 per minute. Ask Forge to raise the staging write limit to at least 140 before T-06 and to restore 60 afterwards. Set HIVEATTIC_RATE_LIMIT_WRITES_PER_MIN to the value Forge confirms (0 means no limit) so the suite can stop before the burst.";
 }
 
 function rateLimitBlocked(): Check | null {
@@ -592,15 +802,160 @@ function rateLimitBlocked(): Check | null {
   return check("write rate limit", false, rateLimitDetail());
 }
 
+const LOG_OPERATOR =
+  "The log check uses Workers Logs when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set, and otherwise `pnpm exec wrangler tail hiveattic-staging --config wrangler.staging.example.jsonc`. Set HIVEATTIC_LOG_MODE=tail to force tail, or HIVEATTIC_LOG_MODE=api to use only the API.";
+
+function workerName(): string {
+  return process.env.HIVEATTIC_WORKER_NAME?.trim() || "hiveattic-staging";
+}
+
+// `pnpm` is `pnpm.cmd` on Windows, which Node only starts through a shell. The arguments are fixed
+// strings and the worker name the guards accepted, so the shell sees nothing a caller chose.
+function startTail(): ChildProcess {
+  const script = process.env.HIVEATTIC_TAIL_SCRIPT?.trim();
+  if (script) return spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  const args = ["exec", "wrangler", "tail", workerName(), "--config", STAGING_CONFIG, "--format", "json"];
+  return spawn("pnpm", args, { stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" });
+}
+
+async function ensureTail(): Promise<void> {
+  if (tailChild || process.env.HIVEATTIC_LOG_MODE === "api") return;
+  tailText = "";
+  const child = startTail();
+  tailChild = child;
+  child.on("error", (err) => {
+    tailText += `\n${err.name}`;
+  });
+  child.stdout?.on("data", (chunk: Buffer) => {
+    tailText += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    tailText += chunk.toString();
+  });
+  const attachRaw = Number(process.env.HIVEATTIC_TAIL_ATTACH_MS ?? "1500");
+  const attachMs = Number.isFinite(attachRaw) && attachRaw >= 0 ? attachRaw : 1500;
+  await sleep(attachMs);
+}
+
+async function stopTail(): Promise<void> {
+  const child = tailChild;
+  tailChild = null;
+  if (!child) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+// Workers Logs (or tail) must not contain any of the written fragments.
+async function logsOmit(label: string, fragments: string[], fromMs: number): Promise<Check> {
+  const name = `${label} logs omit bodies`;
+  const needles = fragments.filter((item) => item.length > 0);
+  const mode = process.env.HIVEATTIC_LOG_MODE?.trim() || "auto";
+  const token = process.env.CLOUDFLARE_API_TOKEN?.trim() ?? "";
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ?? "";
+  if (mode !== "tail" && token && accountId) {
+    const waitRaw = Number(process.env.HIVEATTIC_LOG_WAIT_MS ?? "15000");
+    const waitMs = Number.isFinite(waitRaw) && waitRaw >= 0 ? waitRaw : 15000;
+    const deadline = Date.now() + waitMs;
+    let sawEvents = false;
+    let lastError = "";
+    do {
+      const page = await queryWorkerLogs(token, accountId, workerName(), fromMs).catch((err: unknown) => ({
+        ok: false as const,
+        detail: err instanceof Error ? err.name : "workers logs query failed",
+      }));
+      if (!page.ok) {
+        lastError = page.detail;
+        break;
+      }
+      if (page.events > 0) sawEvents = true;
+      if (needles.some((needle) => page.text.includes(needle))) return check(name, false, "workers logs echoed a written body");
+      if (Date.now() >= deadline) break;
+      await sleep(3000);
+    } while (Date.now() <= deadline);
+    if (sawEvents) return check(name, true);
+    if (mode === "api") return check(name, false, sanitize(lastError || "Workers Logs returned no events", needles));
+  }
+  await ensureTail();
+  const waitRaw = Number(process.env.HIVEATTIC_LOG_WAIT_MS ?? "8000");
+  const waitMs = Number.isFinite(waitRaw) && waitRaw >= 0 ? Math.min(waitRaw, 20000) : 8000;
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    if (needles.some((needle) => tailText.includes(needle))) return check(name, false, "the staging tail echoed a written body");
+    await sleep(500);
+  }
+  if (!tailText.trim()) return check(name, false, sanitize(`The staging tail produced no output. ${LOG_OPERATOR}`, needles));
+  return check(name, true);
+}
+
+async function queryWorkerLogs(token: string, accountId: string, script: string, fromMs: number): Promise<{ ok: true; text: string; events: number } | { ok: false; detail: string }> {
+  const to = Math.max(Date.now(), fromMs + 1);
+  let offset: string | undefined;
+  let combined = "";
+  let events = 0;
+  for (let page = 0; page < 5; page++) {
+    const response = await fetch(cfApi(`/accounts/${accountId}/workers/observability/telemetry/query`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        queryId: "hiveattic-e2e",
+        dry: true,
+        limit: 100,
+        timeframe: { from: Math.max(0, fromMs - 5000), to },
+        parameters: {
+          datasets: ["cloudflare-workers"],
+          filterCombination: "and",
+          filters: [{ key: "$metadata.service", operation: "eq", type: "string", value: script }],
+          limit: 100,
+          view: "events",
+        },
+        ...(offset ? { offset } : {}),
+      }),
+    });
+    const text = await response.text();
+    if (!response.ok) return { ok: false, detail: `workers logs status ${response.status}` };
+    let body: { success?: boolean; errors?: { message?: string }[]; result?: { events?: { count?: number; events?: { $metadata?: { id?: string } }[] } } };
+    try {
+      body = JSON.parse(text) as typeof body;
+    } catch {
+      return { ok: false, detail: "workers logs response was not json" };
+    }
+    if (body.success === false) return { ok: false, detail: body.errors?.[0]?.message || "workers logs query failed" };
+    const rows = body.result?.events?.events ?? [];
+    events += rows.length;
+    combined += text;
+    const count = body.result?.events?.count ?? rows.length;
+    const next = rows.at(-1)?.$metadata?.id;
+    if (!next || rows.length === 0 || events >= count) break;
+    offset = next;
+  }
+  return { ok: true, text: combined, events };
+}
+
+function sanitize(text: string, fragments: string[]): string {
+  let out = text;
+  for (const fragment of fragments) {
+    if (fragment) out = out.split(fragment).join("[filtered]");
+  }
+  return out.slice(0, 240);
+}
+
 function cfApi(path: string): string {
   const root = (process.env.HIVEATTIC_CF_API ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
   return `${root}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+// Only the staging dead-letter queue is ever read.
 function dlqName(): string {
-  const configured = process.env.HIVEATTIC_DLQ_NAME?.trim();
-  if (configured) return configured;
-  return readOnly ? "hiveattic-index-dlq" : "hiveattic-staging-index-dlq";
+  return process.env.HIVEATTIC_DLQ_NAME?.trim() || "hiveattic-staging-index-dlq";
 }
 
 async function readDlqDepth(): Promise<number | null> {
@@ -690,6 +1045,7 @@ function skipped(id: string, details: string): Case {
   return { id, status: "skipped", details, duration_ms: 0, checks: [{ name: id, status: "skipped", detail: details, responses: [] }] };
 }
 
+
 async function record(id: string, run: () => Promise<Check[]>): Promise<Case> {
   const started = Date.now();
   try {
@@ -700,6 +1056,7 @@ async function record(id: string, run: () => Promise<Check[]>): Promise<Case> {
     const status: Status = failed ? "failed" : partial ? "partial" : skippedOnly ? "skipped" : "passed";
     return { id, status, details: checks.map((item) => `${item.status} ${item.name}${item.detail ? ` (${item.detail})` : ""}`).join("; "), duration_ms: Date.now() - started, checks };
   } catch (err) {
+    if (err instanceof StopRun) throw err;
     const detail = err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 240) : "error";
     return { id, status: "failed", details: detail, duration_ms: Date.now() - started, checks: [{ name: id, status: "failed", detail, responses: [] }] };
   }
@@ -733,7 +1090,7 @@ function writeArtifacts(): void {
   const failed = cases.filter((item) => item.status === "failed").length;
   const summary = render(cases);
   mkdirSync(dirname(outPath), { recursive: true });
-  const target = dryRun ? "dry-run" : readOnly ? "read-only" : "staging";
+  const target = dryRun ? "dry-run" : "staging";
   writeFileSync(outPath, JSON.stringify({ run_id: runId, target, failed, dlq_depth: dlqDepth, cases }, null, 2));
   const summaryPath = outPath.endsWith(".json") ? `${outPath.slice(0, -".json".length)}.summary.md` : `${outPath}.summary.md`;
   writeFileSync(summaryPath, summary);
@@ -741,32 +1098,11 @@ function writeArtifacts(): void {
   console.log(summary);
 }
 
-function refuseIfMisconfigured(): void {
-  if (dryRun) {
-    if (!stagingBase || !stagingAdmin) {
-      throw new StopRun(2, "Dry-run needs HIVEATTIC_STAGING_BASE_URL and HIVEATTIC_STAGING_ADMIN_TOKEN. A local mock is enough.");
-    }
-    return;
-  }
-  if (!readOnly && (!stagingBase || !stagingAdmin)) {
-    throw new StopRun(
-      2,
-      "Refusing to run: write tests target only HIVEATTIC_STAGING_BASE_URL with HIVEATTIC_STAGING_ADMIN_TOKEN. Set HIVEATTIC_E2E_READ_ONLY=1 for a read-only smoke against HIVEATTIC_BASE_URL.",
-    );
-  }
-  if (!readOnly && prodBase && prodBase === stagingBase) {
-    throw new StopRun(2, "Refusing to run: HIVEATTIC_STAGING_BASE_URL is the same as HIVEATTIC_BASE_URL.");
-  }
-  if (readOnly && (!(prodBase || stagingBase) || !suppliedReviewer)) {
-    throw new StopRun(2, "Read-only smoke needs HIVEATTIC_BASE_URL (or the staging URL) and HIVEATTIC_REVIEWER_TOKEN. It does not mint tokens or send writes.");
-  }
-}
-
 async function runCases(): Promise<void> {
+  await assertStaging();
+  stagingOk = true;
+  await prepare();
   if (dryRun) {
-    await assertStaging();
-    stagingOk = true;
-    await prepare();
     cases.push({
       id: "DRY-RUN",
       status: "passed",
@@ -776,38 +1112,34 @@ async function runCases(): Promise<void> {
     });
     return;
   }
-  if (readOnly) {
-    cases.push(await record("T-01", () => readOnlyReviewer()));
-    for (const id of ["T-02", "T-03", "T-05", "T-06", "T-07", "T-08", "T-09", "T-11", "T-12"]) {
-      cases.push(skipped(id, "Read-only smoke does not write"));
-    }
-  } else {
-    await assertStaging();
-    stagingOk = true;
-    await prepare();
-    cases.push(await record("T-01", () => scopeCase()));
-    cases.push(await record("T-02", () => keyLikeCase()));
-    cases.push(await record("T-03", () => cardAccountCase()));
-    cases.push(await record("T-05", () => newestCase()));
-    cases.push(await record("T-06", () => concurrencyCase()));
-    cases.push(await record("T-07", () => appendOnlyCase()));
-    cases.push(await record("T-08", () => idempotencyCase()));
-    cases.push(await record("T-09", () => forgetCase()));
-    cases.push(await record("T-11", () => humanEditCase()));
-    cases.push(await record("T-12", () => rebuildCase()));
-    cases.push(await record("T-CLEANUP", () => cleanupCase()));
-  }
+  cases.push(await record("T-01", () => scopeCase()));
+  // T-02, T-03, and T-04 are retired. Their ids stay reserved. The smoke below replaces them.
+  cases.push(await record("SMOKE", () => filterSmokeCase()));
+  cases.push(await record("T-15", () => rerouteCase()));
+  cases.push(await record("T-05", () => newestCase()));
+  cases.push(await record("T-06", () => concurrencyCase()));
+  cases.push(await record("T-07", () => appendOnlyCase()));
+  cases.push(await record("T-08", () => idempotencyCase()));
+  cases.push(await record("T-09", () => forgetCase()));
+  cases.push(await record("T-11", () => humanEditCase()));
+  cases.push(await record("T-12", () => rebuildCase()));
+  cases.push(await record("T-CLEANUP", () => cleanupCase()));
   cases.push(skipped("T-10", "deferred to a later milestone"));
   cases.push(skipped("T-13", "deferred to a later milestone"));
   cases.push(skipped("T-14", "deferred to a later milestone"));
 }
 
 async function finish(): Promise<void> {
+  await stopTail();
+  if (!stagingOk) {
+    writeArtifacts();
+    return;
+  }
   for (const item of minted) {
     await quiet(rest("/v1/admin/tokens/revoke", admin, "POST", { token_id: item.id }, writeRoot));
   }
-  if (stagingOk && stagingBase && stagingAdmin) {
-    await quiet(rest("/v1/admin/cleanup", stagingAdmin, "POST", { run_id: runId }, stagingBase));
+  if (!stagingUrlProblem(stagingBase, dryRun)) {
+    await quiet(rest("/v1/admin/cleanup", stagingAdmin, "POST", { run_id: runId }, stagingBase).then((first) => settled(first)));
   }
   if (!dryRun) dlqDepth = await readDlqDepth().catch(() => null);
   writeArtifacts();
