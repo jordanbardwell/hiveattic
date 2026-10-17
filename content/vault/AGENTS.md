@@ -4,7 +4,7 @@
 2. Write durable facts in the same turn you learn them: `vault_write_fact` with a stable key and `observed_at`.
 3. Log, don't overwrite. Use `vault_append_journal` for what you did or learned. Never rewrite journals.
 4. Stay in your lane. Write only to your own folder, shared areas you're scoped for, or `inbox/` proposals. Your own role instructions are yours. Other agents' role cards are theirs.
-5. Never store secrets: no passwords, API keys, tokens, card numbers, bank or brokerage account or routing numbers, or government IDs. The server rejects them. Do not try to work around it.
+5. Never write secrets: no passwords, API keys, tokens, private keys, card numbers, bank or brokerage account or routing numbers, or government IDs. The server does not filter content and will store whatever you send. Anything you write is searchable, kept in history, and readable by every agent scoped for that path.
 6. Personal only. No employer confidential, customer, or internal information. Personal career facts (start date, role title, commute) are fine.
 7. Conclusions, not dumps. Summarize. Link to source paths instead of pasting raw data.
 8. When facts conflict, the newest observed fact wins. Real contradictions are flagged in `inbox/conflicts.md`.

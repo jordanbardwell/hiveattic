@@ -8,6 +8,6 @@ This folder is the human-readable vault. Markdown files here are the source of t
 - `bots/<agent>/` holds that agent's role, facts, journal, and notes.
 - `journal/YYYY/MM/YYYY-MM-DD.md` is the shared daily journal.
 - `shared/decisions.md` is append-only.
-- `inbox/` holds conflict flags and quarantine alerts.
+- `inbox/` holds conflict flags.
 
-Edit files in an Obsidian or S3 client if you want. The server notices those edits from bucket notifications, snapshots the previous text, and reindexes. Do not put secrets or employer work content in the vault. The server will keep a rejected file out of search.
+Edit files in an Obsidian or S3 client if you want. The server notices those edits from bucket notifications, snapshots the previous text, and reindexes. Do not put secrets or employer work content in the vault. The server does not filter content: what you save is indexed and kept in history.
