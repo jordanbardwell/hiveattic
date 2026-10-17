@@ -8,9 +8,28 @@ type Counts = { whoami: number; minted: string[]; revoked: string[]; cleanup: nu
 
 const counts: Counts = { whoami: 0, minted: [], revoked: [], cleanup: 0, bootstrap: 0 };
 
+let requests = 0;
+
+// HiveAttic envelopes carry a request_id. The mock adds one so the harness can record it per check.
 function send(response: ServerResponse, status: number, body: unknown): void {
+  requests += 1;
+  const enveloped = body && typeof body === "object" && "ok" in body ? { ...body, request_id: `mock-${requests}` } : body;
   response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify(body));
+  response.end(JSON.stringify(enveloped));
+}
+
+type Artifact = {
+  target?: string;
+  failed?: number;
+  cases?: { id?: string; status?: string; checks?: { name?: string; responses?: { label?: string; via?: string; status?: number | null; request_id?: string | null }[] }[] }[];
+};
+
+function assertResponsesRecorded(artifact: Artifact, label: string): void {
+  for (const item of artifact.cases ?? []) {
+    for (const entry of item.checks ?? []) {
+      if (!Array.isArray(entry.responses)) throw new Error(`${label}: ${item.id} ${entry.name} has no responses list`);
+    }
+  }
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -134,21 +153,15 @@ try {
     HIVEATTIC_E2E_OUT: dryOut,
     HIVEATTIC_STAGING_BASE_URL: `http://127.0.0.1:${address.port}`,
     HIVEATTIC_STAGING_ADMIN_TOKEN: "dry-admin",
-    HIVEATTIC_TAIL_SCRIPT: "console.log('tail-ready'); setInterval(() => {}, 60000)",
-    HIVEATTIC_TAIL_ATTACH_MS: "200",
-    HIVEATTIC_LOG_MODE: "tail",
   }));
   if (dry.code !== 0) throw new Error(`dry-run exited ${dry.code}\n${dry.output}`);
-  const artifact = JSON.parse(readFileSync(dryOut, "utf8")) as {
-    target?: string;
-    failed?: number;
-    cases?: { id?: string; status?: string }[];
-  };
+  const artifact = JSON.parse(readFileSync(dryOut, "utf8")) as Artifact;
   if (artifact.target !== "dry-run" || artifact.failed !== 0) throw new Error(`dry-run artifact was not a clean pass\n${dry.output}`);
   if (!artifact.cases?.some((item) => item.id === "DRY-RUN" && item.status === "passed")) {
     throw new Error(`dry-run did not record setup\n${dry.output}`);
   }
   if (artifact.cases.some((item) => item.id === "ABORT")) throw new Error(`dry-run aborted\n${dry.output}`);
+  assertResponsesRecorded(artifact, "dry-run");
   if (counts.whoami < 1 || counts.bootstrap !== 1) throw new Error(`setup did not reach whoami and bootstrap: ${JSON.stringify(counts)}`);
   if (counts.minted.length < 6 || counts.revoked.length !== counts.minted.length) {
     throw new Error(`finally did not revoke every minted token: ${JSON.stringify(counts)}`);
@@ -173,6 +186,16 @@ try {
   if (readOnlyDlq.queue !== "hiveattic-index-dlq") throw new Error(`read-only labeled the wrong DLQ: ${readOnlyDlq.queue}`);
   if (readOnlyDlq.dlq_depth !== 0) throw new Error(`read-only DLQ depth was not read: ${String(readOnlyDlq.dlq_depth)}`);
   if (!readOnly.output.includes("dlq depth")) throw new Error(`read-only summary missing DLQ depth\n${readOnly.output}`);
+  const readOnlyArtifact = JSON.parse(readFileSync(readOnlyOut, "utf8")) as Artifact;
+  assertResponsesRecorded(readOnlyArtifact, "read-only");
+  const smoke = readOnlyArtifact.cases?.find((item) => item.id === "T-01");
+  for (const name of ["whoami", "search"]) {
+    const recorded = smoke?.checks?.find((entry) => entry.name === name)?.responses ?? [];
+    if (recorded.length !== 1 || recorded[0]?.via !== "rest" || recorded[0]?.status !== 200 || !recorded[0]?.request_id?.startsWith("mock-")) {
+      throw new Error(`read-only ${name} did not record its status and request_id: ${JSON.stringify(recorded)}`);
+    }
+  }
+  if (readOnlyArtifact.cases?.some((item) => item.id === "T-04")) throw new Error("read-only still lists T-04");
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
@@ -207,7 +230,7 @@ function sourceFiles(dir: string): string[] {
   return found;
 }
 const missing = new Set<string>();
-for (const file of ["src", "e2e", "examples", "policy", "README.md"].flatMap((root) => sourceFiles(root))) {
+for (const file of ["src", "e2e", "examples", "README.md"].flatMap((root) => sourceFiles(root))) {
   const text = readFileSync(file, "utf8");
   for (const pattern of domainPatterns) {
     pattern.lastIndex = 0;
