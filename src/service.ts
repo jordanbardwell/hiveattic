@@ -240,24 +240,40 @@ export async function forgetNote(
   if (!input.path && !input.id) throw new VaultError("invalid", "path or id is required");
   const idempotencyKey = idempotencyKeyFrom(idempotencyHeader, input.idempotency_key);
   const path = input.path ? assertVaultPath(input.path) : undefined;
-  const note = path
-    ? await env.DB.prepare("SELECT owner, domain, sensitivity, path FROM notes WHERE path = ?")
-        .bind(path)
-        .first<{ owner: string; domain: string | null; sensitivity: string; path: string }>()
-    : await env.DB.prepare("SELECT owner, domain, sensitivity, path FROM notes WHERE id = ?")
-        .bind(input.id ?? "")
-        .first<{ owner: string; domain: string | null; sensitivity: string; path: string }>();
-  const target = note?.path ?? path;
-  if (target && !session.access.admin && isForgetProtectedPath(target)) {
-    throw new VaultError("forget_protected_path", "Only the admin token can forget an append-only or server-managed file", [target]);
-  }
+  // Append-only and server-managed files are the admin's to forget. The caller's own path is checked
+  // first; a path found by id is checked only after the write check on that note passes.
+  if (path) assertForgettable(session.access, path);
+  // Resolve the target the same way the writer does (id wins), then authorize against that note.
+  const note = input.id
+    ? await env.DB.prepare("SELECT id, owner, domain, sensitivity, path FROM notes WHERE id = ?")
+        .bind(input.id)
+        .first<{ id: string; owner: string; domain: string | null; sensitivity: string; path: string }>()
+    : await env.DB.prepare("SELECT id, owner, domain, sensitivity, path FROM notes WHERE path = ?")
+        .bind(path ?? "")
+        .first<{ id: string; owner: string; domain: string | null; sensitivity: string; path: string }>();
   if (note) {
     const sensitivity = note.sensitivity === "sensitive" || inSensitiveFolder(note.path) || (note.domain !== null && !isOrdinaryDomain(note.domain)) ? "sensitive" : "normal";
     assertCanWrite(session.access, note.path, sensitivity, note.domain);
+    if (path && note.path !== path) throw new VaultError("invalid", "path and id refer to different notes");
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
   }
-  return perform(env, { kind: "forget", actor: actor(session), path, id: input.id, reason: input.reason, idempotencyKey });
+  if (note) assertForgettable(session.access, note.path);
+  return perform(env, {
+    kind: "forget",
+    actor: actor(session),
+    access: session.access,
+    path: note?.path ?? path,
+    id: note?.id ?? input.id,
+    reason: input.reason,
+    idempotencyKey,
+  });
+}
+
+function assertForgettable(access: Access, path: string): void {
+  if (!access.admin && isForgetProtectedPath(path)) {
+    throw new VaultError("forget_protected_path", "Only the admin token can forget an append-only or server-managed file", [path]);
+  }
 }
 
 export async function bootstrap(env: Env, session: Session): Promise<Reply> {

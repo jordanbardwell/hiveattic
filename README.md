@@ -237,6 +237,8 @@ HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm mint-reviewer architect-re
 
 The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read` or any summary scope. Finance and health notes, `sensitive/` files, summaries, reads by id, history, and shared notes tagged with those domains return 404 and stay out of search, and `GET /v1/admin/audit` returns 403.
 
+Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before the preset dropped `audit:read` and the summary scopes keeps its old scopes. Revoke it and mint a new one under a fresh agent id.
+
 ## API
 
 Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(pepper || token)`. `GET /v1/health` is the only unauthenticated route.

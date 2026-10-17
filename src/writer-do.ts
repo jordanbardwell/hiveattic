@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { domainOf } from "./access";
+import { canWrite, domainOf, type Access } from "./access";
 import { frontmatterRoute } from "./classify";
 import { configure, FILE_LIMIT_BYTES, isOrdinaryDomain, isProductionDeploy, RESTRICTED, stagingResources, utf8Length, vaultTimeZone, writeTimeoutMs } from "./config";
 import { hash8, hmacSha256Hex, sha256Hex, ulid } from "./crypto";
@@ -87,7 +87,7 @@ export type WriterOp =
       idempotencyKey: string | null;
       reroute: string | null;
     }
-  | { kind: "forget"; actor: Actor; path?: string; id?: string; reason: string; idempotencyKey: string | null }
+  | { kind: "forget"; actor: Actor; access: Access; path?: string; id?: string; reason: string; idempotencyKey: string | null }
   | { kind: "restore"; actor: Actor; path?: string; id?: string; versionTs: string }
   | { kind: "purge"; actor: Actor; path?: string; id?: string }
   | { kind: "bootstrap"; actor: Actor; files: { path: string; markdown: string }[] }
@@ -760,6 +760,11 @@ export class VaultWriter extends DurableObject<Env> {
     if (replay) return replay;
     const note = await this.resolveNote(op.id, op.path);
     if (!note) throw new VaultError("not_found", "Note not found");
+    // Authorize against the resolved note, never the caller-supplied path.
+    if (!canWrite(op.access, note.path, note.sensitivity === "sensitive" ? "sensitive" : "normal", note.domain)) {
+      throw new VaultError("forbidden_scope", "Scope does not allow this write");
+    }
+    if (op.path && note.path !== op.path) throw new VaultError("invalid", "path and id refer to different notes");
     if (note.status === "forgotten") {
       const data = { id: note.id, path: note.path, status: "forgotten" };
       await this.remember(op.actor.agentId, op.idempotencyKey, data, 200);
