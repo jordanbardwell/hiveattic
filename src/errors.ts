@@ -10,7 +10,6 @@ export const ERROR_STATUS: Record<string, number> = {
   forget_protected_path: 400,
   job_running: 409,
   migration_required: 409,
-  count_mismatch: 409,
   confirm_count_mismatch: 409,
   idempotency_key_conflict: 400,
   idempotency_key_reused: 422,

@@ -42,7 +42,6 @@ import {
   purgeSchema,
   quarantineEraseSchema,
   restoreSchema,
-  retireQuarantineSchema,
   revokeSchema,
   tokenSchema,
 } from "./schemas";
@@ -133,16 +132,11 @@ async function route(request: Request, env: Env, url: URL, session: Session, raw
   if (method === "POST" && pathname === "/v1/admin/reconcile") return startJob(env, session, "reconcile");
   if (method === "POST" && pathname === "/v1/admin/jobs") {
     const input = parseInput(jobSchema, await body());
-    return startJob(env, session, input.kind, { dryRun: input.dry_run, confirmCount: input.confirm_count });
+    return startJob(env, session, input.kind);
   }
   if (method === "POST" && pathname === "/v1/admin/migrations/quarantine-erase") {
     const input = parseInput(quarantineEraseSchema, await body());
     return startJob(env, session, "quarantine-erase", { dryRun: input.dry_run, confirmCount: input.confirm_count });
-  }
-  // Alias kept for the staging plan: report is a dry run, apply is the erase.
-  if (method === "POST" && pathname === "/v1/admin/migrations/retire-quarantine") {
-    const input = parseInput(retireQuarantineSchema, await body());
-    return startJob(env, session, "quarantine-erase", { dryRun: input.mode === "report", confirmCount: input.confirm_count });
   }
   const job = /^\/v1\/admin\/jobs\/([^/]+?)(\/report)?$/.exec(pathname);
   if (method === "GET" && job) return getJob(env, session, job[1]!, Boolean(job[2]));

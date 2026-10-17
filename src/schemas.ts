@@ -81,19 +81,13 @@ export const cleanupSchema = z.object({
   run_id: z.string().regex(/^e2e[0-9a-f]{10}$/),
 });
 
+// The quarantine erase is not a kind here: its only route is POST /v1/admin/migrations/quarantine-erase.
 export const jobSchema = z.strictObject({
-  kind: z.enum(["rebuild", "reindex", "reconcile", "quarantine-erase"]),
-  dry_run: z.boolean().optional(),
-  confirm_count: z.number().int().min(0).optional(),
+  kind: z.enum(["rebuild", "reindex", "reconcile"]),
 });
 
 export const quarantineEraseSchema = z.strictObject({
   dry_run: z.boolean().optional(),
-  confirm_count: z.number().int().min(0).optional(),
-});
-
-export const retireQuarantineSchema = z.strictObject({
-  mode: z.enum(["report", "apply"]),
   confirm_count: z.number().int().min(0).optional(),
 });
 

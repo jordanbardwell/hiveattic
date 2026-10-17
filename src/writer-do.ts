@@ -334,14 +334,26 @@ export class VaultWriter extends DurableObject<Env> {
     const kind = request.kind;
     // Until the quarantine migration has run, nothing that rebuilds rows from R2 may start while
     // quarantine records exist, so a quarantined note can never come back as active.
-    if ((kind === "rebuild" || kind === "reindex" || kind === "reconcile") && !this.retiredAt() && (await this.quarantineRecordsExist())) {
+    if ((kind === "rebuild" || kind === "reindex" || kind === "reconcile") && !this.erasedAt() && (await this.quarantineRecordsExist())) {
       return refuse(new VaultError("migration_required", "Quarantine records exist. Run POST /v1/admin/migrations/quarantine-erase first.", ["quarantine_erase"]));
     }
     const dryRun = kind === "quarantine-erase" ? request.dryRun === true : false;
+    // A dry run is allowed anywhere. On production the erase itself runs only when confirm_count is
+    // the count a dry run reports (counts.total), so a person has seen it first. Both refusals carry
+    // the actual count.
     if (kind === "quarantine-erase" && !dryRun && isProductionDeploy(this.env)) {
       const count = await this.quarantineCount();
+      if (request.confirmCount === null || request.confirmCount === undefined) {
+        return failure(
+          new VaultError("invalid", "confirm_count is required on production. Run a dry run and confirm its counts.total.", ["confirm_count_required"], { actual_count: count }),
+        );
+      }
       if (request.confirmCount !== count) {
-        return failure(new VaultError("count_mismatch", "confirm_count does not match the current quarantine count. Run a dry run and confirm its total.", [`current_count:${count}`]));
+        return failure(
+          new VaultError("confirm_count_mismatch", "confirm_count does not match the current quarantine count. Run a dry run and confirm its counts.total.", [], {
+            actual_count: count,
+          }),
+        );
       }
     }
     const again = this.activeJob();
@@ -964,6 +976,8 @@ export class VaultWriter extends DurableObject<Env> {
     const note = await this.noteByPath(path);
     if (!note) return { ok: true, data: { skipped: true, reason: "unknown_delete" } };
     if (note.status === "forgotten") return { ok: true, data: { id: note.id, path, status: "forgotten" } };
+    // A quarantined row is left for the quarantine erase, which removes its history and records too.
+    if (note.status === "quarantined") return { ok: true, data: { skipped: true, reason: "quarantined" } };
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
     await this.snapshotBytes(note, note.body, actor.agentId, "external_delete");
@@ -1389,8 +1403,12 @@ export class VaultWriter extends DurableObject<Env> {
     const existing = await this.noteByPath(input.path);
     const status = noteStatus(parsed.frontmatter);
     const outside = input.action === "external_put" || input.action === "external_copy";
-    // Until the quarantine migration has run, nothing automated turns a quarantined row active again.
-    if (existing?.status === "quarantined" && !outside) return { ok: true, data: { skipped: true, reason: "quarantined" } };
+    // A quarantined row stays as it is until the quarantine erase removes it: no outside edit,
+    // reconcile, replay, or rebuild indexes the file again or turns the row active.
+    if (existing?.status === "quarantined") {
+      if (outside) await this.audit(input.actor, "quarantined_skip", input.path, existing.id, "skipped", ["quarantined"], null, 0, input.detail ?? null);
+      return { ok: true, data: { skipped: true, reason: "quarantined" } };
+    }
     if (status === "active" && !inSensitiveFolder(input.path) && !isServerDocument(input.path)) {
       const route = frontmatterRoute(parsed.frontmatter, input.markdown);
       if (route) {
@@ -1722,8 +1740,9 @@ export class VaultWriter extends DurableObject<Env> {
     return Number(this.state("index_gen") ?? "0") || 0;
   }
 
-  private retiredAt(): string | null {
-    return this.state("quarantine_retired_at");
+  // Set once a quarantine erase (not a dry run) has finished.
+  private erasedAt(): string | null {
+    return this.state("quarantine_erased_at");
   }
 
   private async quarantineRecordsExist(): Promise<boolean> {
@@ -1784,7 +1803,7 @@ export class VaultWriter extends DurableObject<Env> {
     job.phase = "done";
     job.finished_at = new Date().toISOString();
     job.counts.duration_ms = Date.now() - job.started_ms;
-    if (job.kind === "quarantine-erase" && !job.dry_run && !this.retiredAt()) this.setState("quarantine_retired_at", job.finished_at);
+    if (job.kind === "quarantine-erase" && !job.dry_run && !this.erasedAt()) this.setState("quarantine_erased_at", job.finished_at);
     const detail: Record<string, unknown> = { job_id: job.id, ...job.counts };
     if (job.kind === "quarantine-erase") {
       detail.dry_run = job.dry_run;
@@ -1902,6 +1921,13 @@ export class VaultWriter extends DurableObject<Env> {
     for (const entry of processed) if (entry.path && isCurrent(live.get(entry.path), entry.object.etag, gen)) this.count(job, "files");
     for (const file of parsedFiles) {
       const row = live.get(file.path);
+      // Rebuild does not start while quarantine records exist. Should a quarantined row be here
+      // anyway, it is kept as it is, never re-read from its file.
+      if (row?.status === "quarantined") {
+        keepAlive.push(row.id);
+        this.count(job, "skipped");
+        continue;
+      }
       if (utf8Length(file.text) > FILE_LIMIT_BYTES) {
         this.count(job, "skipped");
         if (row) keepAlive.push(row.id);
@@ -2062,11 +2088,13 @@ export class VaultWriter extends DurableObject<Env> {
     if (statements.length) await db.batch(statements);
   }
 
-  private async rowsByPath(paths: string[]): Promise<Map<string, { id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string }>> {
+  private async rowsByPath(
+    paths: string[],
+  ): Promise<Map<string, { id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string; status: string }>> {
     if (!paths.length) return new Map();
-    const rows = await this.env.DB.prepare("SELECT id, path, r2_etag, index_gen, created_at FROM notes WHERE path IN (SELECT value FROM json_each(?))")
+    const rows = await this.env.DB.prepare("SELECT id, path, r2_etag, index_gen, created_at, status FROM notes WHERE path IN (SELECT value FROM json_each(?))")
       .bind(JSON.stringify(paths))
-      .all<{ id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string }>();
+      .all<{ id: string; path: string; r2_etag: string | null; index_gen: number | null; created_at: string; status: string }>();
     return new Map((rows.results ?? []).map((row) => [row.path, row]));
   }
 
@@ -2193,7 +2221,7 @@ export class VaultWriter extends DurableObject<Env> {
   // Once the quarantine migration has run, any sys/quarantine/ record left over is deleted. Before it
   // has run, nothing here touches quarantine data.
   private async deleteQuarantineOrphans(job: Job): Promise<boolean> {
-    if (!this.retiredAt()) return true;
+    if (!this.erasedAt()) return true;
     const page = await this.env.VAULT.list({ prefix: "sys/quarantine/", limit: 100 });
     const keys = page.objects.map((object) => object.key);
     if (keys.length) {
@@ -2268,7 +2296,7 @@ export class VaultWriter extends DurableObject<Env> {
     else if (result.ok && !result.data.skipped) this.count(job, "updated");
   }
 
-  // Quarantine retirement. Lists D1 rows with status 'quarantined' and sys/quarantine/ records,
+  // The quarantine erase. Lists D1 rows with status 'quarantined' and sys/quarantine/ records,
   // matches by exact note id or path, and hard-erases what matched. A dry run only counts.
   private async eraseStep(job: Job, deadline: number): Promise<boolean> {
     const actor: Actor = { agentId: "migration", tokenId: job.actor.tokenId, client: "migration", requestId: job.actor.requestId, ipCountry: null };
@@ -2283,7 +2311,7 @@ export class VaultWriter extends DurableObject<Env> {
         this.count(job, "quarantined_notes");
         this.reportNote(job, row.id, row.path);
         if (!job.dry_run) {
-          await this.eraseRow(row, actor, "quarantine_retired");
+          await this.eraseRow(row, actor, "quarantine_erased");
           this.count(job, "erased");
         }
         job.cursor = row.path;
@@ -2308,7 +2336,7 @@ export class VaultWriter extends DurableObject<Env> {
       const key = r2KeyFor(this.prefix(), "inbox/quarantine.md");
       if (row) {
         job.counts.alert_file = 1;
-        if (!job.dry_run) await this.eraseRow(row, actor, "quarantine_retired");
+        if (!job.dry_run) await this.eraseRow(row, actor, "quarantine_erased");
       } else if (await this.env.VAULT.head(key)) {
         job.counts.alert_file = 1;
         if (!job.dry_run) await this.env.VAULT.delete(key);
@@ -2355,7 +2383,7 @@ export class VaultWriter extends DurableObject<Env> {
             const keys = [r2KeyFor(this.prefix(), path), ...(id ? await this.historyKeys(id) : [])];
             await this.env.VAULT.delete(keys);
             await this.env.DB.prepare(
-              `INSERT INTO tombstones (note_id, at, by_agent, reason, purged_at, content_hash, path) VALUES (?, ?, ?, 'quarantine_retired', ?, ?, ?)
+              `INSERT INTO tombstones (note_id, at, by_agent, reason, purged_at, content_hash, path) VALUES (?, ?, ?, 'quarantine_erased', ?, ?, ?)
                ON CONFLICT(note_id) DO UPDATE SET reason = excluded.reason, purged_at = excluded.purged_at`,
             )
               .bind(id || ulid(), new Date().toISOString(), actor.agentId, new Date().toISOString(), current ?? (await sha256Hex(text)), path)
@@ -2703,10 +2731,12 @@ function normalizeEtag(etag: string | null | undefined): string | null {
   return value || null;
 }
 
-// Status comes from the file. `quarantined` is kept as it is so that nothing reactivates it.
-function noteStatus(frontmatter: Frontmatter): "active" | "forgotten" | "quarantined" | "superseded" {
+// Status comes from the file, except quarantine: only a D1 row can be quarantined, and the code
+// that indexes a file never touches such a row (indexBytes skips it, and rebuild and reconcile
+// refuse to start while one exists). A file that says `quarantined` is indexed by what it holds.
+function noteStatus(frontmatter: Frontmatter): "active" | "forgotten" | "superseded" {
   const status = stringField(frontmatter.status);
-  if (status === "forgotten" || status === "quarantined" || status === "superseded") return status;
+  if (status === "forgotten" || status === "superseded") return status;
   return "active";
 }
 
