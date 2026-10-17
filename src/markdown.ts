@@ -113,13 +113,10 @@ function journalBlockBody(block: string): string {
 
 export function textForFilter(markdown: string): string {
   const parsed = parseMarkdown(markdown);
-  const frontmatter: Frontmatter = {};
-  for (const [key, value] of Object.entries(parsed.frontmatter)) {
-    if (key.startsWith("vault_") || key === "source" || key === "supersedes") continue;
-    frontmatter[key] = value;
-  }
-  const body = parsed.body.replace(/<!--\s*hiveattic:[\s\S]*?-->/g, "");
-  return buildMarkdown(frontmatter, body);
+  const body = parsed.body
+    .replace(/<!--\s*hiveattic:e=[0-9A-HJKMNP-TV-Z]{26}:[^:\s>]+:[0-9a-f]{16}\s*-->/g, "")
+    .replace(/<!--\s*hiveattic:idempotency=[A-Za-z0-9_.:-]{1,64}\s*-->/g, "");
+  return buildMarkdown(parsed.frontmatter, body);
 }
 
 export function guardJournalBody(body: string): string {

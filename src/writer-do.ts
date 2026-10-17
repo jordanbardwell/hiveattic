@@ -916,6 +916,10 @@ export class VaultWriter extends DurableObject<Env> {
     if (versionKeys.length) await this.env.VAULT.delete(versionKeys);
     await this.env.DB.prepare("DELETE FROM note_versions WHERE writer LIKE ? ESCAPE '\\'").bind(like).run();
     await this.deleteRunObjects(op.runId);
+    const tokenRows = await this.env.DB.prepare("SELECT id FROM tokens WHERE label LIKE ? ESCAPE '\\' OR agent_id LIKE ? ESCAPE '\\'")
+      .bind(like, like)
+      .all<{ id: string }>();
+    const deletedTokenIds = (tokenRows.results ?? []).map((row) => row.id);
     await this.env.DB.prepare("DELETE FROM tokens WHERE label LIKE ? ESCAPE '\\' OR agent_id LIKE ? ESCAPE '\\'").bind(like, like).run();
     await this.env.DB.prepare("DELETE FROM agents WHERE id LIKE ? ESCAPE '\\'").bind(like).run();
     const remaining = await this.runLeftovers(op.runId);
@@ -928,7 +932,14 @@ export class VaultWriter extends DurableObject<Env> {
       [],
       null,
       purged,
-      JSON.stringify({ run_id: op.runId, purged, rewritten, ...remaining }),
+      JSON.stringify({
+        run_id: op.runId,
+        purged,
+        rewritten,
+        ...remaining,
+        deleted_token_ids: deletedTokenIds,
+        deleted_tokens: deletedTokenIds.length,
+      }),
     );
     return { ok: true, data: { purged, rewritten, remaining_notes: remaining.notes, remaining_objects: remaining.objects } };
   }
@@ -959,7 +970,7 @@ export class VaultWriter extends DurableObject<Env> {
   }): Promise<ApiResult<{ etag: string }>> {
     const existing = input.create ? null : await this.noteByPath(input.path);
     const appending = input.reason === "appended" || input.reason === "quarantine-alert" || input.reason === "conflict";
-    if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
+    if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay" && input.reason !== "purge") {
       await this.snapshotBytes(existing, existing.body, input.actor.agentId, input.reason);
     }
     const hash = await sha256Hex(input.markdown);
@@ -1464,6 +1475,9 @@ export class VaultWriter extends DurableObject<Env> {
     if (!note) return { ok: true, data: { purged: false } };
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
+    const quarantine = await this.quarantineForPath(note.path);
+    await this.stripQuarantineAlert(note.path, quarantine.hashes, actor);
+    if (quarantine.keys.length) await this.env.VAULT.delete(quarantine.keys);
     const keys = [note.r2_key];
     let cursor: string | undefined;
     do {
@@ -1747,25 +1761,82 @@ export class VaultWriter extends DurableObject<Env> {
 
   private async deleteRunObjects(runId: string): Promise<void> {
     for (const prefix of [this.prefix(), "sys/history/", "sys/quarantine/"]) {
-      let cursor: string | undefined;
-      do {
-        const page = await this.env.VAULT.list({ prefix, cursor, limit: 100 });
-        const keys: string[] = [];
-        for (const object of page.objects) {
-          if (object.key.includes(runId)) {
-            keys.push(object.key);
-            continue;
-          }
-          const file = await this.env.VAULT.get(object.key);
-          if (file && (await file.text()).includes(runId)) keys.push(object.key);
-        }
-        if (keys.length) {
-          await this.env.VAULT.delete(keys);
-          for (const key of keys) await this.env.DB.prepare("DELETE FROM note_versions WHERE r2_key = ?").bind(key).run();
-        }
-        cursor = page.truncated ? page.cursor : undefined;
-      } while (cursor);
+      const keys = await this.scanObjects(prefix, async (key, read) => key.includes(runId) || (await read()).includes(runId));
+      if (!keys.length) continue;
+      await this.env.VAULT.delete(keys);
+      for (const key of keys) await this.env.DB.prepare("DELETE FROM note_versions WHERE r2_key = ?").bind(key).run();
     }
+  }
+
+  private async scanObjects(prefix: string, include: (key: string, read: () => Promise<string>) => Promise<boolean>): Promise<string[]> {
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.VAULT.list({ prefix, cursor, limit: 100 });
+      for (const object of page.objects) {
+        let loaded: string | undefined;
+        const read = async () => {
+          if (loaded !== undefined) return loaded;
+          const file = await this.env.VAULT.get(object.key);
+          loaded = file ? await file.text() : "";
+          return loaded;
+        };
+        if (await include(object.key, read)) keys.push(object.key);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return keys;
+  }
+
+  private async quarantineForPath(path: string): Promise<{ keys: string[]; hashes: string[] }> {
+    const hashes: string[] = [];
+    const keys = await this.scanObjects("sys/quarantine/", async (_key, read) => {
+      const body = await read();
+      if (!body.includes(path)) return false;
+      try {
+        const parsed = JSON.parse(body) as { path?: unknown; content_hash?: unknown };
+        if (parsed.path === path && typeof parsed.content_hash === "string") hashes.push(parsed.content_hash);
+      } catch {
+        return true;
+      }
+      return true;
+    });
+    return { keys, hashes };
+  }
+
+  private async stripQuarantineAlert(path: string, hashes: string[], actor: Actor): Promise<void> {
+    const inbox = await this.noteByPath("inbox/quarantine.md");
+    if (!inbox) return;
+    const needles = [path, ...hashes].filter((needle) => needle.length > 0);
+    if (!needles.some((needle) => inbox.body.includes(needle))) return;
+    const parsed = parseMarkdown(inbox.body);
+    const pieces = parsed.body.split(/\n(?=## )/);
+    const kept = pieces.filter((piece) => !needles.some((needle) => piece.includes(needle)));
+    if (kept.length === pieces.length) return;
+    const body = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    const markdown = Object.keys(parsed.frontmatter).length > 0 ? buildMarkdown(parsed.frontmatter, body) : body ? `${body}\n` : "";
+    if (!markdown) return;
+    const saved = await this.saveMarkdown({
+      id: inbox.id,
+      path: inbox.path,
+      markdown,
+      type: inbox.type,
+      owner: inbox.owner,
+      domain: inbox.domain,
+      sensitivity: inbox.sensitivity === "sensitive" ? "sensitive" : "normal",
+      factKey: null,
+      title: inbox.title ?? "Quarantine",
+      statementHash: null,
+      observedAt: null,
+      actor,
+      ifMatch: inbox.r2_etag,
+      create: false,
+      reason: "purge",
+      action: "purge_inbox",
+      idempotencyKey: null,
+      journal: null,
+    });
+    if (!saved.ok) throw new VaultError(saved.error.code === "conflict_etag" ? "conflict_etag" : "invalid", saved.error.message);
   }
 
   private async runLeftovers(runId: string): Promise<{ notes: number; objects: number }> {

@@ -36,7 +36,15 @@ export function scanSecrets(input: string): string[] {
     const index = match.index ?? 0;
     if (isAgentIdentifier(text, index, token)) continue;
     const span = pathSpan(text, index, token.length);
-    if (isStructuralPath(token) || (span !== null && isStructuralPath(span))) continue;
+    const path = span ?? (token.includes("/") ? token : null);
+    if (path && !/[+=]/.test(path)) {
+      const scored = scorePath(path);
+      if (scored === "safe") continue;
+      if (scored === "segment") {
+        reasons.push("secret_entropy");
+        continue;
+      }
+    }
     if (shannon(token) > 4) reasons.push("secret_entropy");
   }
   return unique(reasons);
@@ -155,9 +163,10 @@ function findAccount(text: string): boolean {
     const end = Math.min(text.length, (match.index ?? 0) + match[0].length + 48);
     const window = text.slice(start, end);
     const explicit = /(?:#|\bno\.?\b)/i.test(window);
+    const labeled = /^(?:accounts?|acct|a\/c|acc(?:t|ount)?(?:\s*(?:no\.?|#))?)$/i.test(match[0]);
     const runs = window.match(/\d[\d .\-]{2,30}\d/g) ?? [];
     for (const run of runs) {
-      if (currencyAdjacent(window, run)) continue;
+      if (!labeled && currencyAdjacent(window, run)) continue;
       const digits = accountDigits(run);
       if (!digits) continue;
       if (/\d{4}-\d{2}-\d{2}/.test(run) && digits.length <= 8) continue;
@@ -280,8 +289,6 @@ function pathSpan(text: string, index: number, length: number): string | null {
   return span.includes("/") ? span : null;
 }
 
-const VAULT_ROOTS = new Set(["bots", "domains", "shared", "journal", "inbox", "profile", "sys"]);
-
 function isAgentIdentifier(text: string, index: number, token: string): boolean {
   if (!/^[a-z0-9][a-z0-9-]{23,63}$/.test(token)) return false;
   const before = text.slice(Math.max(0, index - 80), index);
@@ -290,14 +297,44 @@ function isAgentIdentifier(text: string, index: number, token: string): boolean 
   return /·\s*$/.test(before) && /^\s*·/.test(after);
 }
 
-function isStructuralPath(token: string): boolean {
-  if (token.length > 300 || !token.includes("/") || /[+=]/.test(token)) return false;
-  const parts = token.split("/");
-  if (parts.length < 2) return false;
-  if (!parts.every((part) => part.length >= 1 && part.length <= 200 && /^[A-Za-z0-9_.-]+$/.test(part))) return false;
-  const rooted = VAULT_ROOTS.has(parts[0] ?? "");
-  const extension = /\.[A-Za-z0-9]{1,8}$/.test(parts[parts.length - 1] ?? "");
-  return rooted || extension;
+function scorePath(path: string): "safe" | "segment" | "whole" {
+  if (path.length > 300) return "whole";
+  const parts = path.split("/").filter((part) => part.length > 0);
+  if (parts.length < 2) return "whole";
+  let suspicious = false;
+  for (const part of parts) {
+    const base = part.replace(/\.[A-Za-z0-9]{1,8}$/, "");
+    for (const label of base.split(".").filter((label) => label.length > 0)) {
+      if (isSafePathLabel(label)) continue;
+      if (label.length >= 24 && shannon(label) > 4) suspicious = true;
+      else if (!isShortBenign(label)) return "whole";
+    }
+  }
+  return suspicious ? "segment" : "safe";
+}
+
+function isSafePathLabel(label: string): boolean {
+  if (/^[a-z0-9][a-z0-9-]{0,63}$/.test(label)) return true;
+  if (isWordLike(label)) return true;
+  return isShortBenign(label);
+}
+
+function isShortBenign(label: string): boolean {
+  if (label.length >= 24) return false;
+  if (/^\d+$/.test(label)) return true;
+  if (/^[a-z0-9][a-z0-9-]{0,63}$/.test(label)) return true;
+  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(label) && shannon(label) <= 4;
+}
+
+function isWordLike(value: string): boolean {
+  if (/^[A-Za-z][A-Za-z0-9]*$/.test(value) && /[a-z]/.test(value) && /[A-Z]/.test(value)) {
+    const words = value.split(/(?=[A-Z])/);
+    return words.length >= 2 && words.every((word) => /^[A-Za-z][a-z]{1,19}\d{0,4}$/.test(word));
+  }
+  if (/^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)+$/.test(value)) {
+    return value.split("-").every((part) => part.length >= 2 && part.length <= 18 && part.replace(/\d/g, "").length >= Math.ceil(part.length * 0.6));
+  }
+  return false;
 }
 
 function shannon(value: string): number {

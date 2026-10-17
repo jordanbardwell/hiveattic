@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { hmacSha256Hex, sha256Hex } from "../src/crypto";
 import { inspectWrite, scanEmployer, scanFinancial, scanSecrets } from "../src/filters";
 import worker from "../src/index";
+import { textForFilter } from "../src/markdown";
 import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
 
 let financeRw = "";
@@ -87,6 +88,21 @@ describe("architect review regressions", () => {
     expect(scanSecrets("aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").length).toBeGreaterThan(0);
     expect(scanSecrets("use Zq8xP2mL9vR4tY7wK1n/B5cJ3hF6dS0aGq8xP2 now")).toContain("secret_entropy");
     expect(scanSecrets("see src/components/settings/NotificationPreferences.tsx")).toEqual([]);
+    expect(scanSecrets("https://github.com/jordanbardwell/hiveattic/pull/2")).toEqual([]);
+    expect(scanSecrets("https://shop.example.com/products/wireless-noise-cancelling-headphones")).toEqual([]);
+    expect(scanSecrets("docs/product/quarterly-planning/meeting-notes")).toEqual([]);
+    expect(scanSecrets("bots/Zq8xP2mL9vR4tY7wK1nB5cJ3hF6dS0aG/note.md")).toContain("secret_entropy");
+    expect(scanSecrets("notes/Zq8xP2mL9vR4tY7wK1nB5cJ3hF6dS0aG.md")).toContain("secret_entropy");
+    const marker = "<!-- hiveattic:e=01ARZ3NDEKTSV4RRFFQ69G5FAV:architect:0123456789abcdef -->";
+    const idem = "<!-- hiveattic:idempotency=Zq8xP2mL9vR4tY7wK1nB5cJ3hF6dS0aGq8xP2 -->";
+    const loose = "<!-- hiveattic: sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 -->";
+    const hidden = textForFilter(`---\nsource: sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\n---\nvisible\n${marker}\n${idem}\n${loose}\n`);
+    expect(hidden).not.toContain("hiveattic:e=");
+    expect(hidden).not.toContain("hiveattic:idempotency=");
+    expect(hidden).not.toContain("Zq8xP2mL9vR4tY7wK1nB5cJ3hF6dS0aGq8xP2");
+    expect(hidden).toContain("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(hidden).toContain("source:");
+    expect(scanSecrets(hidden).length).toBeGreaterThan(0);
     const longAgent = "e2e0123456789-01hxyz7k3m9q2w4e6r8t0y2u";
     expect(longAgent.length).toBeGreaterThanOrEqual(20);
     expect(longAgent.length).toBeLessThanOrEqual(40);
@@ -102,7 +118,7 @@ describe("architect review regressions", () => {
     expect(scanFinancial("order number 20261017004512345678")).toEqual([]);
     expect(scanFinancial("UPS tracking 1Z999AA10123456784 and USPS 9400111899223197428490")).toEqual([]);
     expect(scanFinancial("brokerage account 5839201746 holds 500 dollars")).toContain("financial_account");
-    expect(scanFinancial("account 5839201746 (USD)")).toEqual([]);
+    expect(scanFinancial("account 5839201746 (USD)")).toContain("financial_account");
     expect(scanFinancial("account 5839.201.746")).toContain("financial_account");
     const policy = [
       { term: "Contoso Example Corp", kind: "context_subject" },
@@ -459,6 +475,8 @@ describe("architect review regressions", () => {
     expect(String(inboxBefore.json.data?.markdown ?? "")).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789");
     expect(String(inboxBefore.json.data?.markdown ?? "")).not.toContain(secretPath);
     expect(inboxBefore.json.data?.status).toBe("active");
+    const tokenRow = await testEnv().DB.prepare("SELECT id FROM tokens WHERE agent_id = ?").bind(agent).first<{ id: string }>();
+    expect(tokenRow?.id).toBeTruthy();
     testEnv().E2E_CLEANUP_ENABLED = "true";
     testEnv().DEPLOY_ENV = "staging";
     testEnv().VAULT_BUCKET = "hiveattic-staging-vault";
@@ -469,6 +487,18 @@ describe("architect review regressions", () => {
       expect(cleaned.status, cleaned.text).toBe(200);
       expect(cleaned.json.data?.remaining_notes).toBe(0);
       expect(cleaned.json.data?.remaining_objects).toBe(0);
+      const audits = await rest("/v1/admin/audit?limit=200", ADMIN);
+      const entries = audits.json.data?.entries;
+      const cleanup = Array.isArray(entries)
+        ? entries.find((entry) => entry && typeof entry === "object" && (entry as { action?: string }).action === "cleanup")
+        : undefined;
+      const detail = JSON.parse(String((cleanup as { detail?: string } | undefined)?.detail ?? "{}")) as {
+        deleted_token_ids?: string[];
+        deleted_tokens?: number;
+      };
+      expect(detail.deleted_token_ids).toContain(tokenRow?.id);
+      expect(detail.deleted_tokens).toBe(detail.deleted_token_ids?.length);
+      expect(detail.deleted_tokens).toBeGreaterThan(0);
       const dayAfter = await (await testEnv().VAULT.get(`vault/${dayPath}`))!.text();
       expect(dayAfter).toContain("qxkeepday");
       expect(dayAfter).not.toContain("qxrunday");
@@ -511,6 +541,66 @@ describe("architect review regressions", () => {
       testEnv().DB_NAME = "hiveattic-index";
       testEnv().WORKER_NAME = "hiveattic";
     }
+  });
+
+  it("purge removes the quarantine record and the inbox alert for that note", async () => {
+    await resetVault();
+    const path = `shared/purge-${nid()}.md`;
+    const created = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: "Clean qxpurge", type: "note" }) });
+    expect(created.status).toBe(200);
+    const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    await testEnv().VAULT.put(`vault/${path}`, `${secret}\nqxpurgesecret\n`);
+    expect((await deliver({ action: "PutObject", key: `vault/${path}` })).acked).toBe(true);
+    const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
+    expect(row?.status).toBe("quarantined");
+    const before = await testEnv().VAULT.list({ prefix: "sys/quarantine/" });
+    let hash = "";
+    for (const object of before.objects) {
+      const text = await (await testEnv().VAULT.get(object.key))!.text();
+      if (!text.includes(path)) continue;
+      hash = String((JSON.parse(text) as { content_hash?: string }).content_hash ?? "");
+    }
+    expect(hash.length).toBeGreaterThan(0);
+    const inboxBefore = await rest("/v1/notes?path=inbox/quarantine.md", ADMIN);
+    expect(String(inboxBefore.json.data?.markdown ?? "")).toContain(hash);
+    const purged = await rest("/v1/admin/purge", ADMIN, { method: "DELETE", body: JSON.stringify({ path }) });
+    expect(purged.status, purged.text).toBe(200);
+    expect(purged.json.data?.purged).toBe(true);
+    const after = await testEnv().VAULT.list({ prefix: "sys/quarantine/" });
+    for (const object of after.objects) {
+      expect(await (await testEnv().VAULT.get(object.key))!.text()).not.toContain(path);
+    }
+    const inbox = await testEnv().VAULT.get("vault/inbox/quarantine.md");
+    const inboxText = inbox ? await inbox.text() : "";
+    expect(inboxText).not.toContain(hash);
+    expect(inboxText).not.toContain(path);
+    expect(inboxText).not.toContain(secret);
+    expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(path).first()).toBeNull();
+    const history = await testEnv().VAULT.list({ prefix: "sys/history/" });
+    for (const object of history.objects) {
+      expect(await (await testEnv().VAULT.get(object.key))!.text()).not.toContain(secret);
+    }
+  });
+
+  it("an outside edit that hides a secret in source or a loose marker is quarantined", async () => {
+    await resetVault();
+    const path = `shared/hidden-${nid()}.md`;
+    const created = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: "Clean qxhidden", type: "note" }) });
+    expect(created.status).toBe(200);
+    const id = String(created.json.data?.id);
+    const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    const marker = `qxhidden${nid()}`;
+    const loose = `---\nvault_id: ${id}\ntype: note\nowner: shared\nstatus: active\nsource: ${secret}\n---\n${marker}\n<!-- hiveattic: ${secret} -->\n`;
+    await testEnv().VAULT.put(`vault/${path}`, loose, {
+      httpMetadata: { contentType: "text/markdown" },
+      customMetadata: { "vault-writer": "do", "vault-id": id },
+    });
+    expect((await deliver({ action: "PutObject", key: `vault/${path}` })).acked).toBe(true);
+    const row = await testEnv().DB.prepare("SELECT status, body FROM notes WHERE path = ?").bind(path).first<{ status: string; body: string }>();
+    expect(row?.status).toBe("quarantined");
+    expect(row?.body.includes(secret)).toBe(false);
+    expect(row?.body.includes(marker)).toBe(false);
+    expect(results((await rest(`/v1/search?q=${marker}`, ADMIN)).json)).toEqual([]);
   });
 });
 
