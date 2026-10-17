@@ -15,15 +15,7 @@ export type NoteView = {
   frontmatter?: Record<string, unknown>;
 };
 
-export const REVIEWER_SCOPES = [
-  "read:shared",
-  "read:decisions",
-  "read:domain/*",
-  "read:inbox",
-  "audit:read",
-  "read:sensitive:summary/health",
-  "read:sensitive:summary/finance",
-];
+export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox", "audit:read"];
 
 export const SENSITIVE_DOMAINS = new Set(["health", "finance"]);
 

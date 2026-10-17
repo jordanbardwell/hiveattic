@@ -157,7 +157,9 @@ Mint a read-only token for someone who should run the read checks and nothing el
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm mint-reviewer architect-reviewer
 ```
 
-The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, `read:inbox`, `audit:read`, `read:sensitive:summary/health`, and `read:sensitive:summary/finance`. Put it in `HIVEATTIC_REVIEWER_TOKEN`. The suite uses it for the read checks and does not revoke a token you supplied. A run with only that token, and no admin token, executes the read checks and skips the write cases.
+The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, `read:inbox`, and `audit:read`. It does not include `read:sensitive:summary/finance` or `read:sensitive:summary/health`. Those summary reads belong to the chief-of-staff role. Put the token in `HIVEATTIC_REVIEWER_TOKEN`. The suite uses it for the read checks and does not revoke a token you supplied. A run with only that token, and no admin token, executes the read checks and skips the write cases.
+
+Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before this change still has the finance and health summary reads. Revoke it and mint a new one.
 
 Rebuild the D1 index from R2 at any time:
 

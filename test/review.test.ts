@@ -264,6 +264,27 @@ describe("architect review regressions", () => {
     expect(results((await rest(`/v1/search?q=${marker}`, financeRo)).json)).toEqual([]);
   });
 
+  it("a reviewer preset cannot read finance or health summaries", async () => {
+    await resetVault();
+    const minted = await rest("/v1/admin/tokens", ADMIN, {
+      method: "POST",
+      body: JSON.stringify({ preset: "reviewer", agent_id: "rev-preset", label: "rev-preset" }),
+    });
+    expect(minted.status).toBe(200);
+    const scopes = minted.json.data?.scopes;
+    expect(Array.isArray(scopes)).toBe(true);
+    expect(scopes).not.toContain("read:sensitive:summary/finance");
+    expect(scopes).not.toContain("read:sensitive:summary/health");
+    const token = String(minted.json.data?.token);
+    const finance = `domains/finance/summaries/month-${nid()}.md`;
+    const health = `domains/health/summaries/visit-${nid()}.md`;
+    expect((await rest("/v1/notes", ADMIN, { method: "PUT", body: JSON.stringify({ path: finance, body: "Finance summary qxrev", type: "note", sensitivity: "sensitive" }) })).status).toBe(200);
+    expect((await rest("/v1/notes", ADMIN, { method: "PUT", body: JSON.stringify({ path: health, body: "Health summary qxrev", type: "note", sensitivity: "sensitive" }) })).status).toBe(200);
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(finance)}`, token)).status).toBe(404);
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(health)}`, token)).status).toBe(404);
+    expect(results((await rest("/v1/search?q=qxrev", token)).json)).toEqual([]);
+  });
+
   it("P19 notes can be read by id", async () => {
     await resetVault();
     const path = `shared/by-id-${nid()}.md`;
