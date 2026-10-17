@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { canWrite, domainOf, noteSensitivity, type Access } from "./access";
 import { frontmatterRoute } from "./classify";
-import { configure, FILE_LIMIT_BYTES, isOrdinaryDomain, isProductionDeploy, RESTRICTED, stagingResources, utf8Length, vaultTimeZone, writeTimeoutMs } from "./config";
+import { configure, FILE_LIMIT_BYTES, isOrdinaryDomain, isProductionDeploy, requireSecrets, RESTRICTED, stagingResources, utf8Length, vaultTimeZone, writeTimeoutMs } from "./config";
 import { hash8, hmacSha256Hex, sha256Hex, ulid } from "./crypto";
 import { ulidTime } from "./idempotency";
 import { asVaultError, ERROR_STATUS, failure, VaultError, type ApiResult, type JsonValue } from "./errors";
@@ -264,6 +264,7 @@ export class VaultWriter extends DurableObject<Env> {
   async perform(op: WriterOp, operationId?: string): Promise<ApiResult> {
     try {
       configure(this.env);
+      requireSecrets(this.env);
     } catch (err) {
       return failure(asVaultError(err));
     }
@@ -1775,7 +1776,8 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   // Audit hashes are HMAC-SHA256 under AUDIT_KEY, so a hash in the log cannot be checked against a
-  // guessed text. Without the key the hash is left out rather than stored as a plain digest.
+  // guessed text. AUDIT_KEY is required; were it missing, the hash would be left out rather than
+  // stored as a plain digest.
   private async auditHash(text: string): Promise<string | null> {
     if (!this.env.AUDIT_KEY) return null;
     return hmacSha256Hex(this.env.AUDIT_KEY, text);

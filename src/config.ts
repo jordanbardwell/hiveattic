@@ -62,6 +62,17 @@ function domainList(raw: string, label: string): Set<string> {
   return new Set(names);
 }
 
+// The four secrets. TOKEN_PEPPER hashes bearer tokens, ADMIN_TOKEN_HASH is the admin token's
+// hash, AUDIT_KEY keys the HMAC of the content of every write in the audit log and tombstones, and
+// JOURNAL_MAC_KEY signs journal entry markers. A deploy missing one answers 500 misconfigured
+// instead of writing audit rows or journal entries it could not hash or sign.
+export const REQUIRED_SECRETS = ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"] as const;
+
+export function requireSecrets(env: Env): void {
+  const missing = REQUIRED_SECRETS.filter((name) => !env[name]?.trim());
+  if (missing.length) throw new VaultError("misconfigured", "A required secret is not set", missing);
+}
+
 // Day files and journal headings follow VAULT_TZ, an IANA name. TZ_DISPLAY is read as a
 // deprecated alias for one release. An unknown zone fails the write instead of filing it on the
 // wrong day.

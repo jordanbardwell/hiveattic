@@ -292,6 +292,8 @@ export async function forgetNote(
   // Append-only and server-managed files are the admin's to forget. The caller's own path is checked
   // first; a path found by id is checked only after the write check on that note passes.
   if (path) assertForgettable(session.access, path);
+  // A path in a domain the deploy does not classify is refused the way writes refuse it.
+  if (path && !session.access.admin) assertClassifiedDomain(domainOf(path));
   // Resolve the target the same way the writer does (id wins), then authorize against that note.
   const note = input.id
     ? await env.DB.prepare("SELECT id, owner, domain, sensitivity, path FROM notes WHERE id = ?")

@@ -168,6 +168,22 @@ describe("review fixes", () => {
     expect(plain.json.data?.expires_at).toBeNull();
   });
 
+  it("a deploy missing AUDIT_KEY or JOURNAL_MAC_KEY answers 500 misconfigured instead of writing unhashed or unsigned rows", async () => {
+    const env = testEnv();
+    for (const name of ["AUDIT_KEY", "JOURNAL_MAC_KEY"] as const) {
+      const saved = env[name];
+      env[name] = "";
+      try {
+        const response = await rest("/v1/journal", writer, { method: "POST", body: JSON.stringify({ target: "own", title: "t", body: "b" }) });
+        expect(response.status, name).toBe(500);
+        expect(response.json.error).toMatchObject({ code: "misconfigured", reasons: [name] });
+      } finally {
+        env[name] = saved;
+      }
+    }
+    expect((await rest("/v1/whoami", writer)).status).toBe(200);
+  });
+
   it("F11: a late delete event for a key that exists again does not forget the live note", async () => {
     await resetVault();
     const path = `shared/late-${nid()}.md`;

@@ -1,5 +1,5 @@
 import { authenticate, countryOf, enforceRateLimit } from "./auth";
-import { configure, CONTENT_LIMIT_BYTES, REQUEST_LIMIT_BYTES, utf8Length } from "./config";
+import { configure, CONTENT_LIMIT_BYTES, REQUEST_LIMIT_BYTES, requireSecrets, utf8Length } from "./config";
 import { ulid } from "./crypto";
 import { asVaultError, errorBody, VaultError } from "./errors";
 import { logEvent } from "./log";
@@ -65,6 +65,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   }
   try {
     configure(env);
+    requireSecrets(env);
     // The request cap comes first: bytes are counted off the stream before anything authenticates,
     // parses, or clones the body, so it answers 413 `request` even when the content is also too big.
     const raw = await readBodyLimited(request, REQUEST_LIMIT_BYTES);
