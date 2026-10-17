@@ -90,8 +90,10 @@ export function journalEntries(markdown: string): JournalEntry[] {
   for (const block of blocks) {
     const heading = /^## .+ · ([^·\n]+) · (.+?) \^([0-9A-HJKMNP-TV-Z]{26})/m.exec(block);
     if (!heading) continue;
-    const idem = /<!-- hiveattic:idempotency=([A-Za-z0-9_.:-]{1,64})(?: h=([0-9a-f]{64}|-) mac=([0-9a-f]{16})?)? -->/.exec(block);
-    const mac = /<!-- hiveattic:e=([0-9A-HJKMNP-TV-Z]{26}):([^:\s]+):([0-9a-f]{16}) -->/.exec(block);
+    // A marker counts only on a line of its own. The heading and the Tags: line cannot carry one,
+    // and the body escapes the prefix.
+    const idem = /^<!-- hiveattic:idempotency=([A-Za-z0-9_.:-]{1,64})(?: h=([0-9a-f]{64}|-) mac=([0-9a-f]{16})?)? -->$/m.exec(block);
+    const mac = /^<!-- hiveattic:e=([0-9A-HJKMNP-TV-Z]{26}):([^:\s]+):([0-9a-f]{16}) -->$/m.exec(block);
     entries.push({
       id: heading[3]!,
       agent: heading[1]!.trim(),

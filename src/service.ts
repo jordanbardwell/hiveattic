@@ -305,6 +305,7 @@ export async function forgetNote(
   if (note) {
     assertCanWrite(session.access, note.path, noteSensitivity(note), note.domain);
     if (path && note.path !== path) throw new VaultError("invalid", "path and id refer to different notes");
+    if (!session.access.admin) assertClassifiedDomain(domainOf(note.path));
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
   }

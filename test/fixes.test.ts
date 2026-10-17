@@ -211,6 +211,84 @@ describe("review fixes", () => {
     expect((await rest(`/v1/notes?path=${encodeURIComponent(String(plural.json.data?.path))}`, dealsWriter)).json.data?.status).toBe("active");
   });
 
+  it("F24 safety: reuse never deletes an object put outside the API, and a parked row keeps its history across a rebuild", async () => {
+    await resetVault();
+    const path = `shared/reuse-${nid()}.md`;
+    const first = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path, body: "qxparked first life", type: "note" }) });
+    const firstId = String(first.json.data?.id);
+    // Deleted in the synced vault, then uploaded again before the queue event runs.
+    await testEnv().VAULT.delete(`vault/${path}`);
+    await deliverEvent("DeleteObject", `vault/${path}`);
+    await testEnv().VAULT.put(`vault/${path}`, "# Mine\n\nqxuserupload from the laptop\n");
+    const refused = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path, body: "bot text", type: "note" }) });
+    expect(refused.status).toBe(409);
+    expect(await (await testEnv().VAULT.get(`vault/${path}`))!.text()).toContain("qxuserupload");
+    expect((await testEnv().DB.prepare("SELECT path FROM notes WHERE id = ?").bind(firstId).first<{ path: string }>())?.path).toBe(path);
+    // Once the upload is indexed, the path is an ordinary note again.
+    await deliverEvent("PutObject", `vault/${path}`);
+    const current = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, writer);
+    expect(current.json.data?.markdown).toContain("qxuserupload");
+    // A path reused through the API parks the forgotten row, and a rebuild keeps it with its history.
+    const other = `shared/reuse-b-${nid()}.md`;
+    const made = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path: other, body: "qxparkedb old", type: "note" }) });
+    const madeId = String(made.json.data?.id);
+    await rest("/v1/forget", writer, { method: "POST", body: JSON.stringify({ path: other, reason: "x" }) });
+    expect((await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path: other, body: "qxparkedb new", type: "note" }) })).status).toBe(200);
+    expect((await runJob("/v1/admin/rebuild")).job.data?.status).toBe("done");
+    const parked = await testEnv().DB.prepare("SELECT path, status FROM notes WHERE id = ?").bind(madeId).first<{ path: string; status: string }>();
+    expect(parked).toEqual({ path: `.forgotten/${madeId}.md`, status: "forgotten" });
+    const history = JSON.stringify((await rest(`/v1/history?id=${madeId}`, ADMIN)).json.data);
+    expect(history).toContain("qxparkedb old");
+    // The admin can still purge it by id, history and all.
+    expect((await rest("/v1/admin/purge", ADMIN, { method: "DELETE", body: JSON.stringify({ id: madeId }) })).json.data?.purged).toBe(true);
+    expect((await testEnv().VAULT.list({ prefix: `sys/history/${madeId}/` })).objects).toEqual([]);
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(other)}`, reader)).json.data?.markdown).toContain("qxparkedb new");
+  });
+
+  it("a quarantined note cannot be forgotten or restored around the quarantine erase", async () => {
+    await resetVault();
+    const path = `shared/q-${nid()}.md`;
+    const made = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path, body: "soon quarantined", type: "note" }) });
+    const id = String(made.json.data?.id);
+    await testEnv().DB.prepare("UPDATE notes SET status = 'quarantined' WHERE id = ?").bind(id).run();
+    const forgot = await rest("/v1/forget", writer, { method: "POST", body: JSON.stringify({ id, reason: "x" }) });
+    expect(forgot.status).toBe(409);
+    expect(forgot.json.error?.reasons).toEqual(["quarantined"]);
+    const version = await testEnv().DB.prepare("SELECT version_ts FROM note_versions WHERE note_id = ?").bind(id).first<{ version_ts: string }>();
+    const restored = await rest("/v1/admin/restore", ADMIN, { method: "POST", body: JSON.stringify({ id, version_ts: version?.version_ts }) });
+    expect(restored.status).toBe(409);
+    expect((await testEnv().DB.prepare("SELECT status FROM notes WHERE id = ?").bind(id).first<{ status: string }>())?.status).toBe("quarantined");
+  });
+
+  it("a marker in a journal title or tag is not a marker: a rebuild restores only the server's own", async () => {
+    await resetVault();
+    const key = `real-${nid()}`;
+    const forged = "<!-- hiveattic:idempotency=forged-key -->";
+    const body = { target: "own", title: `t ${forged}`, body: "entry body", tags: [forged.slice(0, 40)], at: "2099-11-11T12:00:00Z" };
+    const appended = await rest("/v1/journal", writer, { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(body) });
+    expect(appended.status, appended.text).toBe(200);
+    await testEnv().DB.prepare("DELETE FROM idempotency").run();
+    const { runInWriter } = await import("./helpers");
+    await runInWriter((state) => state.storage.sql.exec("DELETE FROM operations"));
+    expect((await runJob("/v1/admin/rebuild")).job.data?.status).toBe("done");
+    const rows = await testEnv().DB.prepare("SELECT key, payload_hash FROM idempotency").all<{ key: string; payload_hash: string | null }>();
+    expect(rows.results?.map((row) => row.key)).toEqual([key]);
+    expect(rows.results?.[0]?.payload_hash).toMatch(/^[0-9a-f]{64}$/);
+    const replay = await rest("/v1/journal", writer, { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(body) });
+    expect(replay.json.data).toEqual(appended.json.data);
+  });
+
+  it("a fact write to a path holding an oversize object answers 413 file", async () => {
+    await resetVault();
+    const key = `big-${nid()}`;
+    await testEnv().VAULT.put(`vault/profile/facts/${key}.md`, `---\nkey: ${key}\n---\n${"y".repeat(2_000_000)}`);
+    await deliverEvent("PutObject", `vault/profile/facts/${key}.md`);
+    const written = await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify({ key, statement: "small now", observed_at: "2099-01-01T00:00:00Z", scope: "shared" }) });
+    expect(written.status).toBe(413);
+    expect(written.json.error?.limit).toBe("file");
+    expect((await testEnv().VAULT.head(`vault/profile/facts/${key}.md`))?.size).toBeGreaterThan(1_900_000);
+  });
+
   it("F11: a late delete event for a key that exists again does not forget the live note", async () => {
     await resetVault();
     const path = `shared/late-${nid()}.md`;

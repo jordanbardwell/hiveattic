@@ -511,12 +511,19 @@ export class VaultWriter extends DurableObject<Env> {
     // A neutral active fact that receives sensitive text moves: the shared path is tombstoned and the
     // fact continues under a new id in the sensitive folder.
     const moving = Boolean(route && active && !activeSegment);
+    await this.assertNotOversize(path);
     let existing = moving ? await this.noteByPath(path) : active;
-    // A forgotten fact's key and path can be used again: the new fact gets a new id (F24).
-    if (moving && existing?.status === "forgotten") existing = await this.releaseForgotten(existing);
+    // A forgotten fact's key and path can be used again: the new fact gets a new id (F24). The
+    // forgotten row is released only right before the new fact is saved, once every check passed.
+    let releasable: NoteRow | null = null;
+    if (moving && existing?.status === "forgotten") {
+      releasable = existing;
+      existing = null;
+    }
     if (!active) {
-      const parked = await this.noteByPath(path);
-      if (parked?.status === "forgotten") await this.releaseForgotten(parked);
+      const atPath = await this.noteByPath(path);
+      if (atPath?.status === "forgotten") releasable = atPath;
+      else if (atPath) throw new VaultError("conflict_etag", `Cannot write to a ${atPath.status} note`, [atPath.status]);
     }
     if (moving && existing && existing.status !== "active" && existing.status !== "superseded") {
       throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
@@ -561,6 +568,7 @@ export class VaultWriter extends DurableObject<Env> {
       const id = existing?.id ?? ulid();
       const createdAt = existing ? createdAtOf(existing) : now;
       const markdown = this.factMarkdown({ ...facts, id, status: "superseded", supersedes: null, outcome: "superseded_older", createdAt });
+      if (releasable) await this.releaseForgotten(releasable);
       const saved = await this.saveMarkdown({
         ...factSave(id, path, markdown, facts, statementHash, op.actor),
         ifMatch: existing?.r2_etag ?? null,
@@ -590,6 +598,7 @@ export class VaultWriter extends DurableObject<Env> {
     const markdown = this.factMarkdown({ ...facts, id, status: "active", supersedes: existing?.version_ts ?? null, outcome, createdAt });
     // A moving fact is saved without its key, the old fact is retired, and then the new one takes
     // the key, so the unique (owner, fact_key) index never sees two active rows.
+    if (releasable) await this.releaseForgotten(releasable);
     const saved = await this.saveMarkdown({
       ...factSave(id, path, markdown, facts, statementHash, op.actor),
       factKey: moving ? null : op.key,
@@ -684,7 +693,11 @@ export class VaultWriter extends DurableObject<Env> {
       attempt += 1;
       let current = await this.noteByPath(path);
       // A day file the admin forgot starts over as a new file under a new id.
-      if (current?.status === "forgotten") current = await this.releaseForgotten(current);
+      let releasable: NoteRow | null = null;
+      if (current?.status === "forgotten") {
+        releasable = current;
+        current = null;
+      }
       if (current && current.status !== "active") {
         throw new VaultError("conflict_etag", `Cannot append to a ${current.status} note`, [current.status]);
       }
@@ -716,6 +729,7 @@ export class VaultWriter extends DurableObject<Env> {
           );
       if (current && !markdown.startsWith(previous)) throw new VaultError("invalid", "Journal append would rewrite earlier entries");
       const id = current?.id ?? stringField(parseMarkdown(markdown).frontmatter.vault_id) ?? ulid();
+      if (releasable) await this.releaseForgotten(releasable);
       const saved = await this.saveMarkdown({
         id,
         path,
@@ -763,7 +777,11 @@ export class VaultWriter extends DurableObject<Env> {
     let original = route ? await this.noteByPath(op.path) : null;
     if (original?.status === "forgotten") original = null;
     let existing = await this.noteByPath(path);
-    if (existing?.status === "forgotten") existing = await this.releaseForgotten(existing);
+    let releasable: NoteRow | null = null;
+    if (existing?.status === "forgotten") {
+      releasable = existing;
+      existing = null;
+    }
     if (original && original.status !== "active") {
       throw new VaultError("conflict_etag", `Cannot write to a ${original.status} note`, [original.status]);
     }
@@ -789,6 +807,7 @@ export class VaultWriter extends DurableObject<Env> {
     const sensitivity = route || kept?.sensitivity === "sensitive" ? "sensitive" : op.sensitivity;
     const createdAt = existing ? createdAtOf(existing) : now;
     const outcome = moving ? "moved" : existing ? "updated" : "created";
+    if (releasable) await this.releaseForgotten(releasable);
     const markdown = buildMarkdown(
       {
         ...stripReserved(op.extra),
@@ -848,6 +867,8 @@ export class VaultWriter extends DurableObject<Env> {
       throw new VaultError("forbidden_scope", "Scope does not allow this write");
     }
     if (op.path && note.path !== op.path) throw new VaultError("invalid", "path and id refer to different notes");
+    // A quarantined note is the quarantine erase's to remove, with its history.
+    if (note.status === "quarantined") throw new VaultError("conflict_etag", "Cannot forget a quarantined note", ["quarantined"]);
     if (note.status === "forgotten") {
       const data = { id: note.id, path: note.path, status: "forgotten" };
       await this.remember(op.actor.agentId, idem, data, 200);
@@ -902,6 +923,7 @@ export class VaultWriter extends DurableObject<Env> {
   private async restore(op: Extract<WriterOp, { kind: "restore" }>): Promise<ApiResult> {
     const note = await this.resolveNote(op.id, op.path);
     if (!note) throw new VaultError("not_found", "Note not found");
+    if (note.status === "quarantined") throw new VaultError("conflict_etag", "Cannot restore a quarantined note", ["quarantined"]);
     const version = await this.env.DB.prepare(
       "SELECT r2_key, content_hash, version_ts FROM note_versions WHERE note_id = ? AND version_ts = ?",
     )
@@ -1671,15 +1693,21 @@ export class VaultWriter extends DurableObject<Env> {
   // Frees a forgotten note's path for a new note. The forgotten row keeps its id, tombstone, and
   // admin-only history under a parked path that no request can name, and its stub object makes way
   // for the new note. An object someone put there since is left alone, so the create answers 409.
-  private async releaseForgotten(row: NoteRow): Promise<null> {
+  private async releaseForgotten(row: NoteRow): Promise<void> {
+    const key = r2KeyFor(this.prefix(), row.path);
+    const head = await this.env.VAULT.head(key);
+    if (head) {
+      // Only the stub this row wrote is removed. Anything else at the key was put there outside the
+      // API since, and the write is refused until that object has been indexed.
+      if (!row.r2_etag || normalizeEtag(head.etag) !== normalizeEtag(row.r2_etag)) {
+        throw new VaultError("conflict_etag", "The file was changed outside the API. Read it again before writing.");
+      }
+      await this.env.VAULT.delete(key);
+    }
     const parked = `.forgotten/${row.id}.md`;
     await this.env.DB.prepare("UPDATE notes SET path = ?, r2_key = ?, fact_key = NULL WHERE id = ? AND status = 'forgotten'")
       .bind(parked, r2KeyFor(this.prefix(), parked), row.id)
       .run();
-    const key = r2KeyFor(this.prefix(), row.path);
-    const head = await this.env.VAULT.head(key);
-    if (head && (!row.r2_etag || normalizeEtag(head.etag) === normalizeEtag(row.r2_etag))) await this.env.VAULT.delete(key);
-    return null;
   }
 
   // Indexes what R2 holds at a path now, so the next attempt of a write works from the stored file.
@@ -2321,12 +2349,12 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   private async rebuildSweep(job: Job): Promise<boolean> {
+    // A forgotten row parked by a reused path has no object of its own. It keeps its history.
+    await this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE path LIKE '.forgotten/%' AND (index_gen IS NULL OR index_gen < ?)").bind(job.gen, job.gen).run();
     const rows = await this.env.DB.prepare("SELECT id FROM notes WHERE index_gen IS NULL OR index_gen < ? LIMIT 100").bind(job.gen).all<{ id: string }>();
     const stale = (rows.results ?? []).map((row) => row.id);
-    if (!stale.length) {
-      await this.env.DB.prepare("DELETE FROM oversize_files WHERE index_gen IS NULL OR index_gen < ?").bind(job.gen).run();
-      return true;
-    }
+    if (stale.length < 100) await this.env.DB.prepare("DELETE FROM oversize_files WHERE index_gen IS NULL OR index_gen < ?").bind(job.gen).run();
+    if (!stale.length) return true;
     const json = JSON.stringify(stale);
     const now = new Date().toISOString();
     await this.env.DB.batch([
@@ -2773,7 +2801,7 @@ function createdAtOf(note: { frontmatter: string; created_at: string }): string 
 
 // Facts that can appear in profile/summary.md, or did before they changed.
 function feedsSummary(note: { type: string; owner: string; path: string }): boolean {
-  return note.type === "fact" && note.owner === "shared" && note.path.startsWith("profile/facts/");
+  return note.type === "fact" && note.owner === "shared";
 }
 
 function fileTooLarge(): VaultError {
