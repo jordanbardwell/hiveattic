@@ -1,9 +1,9 @@
-import { canRead, hasScope, type Access, type NoteView } from "./access";
+import { canRead, domainOf, hasScope, type Access, type NoteView } from "./access";
 import { domainConfig, RESTRICTED, stagingResources, vaultTimeZone } from "./config";
 import { sha256Hex } from "./crypto";
 import { VaultError } from "./errors";
 import { AGENTS_MD } from "./content";
-import { r2KeyFor } from "./paths";
+import { inSensitiveFolder, ownerForPath, r2KeyFor } from "./paths";
 
 export { stagingResources };
 
@@ -54,6 +54,7 @@ export async function searchVault(env: Env, access: Access, query: string, mode:
        JOIN chunks c ON c.rowid = chunks_fts.rowid
        JOIN notes n ON n.id = c.note_id
        WHERE chunks_fts MATCH ? AND n.status = 'active' AND (${scope.sql}) ${filters.sql}
+         AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
        ORDER BY bm25(chunks_fts)
        LIMIT ?`,
     )
@@ -102,10 +103,24 @@ function readable(access: Access, note: NoteRecord | null): note is NoteRecord {
   return canRead(access, noteView(note));
 }
 
+// An oversize file is not served. A caller who could read the path gets 413 limit "file"; anyone
+// else gets the same 404 as for a missing note.
+async function assertServable(env: Env, access: Access, path: string, note: NoteRecord | null): Promise<void> {
+  const row = await env.DB.prepare("SELECT 1 AS hit FROM oversize_files WHERE path = ?").bind(path).first<{ hit: number }>();
+  if (!row) return;
+  const view: NoteView = note ? noteView(note) : { path, owner: ownerForPath(path), domain: domainOf(path), sensitivity: inSensitiveFolder(path) ? "sensitive" : "normal" };
+  if (note ? readable(access, note) : canRead(access, view)) {
+    throw new VaultError("payload_too_large", "The stored file is over the file size limit", ["file"], { limit: "file" });
+  }
+  throw new VaultError("not_found", "Note not found");
+}
+
 export async function readNote(env: Env, access: Access, path?: string, id?: string): Promise<Record<string, unknown>> {
   const note = id
     ? await env.DB.prepare(`${NOTE_SELECT} WHERE id = ?`).bind(id).first<NoteRecord>()
     : await env.DB.prepare(`${NOTE_SELECT} WHERE path = ?`).bind(path ?? "").first<NoteRecord>();
+  const target = note?.path ?? (id ? null : path);
+  if (target) await assertServable(env, access, target, note);
   if (!readable(access, note)) throw new VaultError("not_found", "Note not found");
   return {
     id: note.id,
@@ -132,6 +147,7 @@ export async function listNotes(env: Env, access: Access, prefix: string, cursor
     const rows = await env.DB.prepare(
       `SELECT id, path, title, type, owner, domain, sensitivity, frontmatter, updated_at, status
        FROM notes n WHERE status = 'active' AND path LIKE ? ESCAPE '\\' AND (? = '' OR path > ?) AND (${scope.sql})
+         AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
        ORDER BY path LIMIT ?`,
     )
       .bind(likePrefix(prefix), after, after, ...scope.binds, page + 1)
@@ -157,6 +173,8 @@ export async function noteHistory(env: Env, access: Access, path?: string, id?: 
   const note = id
     ? await env.DB.prepare(`${NOTE_SELECT} WHERE id = ?`).bind(id).first<NoteRecord>()
     : await env.DB.prepare(`${NOTE_SELECT} WHERE path = ?`).bind(path ?? "").first<NoteRecord>();
+  const target = note?.path ?? (id ? null : path);
+  if (target) await assertServable(env, access, target, note);
   if (!readable(access, note)) throw new VaultError("not_found", "Note not found");
   const versions = await env.DB.prepare(
     "SELECT version_ts, r2_key, content_hash, writer, reason FROM note_versions WHERE note_id = ? ORDER BY version_ts",

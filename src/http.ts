@@ -113,12 +113,17 @@ async function route(request: Request, env: Env, url: URL, session: Session, raw
   }
   if (method === "GET" && pathname === "/v1/list") return ok(await list(env, session, url.searchParams.get("prefix") ?? "", url.searchParams.get("cursor") ?? ""));
   if (method === "GET" && pathname === "/v1/history") return ok(await history(env, session, url.searchParams.get("path") ?? undefined, url.searchParams.get("id") ?? undefined));
-  if (method === "POST" && pathname === "/v1/facts") return writeFact(env, session, parseInput(factSchema, await body()), idempotency);
+  if (method === "POST" && pathname === "/v1/facts") {
+    const parsed = await body();
+    // A statement over the content cap answers 413 like a note body; the 2,000-character schema limit stays 400.
+    assertContentField(parsed, "statement");
+    return writeFact(env, session, parseInput(factSchema, parsed), idempotency);
+  }
   if (method === "POST" && pathname === "/v1/journal") return appendJournal(env, session, parseInput(journalSchema, await body()), idempotency);
   if (method === "PUT" && pathname === "/v1/notes") {
     const parsed = await body();
     // The content cap is checked on the decoded body before the schema, so it answers 413, not 400.
-    if (parsed && typeof parsed === "object" && typeof (parsed as { body?: unknown }).body === "string") assertContent((parsed as { body: string }).body);
+    assertContentField(parsed, "body");
     return writeNote(env, session, parseInput(noteSchema, parsed), request.headers.get("if-match"), idempotency);
   }
   if (method === "POST" && pathname === "/v1/forget") return forgetNote(env, session, parseInput(forgetSchema, await body()), idempotency);
@@ -168,6 +173,12 @@ function assertContent(text: string): void {
   if (utf8Length(text) > CONTENT_LIMIT_BYTES) throw tooLarge("content");
 }
 
+function assertContentField(parsed: unknown, field: "body" | "statement"): void {
+  if (!parsed || typeof parsed !== "object") return;
+  const value = (parsed as Record<string, unknown>)[field];
+  if (typeof value === "string") assertContent(value);
+}
+
 // Reads the body as bytes and stops at the cap. A declared Content-Length over the cap is refused
 // unread. A chunked body with no Content-Length is counted chunk by chunk and cancelled when it passes.
 export async function readBodyLimited(request: Request, limit: number): Promise<Uint8Array | null> {
@@ -212,12 +223,13 @@ function rpcMessages(parsed: unknown): { method?: string; params?: { name?: stri
   return messages.filter((message): message is { method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } => Boolean(message) && typeof message === "object");
 }
 
-// The MCP note body gets the same 413 `content` answer as REST, as an HTTP 413, before the tool runs.
+// The MCP note body and fact statement get the same 413 `content` answer as REST, as an HTTP 413,
+// before the tool runs.
 function assertMcpContent(parsed: unknown): void {
   for (const message of rpcMessages(parsed)) {
-    if (message.method !== "tools/call" || message.params?.name !== "vault_write_note") continue;
-    const content = message.params.arguments?.body;
-    if (typeof content === "string") assertContent(content);
+    if (message.method !== "tools/call") continue;
+    if (message.params?.name === "vault_write_note") assertContentField(message.params.arguments, "body");
+    if (message.params?.name === "vault_write_fact") assertContentField(message.params.arguments, "statement");
   }
 }
 

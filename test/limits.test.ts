@@ -1,6 +1,6 @@
 import { SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ADMIN, deliverEvent, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, deliverEvent, mcp, mint, nid, resetVault, rest, testEnv } from "./helpers";
 
 // T-18. Two 413 limits: the whole request is capped at 256,000 bytes and is checked first, before
 // anything parses it; a note body or fact statement is capped at 200,000 bytes of UTF-8 after
@@ -152,6 +152,17 @@ describe("T-18 size limits", () => {
     }
   });
 
+  it("a fact statement over 200,000 bytes answers 413 content on REST and MCP; over 2,000 characters it is a schema 400", async () => {
+    await resetVault();
+    const statement = "a".repeat(200_001);
+    const viaRest = await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify({ key: `big-${nid()}`, statement, observed_at: "2099-01-01T00:00:00Z" }) });
+    expect(viaRest.status).toBe(413);
+    expect(viaRest.json.error).toMatchObject({ code: "payload_too_large", limit: "content" });
+    const viaMcp = await mcp(writer, "vault_write_fact", { key: `big-${nid()}`, statement, observed_at: "2099-01-01T00:00:00Z" });
+    expect(viaMcp.status).toBe(413);
+    expect((await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify({ key: `big-${nid()}`, statement: "a".repeat(2001), observed_at: "2099-01-01T00:00:00Z" }) })).status).toBe(400);
+  });
+
   it("schema limits stay 400, and a stored file over 1,900,000 bytes answers 413 file", async () => {
     await resetVault();
     const fact = await rest("/v1/facts", writer, { method: "POST", body: JSON.stringify({ key: `f-${nid()}`, statement: "€".repeat(2001), observed_at: "2099-01-01T00:00:00Z" }) });
@@ -167,12 +178,12 @@ describe("T-18 size limits", () => {
     const full = await journal(8000);
     expect(full.status).toBe(413);
     expect(full.json.error).toMatchObject({ code: "payload_too_large", limit: "file" });
-    // An outside object past the file cap is skipped, audited, and never retried into the DLQ.
+    // An outside object past the file cap is recorded as oversize, audited, and never retried into the DLQ.
     await testEnv().VAULT.put("vault/shared/huge.md", "z".repeat(2_000_000));
     const delivered = await deliverEvent("PutObject", "vault/shared/huge.md");
     expect(delivered).toEqual({ acked: true, retried: false });
     expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = 'shared/huge.md'").first()).toBeNull();
-    expect(await testEnv().DB.prepare("SELECT 1 FROM audit_log WHERE action = 'external_skipped' AND path = 'shared/huge.md'").first()).toBeTruthy();
-    expect((await rest("/v1/notes?path=shared/huge.md", ADMIN)).status).toBe(404);
+    expect(await testEnv().DB.prepare("SELECT 1 FROM audit_log WHERE action = 'oversize' AND path = 'shared/huge.md'").first()).toBeTruthy();
+    expect((await rest("/v1/notes?path=shared/huge.md", ADMIN)).json.error).toMatchObject({ code: "payload_too_large", limit: "file" });
   });
 });

@@ -659,6 +659,7 @@ export class VaultWriter extends DurableObject<Env> {
     // to sensitive/restricted/journal/<writer>/. The requested day file gets no entry and no placeholder.
     const requested = journalPath(op.actor.agentId, op.target, stamp.date);
     const path = route ? sensitiveJournalPath(route, op.actor.agentId, stamp.date) : requested;
+    await this.assertNotOversize(path);
     const decisions = !route && op.target === "decisions";
     const type = decisions ? "decision" : "journal";
     const owner = route || op.target === "own" ? op.actor.agentId : "shared";
@@ -731,6 +732,9 @@ export class VaultWriter extends DurableObject<Env> {
       });
       if (saved.ok) return withStatus(journalReply(entryId, path, route), status);
       if (saved.error.code !== "conflict_etag" || attempt === 3) return saved;
+      // The object changed outside the API. D1 cannot catch up by itself inside this call, so the
+      // file is read from R2 and indexed before the next attempt.
+      await this.refreshFromR2(path, op.actor);
     }
     return failure(new VaultError("conflict_etag", "Journal changed while appending"));
   }
@@ -744,6 +748,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (replay) return replay;
     const route = op.reroute;
     const path = route ? reroutedPath(route, op.path) : op.path;
+    await this.assertNotOversize(path);
     const original = route ? await this.noteByPath(op.path) : null;
     const existing = await this.noteByPath(path);
     if (original && original.status !== "active") {
@@ -944,7 +949,12 @@ export class VaultWriter extends DurableObject<Env> {
     const deleting = op.action === "DeleteObject" || op.action === "LifecycleDeletion";
     const copying = op.action === "CopyObject" || Boolean(op.copySource);
     const actionName = deleting ? "external_delete" : copying ? "external_copy" : "external_put";
-    if (deleting) return this.externalDelete(path, actor, detail);
+    if (deleting) {
+      // A delete event can arrive after the key was written again. Only a key that is gone now is forgotten.
+      if (await this.env.VAULT.head(op.key)) return { ok: true, data: { skipped: true, reason: "recreated" } };
+      await this.clearOversize(path);
+      return this.externalDelete(path, actor, detail);
+    }
     if (op.copySource) {
       const source = copySourceVaultPath(op.copySource, prefix, this.env.VAULT_BUCKET || "");
       if (source && source !== path) {
@@ -963,8 +973,9 @@ export class VaultWriter extends DurableObject<Env> {
     }
     if (object.size > FILE_LIMIT_BYTES) {
       await object.body?.cancel();
-      await this.audit(actor, "external_skipped", path, note?.id ?? null, "skipped", ["file_too_large"], null, object.size, detail);
-      return { ok: true, data: { skipped: true, reason: "file_too_large" } };
+      if (note?.status === "quarantined") return { ok: true, data: { skipped: true, reason: "quarantined" } };
+      await this.markOversize(path, object.size, objectEtag, actor, detail);
+      return { ok: true, data: { skipped: true, reason: "oversize" } };
     }
     const markdown = await object.text();
     return this.indexBytes({ path, markdown, etag: objectEtag, actor, action: actionName, reason: "external-edit", detail, metaId: metaId || null });
@@ -1194,9 +1205,7 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   private async saveMarkdown(input: SaveInput): Promise<ApiResult<{ etag: string }>> {
-    if (utf8Length(input.markdown) > FILE_LIMIT_BYTES) {
-      throw new VaultError("payload_too_large", "The stored file would pass the file size limit", ["file"], { limit: "file" });
-    }
+    if (utf8Length(input.markdown) > FILE_LIMIT_BYTES) throw fileTooLarge();
     const existing = input.create ? null : await this.noteByPath(input.path);
     const appending = input.reason === "appended" || input.reason === "conflict";
     if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
@@ -1356,6 +1365,7 @@ export class VaultWriter extends DurableObject<Env> {
         input.detail ?? null,
       ),
     );
+    statements.push(this.env.DB.prepare("DELETE FROM oversize_files WHERE path = ?").bind(input.path));
     if (input.remember) {
       const { key, hash } = input.remember;
       statements.push(...this.rememberStatements(input.actor.agentId, { key, hash }, input.remember.data(put.etag), input.remember.status));
@@ -1574,6 +1584,57 @@ export class VaultWriter extends DurableObject<Env> {
     });
     if (!object) return null;
     return { etag: normalizeEtag(object.etag) ?? object.etag, versionTs: versionStamp() };
+  }
+
+  // An object over the file limit is not indexed, not deleted, and not served. D1 keeps its path and
+  // size in oversize_files. A row the path already had keeps its history, but loses its chunks and
+  // links and its etag, so search and list skip it and no API write can match it. The audit row is
+  // written once per object version. Shrinking the file lets the next event or job index it again.
+  private async markOversize(path: string, size: number, etag: string | null, actor: Actor, detail: string | null = null): Promise<void> {
+    const prior = await this.env.DB.prepare("SELECT r2_etag FROM oversize_files WHERE path = ?").bind(path).first<{ r2_etag: string | null }>();
+    const note = await this.noteByPath(path);
+    const now = new Date().toISOString();
+    const statements: D1PreparedStatement[] = [
+      this.env.DB.prepare(
+        `INSERT INTO oversize_files (path, size, r2_etag, note_id, found_at, index_gen) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, r2_etag = excluded.r2_etag, note_id = excluded.note_id, index_gen = excluded.index_gen`,
+      ).bind(path, size, etag, note?.id ?? null, now, this.gen()),
+    ];
+    if (note) {
+      const chunkIds = await this.chunkIds(note.id);
+      statements.push(
+        this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
+        this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
+        this.env.DB.prepare("UPDATE notes SET r2_etag = NULL, index_gen = ? WHERE id = ?").bind(this.gen(), note.id),
+        ...this.vectorDeletes(chunkIds, note.id, now),
+      );
+    }
+    await this.env.DB.batch(statements);
+    if (!prior || normalizeEtag(prior.r2_etag) !== normalizeEtag(etag)) {
+      await this.audit(actor, "oversize", path, note?.id ?? null, "skipped", ["file"], null, size, detail);
+    }
+  }
+
+  // Indexes what R2 holds at a path now, so the next attempt of a write works from the stored file.
+  private async refreshFromR2(path: string, actor: Actor): Promise<void> {
+    const object = await this.env.VAULT.get(r2KeyFor(this.prefix(), path));
+    if (!object) return;
+    if (object.size > FILE_LIMIT_BYTES) {
+      await object.body?.cancel();
+      await this.markOversize(path, object.size, normalizeEtag(object.etag), actor);
+      throw fileTooLarge();
+    }
+    const indexer: Actor = { ...actor, agentId: "reconcile", tokenId: "reconcile", client: "reconcile" };
+    await this.indexBytes({ path, markdown: await object.text(), etag: normalizeEtag(object.etag), actor: indexer, action: "reconcile", reason: "reconcile" });
+  }
+
+  private async clearOversize(path: string): Promise<void> {
+    await this.env.DB.prepare("DELETE FROM oversize_files WHERE path = ?").bind(path).run();
+  }
+
+  private async assertNotOversize(path: string): Promise<void> {
+    const row = await this.env.DB.prepare("SELECT 1 AS hit FROM oversize_files WHERE path = ?").bind(path).first<{ hit: number }>();
+    if (row) throw fileTooLarge();
   }
 
   // Hard-erases one note: the vault object, sys/history/<id>/, and every D1 row for it, leaving a
@@ -1822,7 +1883,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (job.phase === "start") {
       job.gen = this.gen() + 1;
       this.setState("index_gen", String(job.gen));
-      for (const name of ["files", "notes", "versions", "tombstones", "history_reads", "moved", "swept", "links", "skipped"]) job.counts[name] = 0;
+      for (const name of ["files", "notes", "versions", "tombstones", "history_reads", "moved", "swept", "links", "skipped", "oversize"]) job.counts[name] = 0;
       job.phase = "files";
       job.cursor = null;
     }
@@ -1868,12 +1929,12 @@ export class VaultWriter extends DurableObject<Env> {
     let take = 0;
     let bytes = 0;
     for (const entry of entries) {
-      if (entry.path && !isCurrent(live.get(entry.path), entry.object.etag, gen)) bytes += entry.object.size;
+      if (entry.path && entry.object.size <= FILE_LIMIT_BYTES && !isCurrent(live.get(entry.path), entry.object.etag, gen)) bytes += entry.object.size;
       if (take > 0 && bytes > PAGE_BYTES) break;
       take += 1;
     }
     const chosen = entries.slice(0, take);
-    const loads = chosen.filter((entry) => entry.path && !isCurrent(live.get(entry.path), entry.object.etag, gen));
+    const loads = chosen.filter((entry) => entry.path && entry.object.size <= FILE_LIMIT_BYTES && !isCurrent(live.get(entry.path), entry.object.etag, gen));
     const texts = new Map<string, { text: string; etag: string | null; metaId: string | null; uploaded: string | null }>();
     let loadedUpTo = chosen.length;
     for (const group of slices(loads, R2_READ_CONCURRENCY)) {
@@ -1892,6 +1953,13 @@ export class VaultWriter extends DurableObject<Env> {
       for (const file of files) if (file) texts.set(file.key, file);
     }
     const processed = chosen.slice(0, loadedUpTo);
+    // An object over the file limit is never loaded. It is recorded as oversize and the page goes on.
+    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId: job.actor.requestId, ipCountry: null };
+    for (const entry of processed) {
+      if (!entry.path || entry.object.size <= FILE_LIMIT_BYTES || live.get(entry.path)?.status === "quarantined") continue;
+      await this.markOversize(entry.path, entry.object.size, normalizeEtag(entry.object.etag), actor, JSON.stringify({ job_id: job.id }));
+      this.count(job, "oversize");
+    }
     const loaded = processed.flatMap((entry) => {
       const file = texts.get(entry.object.key);
       return entry.path && file ? [{ path: entry.path, ...file }] : [];
@@ -1929,8 +1997,8 @@ export class VaultWriter extends DurableObject<Env> {
         continue;
       }
       if (utf8Length(file.text) > FILE_LIMIT_BYTES) {
-        this.count(job, "skipped");
-        if (row) keepAlive.push(row.id);
+        await this.markOversize(file.path, utf8Length(file.text), file.etag, actor, JSON.stringify({ job_id: job.id }));
+        this.count(job, "oversize");
         continue;
       }
       const fm = file.parsed.frontmatter;
@@ -2019,7 +2087,9 @@ export class VaultWriter extends DurableObject<Env> {
     }
     await this.flushRows(rows, now);
     if (keepAlive.length) await this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE id IN (SELECT value FROM json_each(?))").bind(gen, JSON.stringify(keepAlive)).run();
-    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId: job.actor.requestId, ipCountry: null };
+    // A path read back at its normal size is no longer oversize.
+    const indexed = rows.notes.map((row) => String(row[1]));
+    if (indexed.length) await this.env.DB.prepare("DELETE FROM oversize_files WHERE path IN (SELECT value FROM json_each(?))").bind(JSON.stringify(indexed)).run();
     for (const move of moves) {
       await this.moveStoredFile({ path: move.path, markdown: move.text, etag: move.etag, route: move.route, actor, action: "rebuild" });
       this.count(job, "moved");
@@ -2174,7 +2244,10 @@ export class VaultWriter extends DurableObject<Env> {
   private async rebuildSweep(job: Job): Promise<boolean> {
     const rows = await this.env.DB.prepare("SELECT id FROM notes WHERE index_gen IS NULL OR index_gen < ? LIMIT 100").bind(job.gen).all<{ id: string }>();
     const stale = (rows.results ?? []).map((row) => row.id);
-    if (!stale.length) return true;
+    if (!stale.length) {
+      await this.env.DB.prepare("DELETE FROM oversize_files WHERE index_gen IS NULL OR index_gen < ?").bind(job.gen).run();
+      return true;
+    }
     const json = JSON.stringify(stale);
     const now = new Date().toISOString();
     await this.env.DB.batch([
@@ -2238,7 +2311,7 @@ export class VaultWriter extends DurableObject<Env> {
   // Reconcile: index files whose etag differs from D1, then forget rows whose object is missing.
   private async reconcileStep(job: Job, deadline: number): Promise<boolean> {
     if (job.phase === "start") {
-      for (const name of ["scanned", "updated", "moved", "forgotten"]) job.counts[name] = 0;
+      for (const name of ["scanned", "updated", "moved", "forgotten", "oversize"]) job.counts[name] = 0;
       this.nextPhase(job, "files");
     }
     const actor: Actor = { agentId: "reconcile", tokenId: "reconcile", client: "reconcile", requestId: job.actor.requestId, ipCountry: null };
@@ -2275,7 +2348,14 @@ export class VaultWriter extends DurableObject<Env> {
         }
       }
       if (list.length) job.cursor = list.at(-1)!.path;
-      if (list.length < PAGE_OBJECTS) this.nextPhase(job, "quarantine");
+      if (list.length < PAGE_OBJECTS) {
+        // Oversize records whose object is gone go too.
+        const records = await this.env.DB.prepare("SELECT path FROM oversize_files").all<{ path: string }>();
+        for (const record of records.results ?? []) {
+          if (!(await this.env.VAULT.head(r2KeyFor(this.prefix(), record.path)))) await this.clearOversize(record.path);
+        }
+        this.nextPhase(job, "quarantine");
+      }
       return false;
     }
     if (job.phase === "quarantine") return this.deleteQuarantineOrphans(job);
@@ -2288,7 +2368,12 @@ export class VaultWriter extends DurableObject<Env> {
     this.count(job, "scanned");
     const row = live.get(path);
     if (row && normalizeEtag(row.r2_etag) && normalizeEtag(row.r2_etag) === normalizeEtag(object.etag)) return;
-    if (object.size > FILE_LIMIT_BYTES) return;
+    if (object.size > FILE_LIMIT_BYTES) {
+      if ((row as { status?: string } | undefined)?.status === "quarantined") return;
+      await this.markOversize(path, object.size, normalizeEtag(object.etag), actor, JSON.stringify({ job_id: job.id }));
+      this.count(job, "oversize");
+      return;
+    }
     const file = await this.env.VAULT.get(object.key);
     if (!file) return;
     const result = await this.indexBytes({ path, markdown: await file.text(), etag: normalizeEtag(file.etag), actor, action: "reconcile", reason: "reconcile" });
@@ -2605,6 +2690,10 @@ function keepClass(access: Access, existing: NoteRow, next: string | null): { do
 function createdAtOf(note: { frontmatter: string; created_at: string }): string {
   const fm = parseFrontmatter(note.frontmatter);
   return stringField(fm.vault_created_at) ?? stringField(fm.created_at) ?? note.created_at;
+}
+
+function fileTooLarge(): VaultError {
+  return new VaultError("payload_too_large", "The stored file is over the file size limit", ["file"], { limit: "file" });
 }
 
 function jobRunning(id: string): VaultError {

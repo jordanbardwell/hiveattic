@@ -8,3 +8,15 @@ ALTER TABLE tombstones ADD COLUMN moved_to TEXT;
 ALTER TABLE tombstones ADD COLUMN path TEXT;
 -- An idempotency key is bound to a hash of its payload: the same key with another payload is refused.
 ALTER TABLE idempotency ADD COLUMN payload_hash TEXT;
+-- A stored object over 1,900,000 bytes is not indexed, not deleted, and not served. Its index
+-- status is oversize: D1 records the path and size only. A row the path had before keeps its
+-- history but loses its chunks and links.
+CREATE TABLE oversize_files (
+  path TEXT PRIMARY KEY,
+  size INTEGER NOT NULL,
+  r2_etag TEXT,
+  note_id TEXT,
+  status TEXT NOT NULL DEFAULT 'oversize' CHECK (status = 'oversize'),
+  found_at TEXT NOT NULL,
+  index_gen INTEGER
+);

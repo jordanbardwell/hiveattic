@@ -6,7 +6,7 @@ export const ADMIN = "test-admin-token-not-a-secret";
 export type Envelope = {
   ok: boolean;
   data?: Record<string, unknown>;
-  error?: { code: string; message: string; reasons: string[] };
+  error?: { code: string; message: string; reasons: string[] } & Record<string, unknown>;
   request_id?: string;
 };
 
