@@ -1,0 +1,16 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+dist/
+coverage/
+e2e-results/
+*.log
+.DS_Store
+test/fixtures/account-number.local.txt
+account-number.local.txt
+*.local.json
+.e2e.env
+e2e.env
+policy/employers.local.txt

@@ -1,0 +1,8 @@
+{
+  "finance-rw": ["read:shared", "read:own", "write:own", "read:domain/finance", "write:domain/finance", "read:sensitive/finance", "write:sensitive/finance"],
+  "finance-ro": ["read:shared", "read:own", "write:own", "read:domain/finance", "read:sensitive/finance"],
+  "chief-of-staff": ["read:shared", "read:inbox", "read:sensitive:summary/health", "read:sensitive:summary/finance"],
+  "reader-x": ["read:shared", "read:own", "write:own", "read:domain/x", "write:domain/x"],
+  "shared-writer": ["read:shared", "read:own", "write:own", "write:shared"],
+  "external-default": ["read:shared"]
+}

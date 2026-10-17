@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+      - run: grep -q '00000000-0000-0000-0000-000000000001' wrangler.jsonc
+      - run: grep -q '"E2E_CLEANUP_ENABLED": ""' wrangler.jsonc
+      - run: grep -q '"DEPLOY_ENV": ""' wrangler.jsonc
+      - run: grep -q '"workers_dev": true' wrangler.jsonc
+      - run: if grep -q hiveattic.com wrangler.jsonc; then echo "tracked prod config must not route hiveattic.com"; exit 1; fi
