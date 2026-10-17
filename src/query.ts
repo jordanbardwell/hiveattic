@@ -161,7 +161,7 @@ export async function noteHistory(env: Env, access: Access, path?: string, id?: 
   )
     .bind(note.id)
     .all<{ version_ts: string; r2_key: string; content_hash: string; writer: string; reason: string | null }>();
-  const hiddenBody = note.status === "forgotten" || note.status === "quarantined";
+  const hiddenBody = note.status === "forgotten";
   const includeBody = access.admin || (!hiddenBody && note.owner === access.agentId);
   const listed = [];
   for (const version of (versions.results ?? []).slice(-50)) {

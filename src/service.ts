@@ -1,9 +1,8 @@
-import { assertClassifiedDomain, canWrite, hasScope, NON_SENSITIVE_DOMAINS, resolveDomain, REVIEWER_SCOPES, type Access } from "./access";
+import { assertClassifiedDomain, canWrite, hasScope, NON_SENSITIVE_DOMAINS, resolveDomain, REVIEWER_SCOPES, SENSITIVE_DOMAINS, type Access } from "./access";
 import { clearAuthCache } from "./auth";
 import { AGENTS_MD, README_MD } from "./content";
-import { hashToken, hmacSha256Hex, randomToken, ulid } from "./crypto";
+import { hashToken, randomToken, ulid } from "./crypto";
 import { VaultError, type ApiResult, type ErrorCode, type JsonValue } from "./errors";
-import { classifySensitive, inspectWrite, type PolicyTerm } from "./filters";
 import { logEvent } from "./log";
 import { assertVaultPath } from "./access";
 import { factPath, journalPath } from "./paths";
@@ -77,9 +76,8 @@ export async function writeFact(
 ): Promise<Record<string, unknown>> {
   const path = factPath(session.access.agentId, input.scope, input.key);
   const domain = resolveDomain(path, input.domain);
-  const sensitivity = sensitivityFor(input.sensitivity, domain, `${input.statement}\n${input.tags.join(" ")}`);
+  const sensitivity = sensitivityFor(input.sensitivity, domain);
   assertCanWrite(session.access, path, sensitivity, domain);
-  await rejectFiltered(env, session, path, `${input.statement}\n${input.tags.join(" ")}\n${input.links.join(" ")}`, "write_fact");
   return perform(env, {
     kind: "fact",
     actor: actor(session),
@@ -107,12 +105,12 @@ export async function appendJournal(
     tags: string[];
     idempotency_key?: string | null;
     domain?: string | null;
+    sensitivity?: "normal" | "sensitive";
   },
 ): Promise<Record<string, unknown>> {
   const domain = input.domain ?? null;
   assertClassifiedDomain(domain);
-  const text = `${input.title}\n${input.body}\n${input.tags.join(" ")}`;
-  const sensitivity = sensitivityFor(undefined, domain, text);
+  const sensitivity = sensitivityFor(input.sensitivity, domain);
   if (sensitivity === "sensitive" && input.target !== "own") {
     throw new VaultError("invalid", "A sensitive journal entry stays in your own journal. Shared day files stay normal.");
   }
@@ -121,7 +119,6 @@ export async function appendJournal(
   const journalDate = etStamp(input.at ?? new Date().toISOString(), env.TZ_DISPLAY || "UTC").date;
   const journalFile = journalPath(session.access.agentId, input.target, journalDate, sensitivity === "sensitive" && input.target === "own");
   assertCanWrite(session.access, journalFile, sensitivity, domain);
-  await rejectFiltered(env, session, input.target === "own" ? `bots/${session.access.agentId}/journal/own.md` : "journal/shared.md", text, "append_journal");
   return perform(env, {
     kind: "journal",
     actor: actor(session),
@@ -152,10 +149,8 @@ export async function writeNote(
 ): Promise<Record<string, unknown>> {
   const path = assertVaultPath(input.path);
   const domain = resolveDomain(path, input.domain);
-  const extraText = JSON.stringify(input.extra ?? {});
-  const sensitivity = sensitivityFor(input.sensitivity, domain, `${input.body}\n${extraText}`);
+  const sensitivity = sensitivityFor(input.sensitivity, domain);
   assertCanWrite(session.access, path, sensitivity, domain);
-  await rejectFiltered(env, session, path, `${input.body}\n${extraText}`, "write_note");
   return perform(env, {
     kind: "note",
     actor: actor(session),
@@ -189,7 +184,6 @@ export async function forgetNote(
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
   }
-  await rejectFiltered(env, session, path ?? "forget.md", input.reason, "forget");
   return perform(env, { kind: "forget", actor: actor(session), path, id: input.id, reason: input.reason });
 }
 
@@ -257,35 +251,10 @@ export async function revokeToken(env: Env, session: Session, input: { token_id?
   return { revoked: result.meta.changes ?? 0 };
 }
 
-export async function listPolicy(env: Env, session: Session): Promise<Record<string, unknown>> {
-  assertAdmin(session.access);
-  const rows = await env.DB.prepare("SELECT term, kind, added_by, added_at FROM policy_terms ORDER BY kind, term").all();
-  return { terms: rows.results ?? [] };
-}
-
-export async function addPolicy(env: Env, session: Session, term: string, kind: string): Promise<Record<string, unknown>> {
-  assertAdmin(session.access);
-  await env.DB.prepare(
-    `INSERT INTO policy_terms (term, kind, added_by, added_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(term) DO UPDATE SET kind = excluded.kind, added_by = excluded.added_by, added_at = excluded.added_at`,
-  )
-    .bind(term, kind, session.access.agentId, new Date().toISOString())
-    .run();
-  await audit(env, session, "add_policy", null, null, "ok", [kind], null, term.length);
-  return { term, kind };
-}
-
-export async function removePolicy(env: Env, session: Session, term: string): Promise<Record<string, unknown>> {
-  assertAdmin(session.access);
-  await env.DB.prepare("DELETE FROM policy_terms WHERE term = ?").bind(term).run();
-  await audit(env, session, "remove_policy", null, null, "ok", [], null, term.length);
-  return { term };
-}
-
+// The writer audits reindex_started, then reindex with the outcome, counts, and duration when the rebuild ends.
 export async function reindex(env: Env, session: Session): Promise<Record<string, unknown>> {
   assertAdmin(session.access);
-  await audit(env, session, "reindex", null, null, "ok", [], null, 0);
-  return perform(env, { kind: "rebuild" });
+  return perform(env, { kind: "rebuild", actor: actor(session) });
 }
 
 export async function reconcile(env: Env, session: Session): Promise<Record<string, unknown>> {
@@ -392,16 +361,9 @@ export async function verifyAuditAppendOnly(env: Env, session: Session): Promise
   return { update_aborted: true, delete_aborted: true };
 }
 
-export async function listQuarantine(env: Env, session: Session): Promise<Record<string, unknown>> {
-  assertAdmin(session.access);
-  const rows = await env.DB.prepare(
-    "SELECT id, path, content_hash, updated_at FROM notes WHERE status = 'quarantined' ORDER BY updated_at DESC LIMIT 100",
-  ).all();
-  return { notes: rows.results ?? [] };
-}
-
-function sensitivityFor(requested: "normal" | "sensitive" | undefined, domain: string | null, text: string): "normal" | "sensitive" {
-  if (requested === "sensitive" || classifySensitive(text, domain)) return "sensitive";
+// Sensitivity comes from the caller or the domain. The server does not read content to decide it.
+function sensitivityFor(requested: "normal" | "sensitive" | undefined, domain: string | null): "normal" | "sensitive" {
+  if (requested === "sensitive" || (domain !== null && SENSITIVE_DOMAINS.has(domain))) return "sensitive";
   return "normal";
 }
 
@@ -411,28 +373,6 @@ function assertCanWrite(access: Access, path: string, sensitivity: "normal" | "s
 
 function assertAdmin(access: Access): void {
   if (!access.admin) throw new VaultError("forbidden_scope", "Admin scope required");
-}
-
-async function rejectFiltered(env: Env, session: Session, path: string, text: string, action: string): Promise<void> {
-  const terms = await policy(env);
-  const pathHit = inspectWrite(path, terms);
-  const hit = pathHit ?? inspectWrite(text, terms);
-  if (!hit) return;
-  const auditPath = pathHit ? "[redacted]" : path;
-  const hash = env.AUDIT_KEY ? await hmacSha256Hex(env.AUDIT_KEY, text) : null;
-  await audit(env, session, action, auditPath, null, "rejected", hit.reasons, hash, text.length);
-  const message =
-    hit.code === "rejected_secret"
-      ? "Write rejected by the secret filter"
-      : hit.code === "rejected_employer"
-        ? "Write rejected by the employer filter"
-        : "Write rejected by the financial or government-id filter";
-  throw new VaultError(hit.code, message, hit.reasons);
-}
-
-async function policy(env: Env): Promise<PolicyTerm[]> {
-  const rows = await env.DB.prepare("SELECT term, kind FROM policy_terms").all<PolicyTerm>();
-  return rows.results ?? [];
 }
 
 async function audit(
@@ -499,11 +439,6 @@ function isErrorCode(code: string): code is ErrorCode {
   return [
     "unauthorized",
     "forbidden_scope",
-    "rejected_secret",
-    "rejected_employer",
-    "rejected_financial",
-    "rejected_government_id",
-    "rejected_pii",
     "conflict_etag",
     "not_found",
     "rate_limited",

@@ -1,6 +1,5 @@
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { scanFinancial, scanSecrets } from "../src/filters";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import { ADMIN, mcp, mint, nid, resetVault, rest, testEnv, type Envelope } from "./helpers";
 
@@ -82,144 +81,70 @@ describe("HiveAttic acceptance", () => {
     expect(results(hybrid.json).some((row) => row.path === path)).toBe(true);
   });
 
-  it("T-02 secret filter", async () => {
-    const secrets = [
+  // HiveAttic does not filter content. Bots must never write secrets, and the server stores what it is sent.
+  it("T-02 content containing a key-like string is accepted and stored", async () => {
+    const samples = [
       "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
       "AKIAIOSFODNN7EXAMPLE",
       "ghp_abcdefghijklmnopqrstuvwxyz",
       "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
       "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
       "password: hunter2",
-      `sk-\u200Bproj-abcdefghijklmnopqrstuvwxyz0123456789`,
+      "Zq8xP2mL9vR4tY7wK1nB5cJ3hF6dS0aG",
     ];
-    const logs: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      logs.push(args.map((arg) => String(arg)).join(" "));
-    });
-    try {
-      for (const secret of secrets) {
-        const path = `shared/note-${nid()}.md`;
-        const response = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: `prefix ${secret} suffix`, type: "note" }) });
-        expect(response.status).toBe(422);
-        expect(response.json.error?.code).toBe("rejected_secret");
-        expect(response.text.includes(secret)).toBe(false);
-        const audit = await testEnv().DB.prepare("SELECT path, outcome, reason_codes, content_hash FROM audit_log WHERE request_id = ?").bind(response.json.request_id).all();
-        const dumped = JSON.stringify(audit.results ?? []);
-        expect(dumped.includes(secret)).toBe(false);
-        const listed = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(response.json.request_id ?? ""))}`, ADMIN);
-        expect(listed.status).toBe(200);
-        const entries = listed.json.data?.entries;
-        expect(Array.isArray(entries) && entries.length > 0).toBe(true);
-        expect(JSON.stringify(entries).includes(secret)).toBe(false);
-        expect(logs.some((line) => line.includes(secret))).toBe(false);
-      }
-      const mcpReject = await mcp(sharedWriter, "vault_write_note", { path: `shared/mcp-${nid()}.md`, body: "password: hunter2", type: "note" });
-      expect(mcpReject.json.error?.code).toBe("rejected_secret");
-      expect(mcpReject.text.includes("hunter2")).toBe(false);
-      expect(mcpReject.json.request_id).toBeTruthy();
-      const mcpAudit = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(mcpReject.json.request_id))}`, ADMIN);
-      expect(mcpAudit.status).toBe(200);
-      expect(JSON.stringify(mcpAudit.json.data?.entries ?? []).includes("hunter2")).toBe(false);
-    } finally {
-      spy.mockRestore();
+    for (const sample of samples) {
+      const path = `shared/note-${nid()}.md`;
+      const marker = `qxkey${nid()}`;
+      const response = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: `${marker} prefix ${sample} suffix`, type: "note" }) });
+      expect(response.status, response.text).toBe(200);
+      const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedWriter);
+      expect(read.json.data?.status).toBe("active");
+      expect(String(read.json.data?.markdown)).toContain(sample);
+      expect(results((await rest(`/v1/search?q=${marker}`, sharedWriter)).json).some((row) => row.path === path)).toBe(true);
     }
+    const fact = await rest("/v1/facts", sharedWriter, {
+      method: "POST",
+      body: JSON.stringify({ key: `token-${nid()}`, statement: "The test key is sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", observed_at: "2026-01-01T00:00:00Z", scope: "own" }),
+    });
+    expect(fact.status, fact.text).toBe(200);
+    const journal = await rest("/v1/journal", sharedWriter, {
+      method: "POST",
+      body: JSON.stringify({ target: "shared", title: "keys", body: "Rotated AKIAIOSFODNN7EXAMPLE today", at: "2026-02-01T16:00:00Z" }),
+    });
+    expect(journal.status, journal.text).toBe(200);
+    const mcpPath = `shared/mcp-${nid()}.md`;
+    const viaMcp = await mcp(sharedWriter, "vault_write_note", { path: mcpPath, body: "password: hunter2", type: "note" });
+    expect(viaMcp.json.ok, viaMcp.text).toBe(true);
+    expect(String((await rest(`/v1/notes?path=${encodeURIComponent(mcpPath)}`, sharedWriter)).json.data?.markdown)).toContain("hunter2");
   });
 
-  it("T-03 financial filter rejects cards, routing numbers, and benign text", async () => {
-    const logs: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      logs.push(args.map((arg) => String(arg)).join(" "));
-    });
-    try {
-    const card = await rest("/v1/notes", sharedWriter, {
-      method: "PUT",
-      body: JSON.stringify({ path: `shared/card-${nid()}.md`, body: "Card 4242424242424242 on file", type: "note" }),
-    });
-    expect(card.status).toBe(422);
-    expect(card.json.error?.code).toBe("rejected_financial");
-    expect(card.json.error?.reasons).toContain("financial_card");
-    expect(card.text.includes("4242424242424242")).toBe(false);
-    const cardAudit = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(card.json.request_id ?? ""))}`, ADMIN);
-    expect(JSON.stringify(cardAudit.json.data?.entries ?? []).includes("4242424242424242")).toBe(false);
-    expect(logs.some((line) => line.includes("4242424242424242"))).toBe(false);
+  it("T-03 content containing a card number or an account number is accepted and stored", async () => {
+    const cases = [
+      { path: `shared/card-${nid()}.md`, body: "Card 4242424242424242 on file", fragment: "4242424242424242" },
+      { path: `shared/card-spaced-${nid()}.md`, body: "card 4242 4242 4242 4242", fragment: "4242 4242 4242 4242" },
+      { path: `shared/acct-${nid()}.md`, body: "The brokerage account 5839201746 is on file.", fragment: "5839201746" },
+      { path: `shared/iban-${nid()}.md`, body: "IBAN GB82WEST12345698765432", fragment: "GB82WEST12345698765432" },
+    ];
+    for (const item of cases) {
+      const response = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path: item.path, body: item.body, type: "note" }) });
+      expect(response.status, response.text).toBe(200);
+      const read = await rest(`/v1/notes?path=${encodeURIComponent(item.path)}`, sharedWriter);
+      expect(String(read.json.data?.markdown)).toContain(item.fragment);
+    }
     const routing = await rest("/v1/facts", sharedWriter, {
       method: "POST",
       body: JSON.stringify({ key: `route-${nid()}`, statement: "routing 021000021", observed_at: "2026-01-01T00:00:00Z", scope: "own" }),
     });
-    expect(routing.status).toBe(422);
-    expect(routing.json.error?.reasons).toContain("financial_routing");
-    const routingAudit = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(routing.json.request_id ?? ""))}`, ADMIN);
-    expect(JSON.stringify(routingAudit.json.data?.entries ?? []).includes("021000021")).toBe(false);
-    expect(logs.some((line) => line.includes("021000021"))).toBe(false);
-    const ssn = await mcp(sharedWriter, "vault_write_note", { path: `shared/ssn-${nid()}.md`, body: "ssn 219-09-9999", type: "note" });
-    expect(ssn.json.error?.code).toBe("rejected_government_id");
-    const benign = await rest("/v1/notes", sharedWriter, {
-      method: "PUT",
-      body: JSON.stringify({ path: `shared/benign-${nid()}.md`, body: "The price is $51.00 on 2026-10-17 and ticker ACME rose.", type: "note" }),
-    });
-    expect(benign.status).toBe(200);
-    const corpus = testEnv().BENIGN_CORPUS ?? "";
-    const sentences = corpus.split("\n").map((line) => line.trim()).filter(Boolean);
-    expect(sentences.length).toBeGreaterThanOrEqual(200);
-    const hits = sentences.filter((sentence) => scanFinancial(sentence).length > 0 || scanSecrets(sentence).length > 0);
-    expect(hits.length / sentences.length).toBeLessThanOrEqual(0.02);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it.skipIf(!(testEnv().ACCOUNT_FIXTURE ?? "").trim(), "T-03 account fixture absent: set HIVEATTIC_ACCOUNT_NUMBER or test/fixtures/account-number.local.txt")(
-    "T-03 account number fixture",
-    async () => {
-      const account = (testEnv().ACCOUNT_FIXTURE ?? "").trim();
-      const statement = /\d{6,}/.test(account) && /account|acct|acc#|brokerage|iban/i.test(account) ? account : `The brokerage account ${account} is on file.`;
-      const response = await rest("/v1/notes", sharedWriter, {
-        method: "PUT",
-        body: JSON.stringify({ path: `shared/acct-${nid()}.md`, body: statement, type: "note" }),
-      });
-      const leaked = response.text.includes(account);
-      expect(response.status, "account fixture status").toBe(422);
-      expect(response.json.error?.code).toBe("rejected_financial");
-      expect(response.json.error?.reasons).toContain("financial_account");
-      expect(leaked, "response echoed the account fixture").toBe(false);
-      const audit = await testEnv().DB.prepare("SELECT path, reason_codes, content_hash FROM audit_log WHERE request_id = ?").bind(response.json.request_id).all();
-      expect(JSON.stringify(audit.results ?? []).includes(account), "audit echoed the account fixture").toBe(false);
-      const listed = await rest(`/v1/admin/audit?request_id=${encodeURIComponent(String(response.json.request_id ?? ""))}`, ADMIN);
-      expect(JSON.stringify(listed.json.data?.entries ?? []).includes(account), "audit endpoint echoed the account fixture").toBe(false);
-    },
-  );
-
-  it("T-04 employer guardrail", async () => {
-    for (const term of [
-      { term: "Contoso Example Corp", kind: "context_subject" },
-      { term: "customer", kind: "context_qualifier" },
-      { term: "nda", kind: "employer" },
-    ]) {
-      expect((await rest("/v1/admin/policy", ADMIN, { method: "POST", body: JSON.stringify(term) })).status).toBe(200);
-    }
-    const rejected = await rest("/v1/facts", readerX, {
+    expect(routing.status, routing.text).toBe(200);
+    const ssnPath = `shared/ssn-${nid()}.md`;
+    const ssn = await mcp(sharedWriter, "vault_write_note", { path: ssnPath, body: "ssn 219-09-9999", type: "note" });
+    expect(ssn.json.ok, ssn.text).toBe(true);
+    const shared = await rest("/v1/journal", sharedWriter, {
       method: "POST",
-      body: JSON.stringify({
-        key: `work-${nid()}`,
-        statement: "Contoso Example Corp customer migration notes",
-        observed_at: "2026-02-01T00:00:00Z",
-        scope: "own",
-      }),
+      body: JSON.stringify({ target: "shared", title: "call", body: "Reached the bank at 206-555-0142 about account 5839201746", at: "2026-03-01T16:00:00Z" }),
     });
-    expect(rejected.status).toBe(422);
-    expect(rejected.json.error?.code).toBe("rejected_employer");
-    const accepted = await mcp(readerX, "vault_write_fact", {
-      key: `career-${nid()}`,
-      statement: "I start at Contoso Example Corp next month as an analyst",
-      observed_at: "2026-02-02T00:00:00Z",
-      scope: "own",
-    });
-    expect(accepted.json.ok).toBe(true);
-    const monday = await rest("/v1/notes", sharedWriter, {
-      method: "PUT",
-      body: JSON.stringify({ path: `shared/monday-${nid()}.md`, body: "The monday market opens at nine.", type: "note" }),
-    });
-    expect(monday.status).toBe(200);
+    expect(shared.status, shared.text).toBe(200);
+    expect(String(shared.json.data?.path)).toMatch(/^journal\//);
   });
 
   it("T-05 newest observed fact wins", async () => {
@@ -369,7 +294,7 @@ describe("HiveAttic acceptance", () => {
     console.log("T-09 PARTIAL — FTS covered (search empty, stub read, history kept, chunk ids queued). Vector deletion deferred to M2.");
   });
 
-  it("T-11 keyword indexing for an outside edit, with history and secret quarantine", async () => {
+  it("T-11 keyword indexing for an outside edit, with history", async () => {
     const path = `shared/human-${nid()}.md`;
     const created = await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path, body: "Original qxalpha text", type: "note" }) });
     expect(created.status).toBe(200);
@@ -392,19 +317,15 @@ describe("HiveAttic acceptance", () => {
     const history = await rest(`/v1/history?id=${id}`, ADMIN);
     expect(versions(history.json).some((version) => String(version.body ?? "").includes("qxalpha"))).toBe(true);
 
-    const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
-    const marker = `qxsecret${nid()}`;
-    await testEnv().VAULT.put(row!.r2_key, `${secret}\n${marker}\n`, { httpMetadata: { contentType: "text/markdown" } });
+
+    // Malformed frontmatter from an outside editor is indexed as body text. Nothing is quarantined.
+    const marker = `qxmalformed${nid()}`;
+    await testEnv().VAULT.put(row!.r2_key, `---\ntitle: [unclosed\n---\n${marker} after a bad header\n`, { httpMetadata: { contentType: "text/markdown" } });
     await deliver({ action: "PutObject", key: row!.r2_key });
-    const leakedSearch = await rest(`/v1/search?q=${marker}`, ADMIN);
-    expect(results(leakedSearch.json)).toEqual([]);
     const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, ADMIN);
-    expect(String(read.json.data?.markdown).includes(secret)).toBe(false);
-    expect(read.json.data?.status).toBe("quarantined");
-    const quarantine = await testEnv().VAULT.list({ prefix: "sys/quarantine/" });
-    expect(quarantine.objects.length).toBeGreaterThan(0);
-    const inbox = await rest("/v1/notes?path=inbox/quarantine.md", ADMIN);
-    expect(String(inbox.json.data?.markdown ?? "").includes(secret)).toBe(false);
+    expect(read.json.data?.status).toBe("active");
+    expect(String(read.json.data?.markdown)).toContain(marker);
+    expect(results((await rest(`/v1/search?q=${marker}`, sharedWriter)).json).some((item) => item.path === path)).toBe(true);
   });
 
   it("T-12 rebuild D1 from R2 and restore one note", async () => {

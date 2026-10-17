@@ -21,7 +21,6 @@
     "mint-reviewer": "node --experimental-strip-types scripts/mint-reviewer.ts",
     "hash-token": "node --experimental-strip-types scripts/hash-token.ts",
     "rebuild": "node --experimental-strip-types scripts/rebuild-from-r2.ts",
-    "policy:apply": "node --experimental-strip-types scripts/apply-policy.ts",
     "dev": "wrangler dev"
   },
   "dependencies": {

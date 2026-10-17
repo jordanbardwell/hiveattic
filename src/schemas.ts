@@ -27,6 +27,7 @@ export const journalSchema = z.object({
   domain: slug.nullable().optional(),
   tags: z.array(tag).max(20).default([]),
   idempotency_key: idempotency.nullable().optional(),
+  sensitivity: z.enum(["normal", "sensitive"]).optional(),
 });
 
 export const noteSchema = z.object({
@@ -57,15 +58,6 @@ export const tokenSchema = z.object({
 export const revokeSchema = z.object({
   token_id: z.string().min(1).max(80).optional(),
   label: z.string().min(1).max(80).optional(),
-});
-
-export const policySchema = z.object({
-  term: z.string().min(1).max(120),
-  kind: z.enum(["employer", "deny", "allow", "context_subject", "context_qualifier"]),
-});
-
-export const termSchema = z.object({
-  term: z.string().min(1).max(120),
 });
 
 export const restoreSchema = z.object({

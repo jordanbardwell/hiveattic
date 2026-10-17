@@ -111,14 +111,6 @@ function journalBlockBody(block: string): string {
   return kept.join("\n").trim();
 }
 
-export function textForFilter(markdown: string): string {
-  const parsed = parseMarkdown(markdown);
-  const body = parsed.body
-    .replace(/<!--\s*hiveattic:e=[0-9A-HJKMNP-TV-Z]{26}:[^:\s>]+:[0-9a-f]{16}\s*-->/g, "")
-    .replace(/<!--\s*hiveattic:idempotency=[A-Za-z0-9_.:-]{1,64}\s*-->/g, "");
-  return buildMarkdown(parsed.frontmatter, body);
-}
-
 export function guardJournalBody(body: string): string {
   return body
     .split(/\r?\n/)

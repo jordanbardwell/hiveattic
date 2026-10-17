@@ -10,10 +10,8 @@ export type Envelope = {
   request_id?: string;
 };
 
-type TestEnv = Env & { ACCOUNT_FIXTURE?: string; BENIGN_CORPUS?: string };
-
-export function testEnv(): TestEnv {
-  return env as TestEnv;
+export function testEnv(): Env {
+  return env as Env;
 }
 
 export function nid(): string {

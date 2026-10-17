@@ -14,7 +14,6 @@ export function isAppendOnlyPath(path: string): boolean {
   return (
     path === "shared/decisions.md" ||
     path === "inbox/conflicts.md" ||
-    path === "inbox/quarantine.md" ||
     path.startsWith("journal/") ||
     path.includes("/journal/") ||
     path.includes("/journal-sensitive/")
@@ -27,10 +26,6 @@ export function isFactPath(path: string): boolean {
 
 export function isServerManagedPath(path: string): boolean {
   return path === "profile/summary.md" || isFactPath(path);
-}
-
-export function isGeneratedNote(path: string): boolean {
-  return path === "inbox/quarantine.md" || path === "inbox/conflicts.md" || path === "profile/summary.md";
 }
 
 export function ownerForPath(path: string): string {

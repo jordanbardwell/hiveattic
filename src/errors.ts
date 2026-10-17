@@ -1,11 +1,6 @@
 export const ERROR_STATUS: Record<string, number> = {
   unauthorized: 401,
   forbidden_scope: 403,
-  rejected_secret: 422,
-  rejected_financial: 422,
-  rejected_government_id: 422,
-  rejected_employer: 422,
-  rejected_pii: 422,
   conflict_etag: 409,
   not_found: 404,
   rate_limited: 429,

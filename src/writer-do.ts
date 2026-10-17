@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-import { classifySensitive, inspectWrite, type PolicyTerm } from "./filters";
 import { hash8, hmacSha256Hex, sha256Hex, ulid } from "./crypto";
 import { failure, VaultError, type ApiResult, type JsonValue } from "./errors";
 import { logEvent } from "./log";
@@ -12,13 +11,12 @@ import {
   parseMarkdown,
   stringField,
   stringList,
-  textForFilter,
   type Frontmatter,
   type JournalEntry,
 } from "./markdown";
-import { domainOf } from "./access";
+import { domainOf, SENSITIVE_DOMAINS } from "./access";
 import { stagingResources } from "./query";
-import { isAppendOnlyPath, isFactPath, isGeneratedNote, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
+import { isAppendOnlyPath, isFactPath, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
 import { etStamp, versionStamp, within24h } from "./time";
 
 export type Actor = {
@@ -79,7 +77,7 @@ export type WriterOp =
       eTag?: string | null;
       copySource?: { bucket?: string; object?: string } | string | null;
     }
-  | { kind: "rebuild" }
+  | { kind: "rebuild"; actor: Actor }
   | { kind: "reconcile" }
   | { kind: "replay" }
   | { kind: "cleanup"; actor: Actor; runId: string };
@@ -106,6 +104,20 @@ type NoteRow = {
   version_ts: string | null;
   last_writer: string;
 };
+
+// Ordinary writes answer within 25 seconds. A rebuild or reconcile walks the whole bucket, so it gets longer.
+const WRITE_TIMEOUT_MS = 25_000;
+const MAINTENANCE_TIMEOUT_MS = 120_000;
+const R2_READ_CONCURRENCY = 8;
+// D1 caps a bound value at 2 MB. Staged rows are sent as JSON arrays split well below that.
+const STAGE_JSON_BYTES = 900_000;
+const NOTE_COLUMNS = [
+  "id", "path", "type", "owner", "domain", "sensitivity", "fact_key", "title", "body", "frontmatter", "content_hash", "statement_hash",
+  "r2_etag", "r2_key", "status", "observed_at", "created_at", "updated_at", "version_ts", "last_writer",
+];
+const CHUNK_COLUMNS = ["id", "note_id", "n", "text", "title", "path", "token_count"];
+const JOURNAL_STAGE_COLUMNS = ["id", "note_id", "agent_id", "at", "title", "block_ref", "idempotency_key", "path"];
+const VERSION_COLUMNS = ["note_id", "version_ts", "r2_key", "content_hash", "writer", "reason"];
 
 export class VaultWriter extends DurableObject<Env> {
   private tail: Promise<unknown> = Promise.resolve();
@@ -144,8 +156,10 @@ export class VaultWriter extends DurableObject<Env> {
   async perform(op: WriterOp): Promise<ApiResult> {
     const run = this.tail.then(() => this.dispatch(op), () => this.dispatch(op));
     this.tail = run.then(() => undefined, () => undefined);
+    const maintenance = op.kind === "rebuild" || op.kind === "reconcile";
+    const message = op.kind === "rebuild" ? "Rebuild is still running. The reindex audit row records the outcome." : "Write timed out";
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(failure(new VaultError("invalid", "Write timed out"))), 25_000);
+      const timer = setTimeout(() => resolve(failure(new VaultError("invalid", message))), maintenance ? MAINTENANCE_TIMEOUT_MS : WRITE_TIMEOUT_MS);
       run.then(
         (value) => {
           clearTimeout(timer);
@@ -188,7 +202,7 @@ export class VaultWriter extends DurableObject<Env> {
       case "external":
         return this.external(op);
       case "rebuild":
-        return this.rebuild();
+        return this.rebuild(op.actor);
       case "reconcile":
         return this.reconcile();
       case "replay":
@@ -347,8 +361,7 @@ export class VaultWriter extends DurableObject<Env> {
     const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
     if (replay) return { ok: true, data: replay };
     const stamp = etStamp(op.at, this.env.TZ_DISPLAY || "UTC");
-    const text = `${op.title}\n${op.body}`;
-    const sensitive = op.sensitivity === "sensitive" || classifySensitive(text, op.domain);
+    const sensitive = op.sensitivity === "sensitive";
     if (sensitive && op.target !== "own") {
       throw new VaultError("invalid", "A sensitive journal entry stays in your own journal. Shared day files stay normal.");
     }
@@ -612,11 +625,6 @@ export class VaultWriter extends DurableObject<Env> {
       return { ok: true, data: { skipped: true, reason: "unchanged" } };
     }
     const markdown = await object.text();
-    const hit = await this.contentHit(path, markdown);
-    if (hit) {
-      await this.quarantine(path, markdown, hit.reasons, actor, true, actionName, detail, objectEtag);
-      return { ok: true, data: { quarantined: true, path, reasons: hit.reasons } };
-    }
     return this.indexBytes({
       path,
       markdown,
@@ -654,29 +662,72 @@ export class VaultWriter extends DurableObject<Env> {
     return { ok: true, data: { id: note.id, path, status: "forgotten" } };
   }
 
-  private async rebuild(): Promise<ApiResult> {
+  // Audits reindex_started first, then one reindex row after the rebuild ends, ok or failed, with counts and duration.
+  private async rebuild(actor: Actor): Promise<ApiResult> {
+    const started = Date.now();
+    const progress: RebuildProgress = { phase: "stage", files: 0, notes: 0, versions: 0, tombstones: 0, history_reads: 0 };
+    await this.audit(actor, "reindex_started", null, null, "ok", [], null, 0);
+    try {
+      await this.rebuildIndex(actor.requestId, progress);
+    } catch (err) {
+      const code = err instanceof VaultError ? err.code : "error";
+      const detail = { ...progress, duration_ms: Date.now() - started, error: errorText(err) };
+      await this.audit(actor, "reindex", null, null, "failed", [code], null, 0, JSON.stringify(detail)).catch(() => undefined);
+      logEvent({ event: "reindex_failed", name: err instanceof Error ? err.name : "error", phase: progress.phase });
+      throw err;
+    }
+    const { phase: _phase, ...counts } = progress;
+    const data = { ...counts, imported: counts.files, duration_ms: Date.now() - started };
+    await this.audit(actor, "reindex", null, null, "ok", [], null, 0, JSON.stringify(data));
+    return { ok: true, data };
+  }
+
+  // Stages every vault file, then swaps the live tables and the history rows in one D1 batch, so a
+  // failure part way leaves the live index as it was. Rows go to D1 as JSON arrays, a few statements
+  // per megabyte, because one query per chunk or history file outran the request deadline on a
+  // vault of about 150 notes.
+  private async rebuildIndex(requestId: string, progress: RebuildProgress): Promise<void> {
+    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId, ipCountry: null };
+    const live = await this.liveNoteIds();
+    const known = await this.knownHistory();
     await this.prepareStage();
-    let imported = 0;
-    let cursor: string | undefined;
-    const actor: Actor = { agentId: "rebuild", tokenId: "rebuild", client: "indexer", requestId: ulid(), ipCountry: null };
+    const assigned = new Map<string, string>();
+    const factKeys = new Set<string>();
     const tombstones: { id: string; hash: string }[] = [];
+    let rows = new StageRows();
+    let cursor: string | undefined;
     do {
-      const page = await this.env.VAULT.list({ prefix: this.prefix(), cursor, limit: 100 });
-      for (const object of page.objects) {
-        if (!object.key.endsWith(".md")) continue;
-        const path = vaultPathFromKey(this.prefix(), object.key);
-        if (!path) continue;
-        const file = await this.env.VAULT.get(object.key);
-        if (!file) continue;
-        const text = await file.text();
-        const tombstone = await this.stageVaultFile(path, text, normalizeEtag(file.etag), actor, file.customMetadata?.["vault-id"] ?? null);
-        if (tombstone) tombstones.push(tombstone);
-        imported += 1;
+      const page = await this.env.VAULT.list({ prefix: this.prefix(), cursor, limit: 1000 });
+      const keys = page.objects.map((object) => object.key).filter((key) => key.endsWith(".md") && vaultPathFromKey(this.prefix(), key));
+      for (const files of slices(keys, R2_READ_CONCURRENCY)) {
+        const loaded = await Promise.all(
+          files.map(async (key) => {
+            const file = await this.env.VAULT.get(key);
+            return file ? { key, text: await file.text(), etag: normalizeEtag(file.etag), metaId: file.customMetadata?.["vault-id"] ?? null } : null;
+          }),
+        );
+        for (const file of loaded) {
+          if (!file) continue;
+          const path = vaultPathFromKey(this.prefix(), file.key)!;
+          const staged = await this.stageFile(path, file.text, file.etag, file.metaId, actor, live, assigned, factKeys);
+          if (staged.tombstone) tombstones.push(staged.tombstone);
+          if (!rows.add(staged)) {
+            await this.flushStage(rows);
+            rows = new StageRows();
+            rows.add(staged);
+          }
+          progress.files += 1;
+        }
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+    await this.flushStage(rows);
+    progress.phase = "history";
+    const versions = await this.stageHistory(assigned, known, progress);
+    progress.phase = "swap";
+    progress.tombstones = tombstones.length;
     const now = new Date().toISOString();
-    const swap = [
+    await this.env.DB.batch([
       this.env.DB.prepare("DELETE FROM links"),
       this.env.DB.prepare("DELETE FROM journal_entries"),
       this.env.DB.prepare("DELETE FROM note_versions"),
@@ -686,7 +737,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare("INSERT INTO notes SELECT * FROM notes_stage"),
       this.env.DB.prepare("INSERT INTO chunks SELECT * FROM chunks_stage"),
       this.env.DB.prepare(
-        `INSERT INTO journal_entries (id, note_id, agent_id, at, title, block_ref, idempotency_key)
+        `INSERT OR IGNORE INTO journal_entries (id, note_id, agent_id, at, title, block_ref, idempotency_key)
          SELECT id, note_id, agent_id, at, title, block_ref, idempotency_key FROM journal_stage`,
       ),
       this.env.DB.prepare(
@@ -696,162 +747,172 @@ export class VaultWriter extends DurableObject<Env> {
            at
          FROM journal_stage WHERE idempotency_key IS NOT NULL`,
       ),
-      ...tombstones.map((row) =>
+      ...jsonSlices(tombstones.map((row) => [row.id, row.hash])).map((json) =>
         this.env.DB.prepare(
-          `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash) VALUES (?, ?, 'rebuild', 'forgotten', ?)
+          `INSERT INTO tombstones (note_id, at, by_agent, reason, content_hash)
+           SELECT json_extract(value, '$[0]'), ?, 'rebuild', 'forgotten', json_extract(value, '$[1]') FROM json_each(?) WHERE 1
            ON CONFLICT(note_id) DO NOTHING`,
-        ).bind(row.id, now, row.hash),
+        ).bind(now, json),
       ),
-    ];
-    await this.env.DB.batch(swap);
+      ...jsonSlices(versions).map((json) => this.env.DB.prepare(jsonInsert("INSERT OR IGNORE INTO note_versions", VERSION_COLUMNS)).bind(json)),
+      this.env.DB.prepare("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')"),
+    ]);
+    progress.versions = versions.length;
     await this.env.DB.batch([
       this.env.DB.prepare("DROP TABLE journal_stage"),
       this.env.DB.prepare("DROP TABLE chunks_stage"),
       this.env.DB.prepare("DROP TABLE notes_stage"),
     ]);
-    await this.env.DB.prepare("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')").run();
-    let versions = 0;
-    let historyCursor: string | undefined;
-    do {
-      const page = await this.env.VAULT.list({ prefix: "sys/history/", cursor: historyCursor, limit: 200 });
-      for (const object of page.objects) {
-        const parsed = /^sys\/history\/([^/]+)\/([^-]+)-([0-9a-f]{8})\.md$/.exec(object.key);
-        if (!parsed) continue;
-        const note = await this.env.DB.prepare("SELECT id FROM notes WHERE id = ?").bind(parsed[1]).first<{ id: string }>();
-        if (!note) continue;
-        const file = await this.env.VAULT.get(object.key);
-        if (!file) continue;
-        const text = await file.text();
-        const hash = await sha256Hex(text);
-        await this.env.DB.prepare(
-          `INSERT OR IGNORE INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason)
-           VALUES (?, ?, ?, ?, 'rebuild', 'history')`,
-        )
-          .bind(parsed[1], parsed[2], object.key, hash)
-          .run();
-        versions += 1;
-      }
-      historyCursor = page.truncated ? page.cursor : undefined;
-    } while (historyCursor);
     const count = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>();
-    return { ok: true, data: { imported, versions, notes: count?.n ?? 0 } };
+    progress.phase = "done";
+    progress.notes = count?.n ?? 0;
   }
 
   private async prepareStage(): Promise<void> {
-    await this.env.DB.prepare("DROP TABLE IF EXISTS journal_stage").run();
-    await this.env.DB.prepare("DROP TABLE IF EXISTS chunks_stage").run();
-    await this.env.DB.prepare("DROP TABLE IF EXISTS notes_stage").run();
-    await this.env.DB.prepare("CREATE TABLE notes_stage AS SELECT * FROM notes WHERE 0").run();
-    await this.env.DB.prepare("CREATE TABLE chunks_stage AS SELECT * FROM chunks WHERE 0").run();
-    await this.env.DB.prepare(
-      `CREATE TABLE journal_stage (
-        id TEXT PRIMARY KEY,
-        note_id TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        at TEXT NOT NULL,
-        title TEXT NOT NULL,
-        block_ref TEXT NOT NULL,
-        idempotency_key TEXT,
-        path TEXT NOT NULL
-      )`,
-    ).run();
+    await this.env.DB.batch([
+      this.env.DB.prepare("DROP TABLE IF EXISTS journal_stage"),
+      this.env.DB.prepare("DROP TABLE IF EXISTS chunks_stage"),
+      this.env.DB.prepare("DROP TABLE IF EXISTS notes_stage"),
+      this.env.DB.prepare("CREATE TABLE notes_stage AS SELECT * FROM notes WHERE 0"),
+      this.env.DB.prepare("CREATE TABLE chunks_stage AS SELECT * FROM chunks WHERE 0"),
+      this.env.DB.prepare(
+        `CREATE TABLE journal_stage (
+          id TEXT PRIMARY KEY,
+          note_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          at TEXT NOT NULL,
+          title TEXT NOT NULL,
+          block_ref TEXT NOT NULL,
+          idempotency_key TEXT,
+          path TEXT NOT NULL
+        )`,
+      ),
+    ]);
   }
 
-  private async stageVaultFile(
+  private async liveNoteIds(): Promise<{ byPath: Map<string, string>; byId: Map<string, string> }> {
+    const rows = await this.env.DB.prepare("SELECT id, path FROM notes").all<{ id: string; path: string }>();
+    const byPath = new Map<string, string>();
+    const byId = new Map<string, string>();
+    for (const row of rows.results ?? []) {
+      byPath.set(row.path, row.id);
+      byId.set(row.id, row.path);
+    }
+    return { byPath, byId };
+  }
+
+  // History objects are write-once and their key carries the first 8 hex of the content hash. A row
+  // D1 already holds for that key keeps its hash, writer, and reason. Anything else is read from R2.
+  private async knownHistory(): Promise<Map<string, { content_hash: string; writer: string; reason: string | null }>> {
+    const rows = await this.env.DB.prepare("SELECT r2_key, content_hash, writer, reason FROM note_versions WHERE r2_key LIKE 'sys/history/%'").all<{
+      r2_key: string;
+      content_hash: string;
+      writer: string;
+      reason: string | null;
+    }>();
+    return new Map((rows.results ?? []).map((row) => [row.r2_key, row]));
+  }
+
+  private async stageHistory(
+    assigned: Map<string, string>,
+    known: Map<string, { content_hash: string; writer: string; reason: string | null }>,
+    progress: RebuildProgress,
+  ): Promise<JsonValue[][]> {
+    const versions: JsonValue[][] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.VAULT.list({ prefix: "sys/history/", cursor, limit: 1000 });
+      const wanted = page.objects
+        .map((object) => ({ key: object.key, parsed: /^sys\/history\/([^/]+)\/([^-]+)-([0-9a-f]{8})\.md$/.exec(object.key) }))
+        .filter((item): item is { key: string; parsed: RegExpExecArray } => Boolean(item.parsed && assigned.has(item.parsed[1]!)));
+      for (const items of slices(wanted, R2_READ_CONCURRENCY)) {
+        const resolved = await Promise.all(
+          items.map(async ({ key, parsed }) => {
+            const row = known.get(key);
+            if (row && hash8(row.content_hash) === parsed[3]) return [parsed[1]!, parsed[2]!, key, row.content_hash, row.writer, row.reason];
+            const file = await this.env.VAULT.get(key);
+            progress.history_reads += 1;
+            if (!file) return null;
+            return [parsed[1]!, parsed[2]!, key, await sha256Hex(await file.text()), "rebuild", "history"];
+          }),
+        );
+        for (const row of resolved) if (row) versions.push(row);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    progress.versions = versions.length;
+    return versions;
+  }
+
+  private async stageFile(
     path: string,
     markdown: string,
     etag: string | null,
+    metaId: string | null,
     actor: Actor,
-    metaId: string | null = null,
-  ): Promise<{ id: string; hash: string } | null> {
-    const hit = await this.contentHit(path, markdown);
-    const id = await this.existingNoteId(path, markdown, metaId);
-    let stored = markdown;
-    let forced: string | null = null;
-    if (hit) {
-      stored = buildMarkdown(
-        { vault_id: id, type: inferType(path), status: "quarantined", sensitivity: "sensitive", owner: ownerForPath(path) },
-        "This note was quarantined by the content filter.",
-      );
-      forced = "quarantined";
-      const redacted = await this.auditHash(markdown);
-      await this.env.VAULT.put(
-        `sys/quarantine/${redacted ?? ulid()}.json`,
-        JSON.stringify({
-          path,
-          at: new Date().toISOString(),
-          reason_codes: hit.reasons,
-          content_hash: redacted,
-          agent_id: actor.agentId,
-          run_id: runMarker(path),
-        }),
-        { httpMetadata: { contentType: "application/json" } },
-      );
+    live: { byPath: Map<string, string>; byId: Map<string, string> },
+    assigned: Map<string, string>,
+    factKeys: Set<string>,
+  ): Promise<StagedFile> {
+    const parsed = parseMarkdown(markdown);
+    const fm = parsed.frontmatter;
+    const id = stagedNoteId(path, stringField(fm.vault_id) ?? null, metaId, live, assigned);
+    assigned.set(id, path);
+    const status = noteStatus(fm);
+    const type = stringField(fm.type) ?? inferType(path);
+    const owner = stringField(fm.owner) ?? ownerForPath(path);
+    const domain = domainOf(path) ?? stringField(fm.domain) ?? null;
+    const title = stringField(fm.key) ?? stringField(fm.title) ?? titleFromBody(parsed.body, path);
+    // Two active files for one fact key would break the unique index and the whole swap. The first path keeps the key.
+    let factKey = type === "fact" ? (stringField(fm.key) ?? null) : null;
+    if (factKey && status === "active") {
+      const slot = `${owner}\u0000${factKey}`;
+      if (factKeys.has(slot)) factKey = null;
+      else factKeys.add(slot);
     }
-    const again = parseMarkdown(stored);
-    const fmStatus = stringField(again.frontmatter.status);
-    const status = forced ?? (fmStatus === "forgotten" || fmStatus === "quarantined" ? fmStatus : "active");
-    const type = stringField(again.frontmatter.type) ?? inferType(path);
-    const owner = stringField(again.frontmatter.owner) ?? ownerForPath(path);
-    const domain = domainOf(path) ?? stringField(again.frontmatter.domain) ?? null;
-    const sensitivity = stringField(again.frontmatter.sensitivity) === "sensitive" || classifySensitive(stored, domain) ? "sensitive" : "normal";
-    const title = stringField(again.frontmatter.key) ?? stringField(again.frontmatter.title) ?? titleFromBody(again.body, path);
     const now = new Date().toISOString();
-    const hash = await sha256Hex(stored);
-    const statementHash = type === "fact" ? await sha256Hex(statementOnly(again.body)) : null;
-    await this.env.DB.prepare(
-      `INSERT INTO notes_stage (
-        id, path, type, owner, domain, sensitivity, fact_key, title, body, frontmatter, content_hash, statement_hash,
-        r2_etag, r2_key, status, observed_at, created_at, updated_at, version_ts, last_writer
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        id,
-        path,
-        type,
-        owner,
-        domain,
-        sensitivity,
-        type === "fact" ? (stringField(again.frontmatter.key) ?? null) : null,
-        title,
-        stored,
-        JSON.stringify(again.frontmatter),
-        hash,
-        statementHash,
-        etag,
-        r2KeyFor(this.prefix(), path),
-        status,
-        stringField(again.frontmatter.observed_at) ?? null,
-        now,
-        stringField(again.frontmatter.updated_at) ?? now,
-        versionStamp(),
-        stringField(again.frontmatter.source) ?? actor.agentId,
-      )
-      .run();
-    if (status === "active") {
-      for (const chunk of chunkMarkdown(path, title, again.body)) {
-        await this.env.DB.prepare(
-          "INSERT INTO chunks_stage (id, note_id, n, text, title, path, token_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-          .bind(`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, path, chunk.tokenCount)
-          .run();
+    const hash = await sha256Hex(markdown);
+    const note: JsonValue[] = [
+      id,
+      path,
+      type,
+      owner,
+      domain,
+      storedSensitivity(fm, domain),
+      factKey,
+      title,
+      markdown,
+      JSON.stringify(fm),
+      hash,
+      type === "fact" ? await sha256Hex(statementOnly(parsed.body)) : null,
+      etag,
+      r2KeyFor(this.prefix(), path),
+      status,
+      stringField(fm.observed_at) ?? null,
+      now,
+      stringField(fm.updated_at) ?? now,
+      versionStamp(),
+      stringField(fm.source) ?? actor.agentId,
+    ];
+    const chunks: JsonValue[][] =
+      status === "active" ? chunkMarkdown(path, title, parsed.body).map((chunk) => [`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, path, chunk.tokenCount]) : [];
+    const journal: JsonValue[][] = [];
+    if (type === "journal" || type === "decision") {
+      for (const entry of journalEntries(markdown)) {
+        const agent = entry.agent || owner;
+        if (!(await journalMacMatches(this.env, { ...entry, agent }))) continue;
+        journal.push([entry.id, id, agent, now, entry.title, `^${entry.id}`, entry.idempotency, path]);
       }
     }
-    if (type === "journal" || type === "decision") await this.stageJournal(id, path, stored, owner, now);
-    if (status === "forgotten") return { id, hash };
-    return null;
+    return { note, chunks, journal, tombstone: status === "forgotten" ? { id, hash } : null };
   }
 
-  private async stageJournal(noteId: string, path: string, markdown: string, owner: string, at: string): Promise<void> {
-    for (const entry of journalEntries(markdown)) {
-      const agent = entry.agent || owner;
-      if (!(await journalMacMatches(this.env, { ...entry, agent }))) continue;
-      await this.env.DB.prepare(
-        `INSERT OR IGNORE INTO journal_stage (id, note_id, agent_id, at, title, block_ref, idempotency_key, path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-        .bind(entry.id, noteId, agent, at, entry.title, `^${entry.id}`, entry.idempotency, path)
-        .run();
-    }
+  private async flushStage(rows: StageRows): Promise<void> {
+    const statements: D1PreparedStatement[] = [];
+    if (rows.notes.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT INTO notes_stage", NOTE_COLUMNS)).bind(rows.json("notes")));
+    if (rows.chunks.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT INTO chunks_stage", CHUNK_COLUMNS)).bind(rows.json("chunks")));
+    if (rows.journal.length) statements.push(this.env.DB.prepare(jsonInsert("INSERT OR IGNORE INTO journal_stage", JOURNAL_STAGE_COLUMNS)).bind(rows.json("journal")));
+    if (statements.length) await this.env.DB.batch(statements);
   }
 
   private async cleanup(op: Extract<WriterOp, { kind: "cleanup" }>): Promise<ApiResult> {
@@ -908,7 +969,6 @@ export class VaultWriter extends DurableObject<Env> {
     await this.env.DB.prepare("DELETE FROM idempotency WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM links WHERE target LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM conflicts WHERE fact_key LIKE ? ESCAPE '\\'").bind(like).run();
-    await this.env.DB.prepare("DELETE FROM policy_terms WHERE term LIKE ? ESCAPE '\\'").bind(like).run();
     const runVersions = await this.env.DB.prepare("SELECT r2_key FROM note_versions WHERE writer LIKE ? ESCAPE '\\'")
       .bind(like)
       .all<{ r2_key: string }>();
@@ -969,8 +1029,8 @@ export class VaultWriter extends DurableObject<Env> {
     detail?: string | null;
   }): Promise<ApiResult<{ etag: string }>> {
     const existing = input.create ? null : await this.noteByPath(input.path);
-    const appending = input.reason === "appended" || input.reason === "quarantine-alert" || input.reason === "conflict";
-    if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay" && input.reason !== "purge") {
+    const appending = input.reason === "appended" || input.reason === "conflict";
+    if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
       await this.snapshotBytes(existing, existing.body, input.actor.agentId, input.reason);
     }
     const hash = await sha256Hex(input.markdown);
@@ -995,8 +1055,7 @@ export class VaultWriter extends DurableObject<Env> {
     }
     const now = new Date().toISOString();
     const parsed = parseMarkdown(input.markdown);
-    const fmStatus = stringField(parsed.frontmatter.status);
-    const status = fmStatus === "forgotten" || fmStatus === "quarantined" ? fmStatus : "active";
+    const status = noteStatus(parsed.frontmatter);
     const frontmatter = JSON.stringify(parsed.frontmatter);
     const chunks = appending && existing ? [] : chunkMarkdown(input.path, input.title, parsed.body);
     const appendedChunks = appending && existing ? chunkMarkdown(input.path, input.title, input.markdown.startsWith(existing.body) ? input.markdown.slice(existing.body.length) : parsed.body) : [];
@@ -1213,7 +1272,7 @@ export class VaultWriter extends DurableObject<Env> {
         type: stringField(parsed.frontmatter.type) ?? inferType(input.path),
         owner: stringField(parsed.frontmatter.owner) ?? ownerForPath(input.path),
         status: stringField(parsed.frontmatter.status) ?? "active",
-        sensitivity: stringField(parsed.frontmatter.sensitivity) ?? (classifySensitive(markdown, domainOf(input.path)) ? "sensitive" : "normal"),
+        sensitivity: stringField(parsed.frontmatter.sensitivity) ?? storedSensitivity(parsed.frontmatter, domainOf(input.path)),
         source: stringField(parsed.frontmatter.source) ?? "external",
         updated_at: stringField(parsed.frontmatter.updated_at) ?? new Date().toISOString(),
       };
@@ -1225,9 +1284,7 @@ export class VaultWriter extends DurableObject<Env> {
     const type = stringField(again.frontmatter.type) ?? inferType(input.path);
     const owner = stringField(again.frontmatter.owner) ?? ownerForPath(input.path);
     const domain = domainOf(input.path) ?? stringField(again.frontmatter.domain) ?? null;
-    const sensitivity = (stringField(again.frontmatter.sensitivity) === "sensitive" || classifySensitive(markdown, domain) ? "sensitive" : "normal") as
-      | "normal"
-      | "sensitive";
+    const sensitivity = storedSensitivity(again.frontmatter, domain);
     const title = stringField(again.frontmatter.key) ?? stringField(again.frontmatter.title) ?? titleFromBody(again.body, input.path);
     const existingRow = await this.noteByPath(input.path);
     const saved = await this.saveMarkdown({
@@ -1255,110 +1312,6 @@ export class VaultWriter extends DurableObject<Env> {
     });
     if (saved.ok && (type === "journal" || type === "decision")) await restoreJournalMarkers(this.env, id, input.path, markdown, owner);
     return saved;
-  }
-
-  private async quarantine(
-    path: string,
-    markdown: string,
-    reasons: string[],
-    actor: Actor,
-    alert = true,
-    action = "quarantine",
-    detail: string | null = null,
-    etag: string | null = null,
-  ): Promise<void> {
-    const hash = await this.auditHash(markdown);
-    const existing = await this.noteByPath(path);
-    const normalized = normalizeEtag(etag);
-    if (existing?.status === "quarantined" && normalized && normalized === normalizeEtag(existing.r2_etag)) return;
-    if (existing?.status === "active") {
-      await this.snapshotBytes(existing, existing.body, actor.agentId, "quarantine");
-      await this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key NOT LIKE 'sys/history/%'").bind(existing.id).run();
-    }
-    const id = existing?.id ?? ulid();
-    const stub = buildMarkdown(
-      { vault_id: id, type: inferType(path), status: "quarantined", sensitivity: "sensitive", owner: ownerForPath(path) },
-      "This note was quarantined by the content filter.",
-    );
-    const now = new Date().toISOString();
-    const stubHash = await sha256Hex(stub);
-    const recordKey = `sys/quarantine/${hash ?? ulid()}.json`;
-    await this.env.VAULT.put(
-      recordKey,
-      JSON.stringify({
-        path,
-        at: now,
-        reason_codes: reasons,
-        content_hash: hash,
-        agent_id: actor.agentId,
-        run_id: runMarker(path) ?? runMarker(actor.agentId),
-      }),
-      { httpMetadata: { contentType: "application/json" } },
-    );
-    const prior = existing;
-    if (!prior) {
-      await this.env.DB.prepare(
-        `INSERT INTO notes (
-          id, path, type, owner, domain, sensitivity, title, body, frontmatter,           content_hash, r2_etag, r2_key, status,
-          created_at, updated_at, version_ts, last_writer
-        ) VALUES (?, ?, ?, ?, ?, 'sensitive', ?, ?, ?, ?, ?, ?, 'quarantined', ?, ?, ?, ?)`,
-      )
-        .bind(
-          id,
-          path,
-          inferType(path),
-          ownerForPath(path),
-          domainOf(path),
-          path,
-          stub,
-          JSON.stringify(parseMarkdown(stub).frontmatter),
-          stubHash,
-          normalized,
-          r2KeyFor(this.prefix(), path),
-          now,
-          now,
-          versionStamp(),
-          actor.agentId,
-        )
-        .run();
-    } else {
-      await this.env.DB.prepare(
-        `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, r2_etag = ?, status = 'quarantined', sensitivity = 'sensitive', updated_at = ?, last_writer = ? WHERE id = ?`,
-      )
-        .bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), stubHash, normalized, now, actor.agentId, id)
-        .run();
-      await this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(id).run();
-    }
-    await this.audit(actor, action, path, id, "rejected", reasons, hash, markdown.length, detail);
-    if (!alert) return;
-    const inbox = await this.noteByPath("inbox/quarantine.md");
-    if (hash && inbox?.body.includes(hash)) return;
-    const ref = runMarker(path) ?? runMarker(actor.agentId);
-    const block = `## ${now} · quarantine\nA vault file was excluded from search (${reasons.join(", ")}). Hash ${hash ?? "none"}.${ref ? ` Ref ${ref}.` : ""}\n`;
-    const base =
-      inbox?.body ??
-      buildMarkdown({ vault_id: ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal", vault_summary: false }, "# Quarantine\n");
-    const markdownInbox = `${base.endsWith("\n") ? base : `${base}\n`}\n${block}`;
-    await this.saveMarkdown({
-      id: inbox?.id ?? stringField(parseMarkdown(base).frontmatter.vault_id) ?? ulid(),
-      path: "inbox/quarantine.md",
-      markdown: markdownInbox,
-      type: "note",
-      owner: "shared",
-      domain: null,
-      sensitivity: "normal",
-      factKey: null,
-      title: "Quarantine",
-      statementHash: null,
-      observedAt: now,
-      actor,
-      ifMatch: inbox?.r2_etag ?? null,
-      create: !inbox,
-      reason: "quarantine-alert",
-      action: "quarantine_alert",
-      idempotencyKey: null,
-      journal: null,
-    });
   }
 
   private async refreshSummary(actor: Actor): Promise<void> {
@@ -1475,9 +1428,6 @@ export class VaultWriter extends DurableObject<Env> {
     if (!note) return { ok: true, data: { purged: false } };
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
-    const quarantine = await this.quarantineForPath(note.path);
-    await this.stripQuarantineAlert(note.path, quarantine.hashes, actor);
-    if (quarantine.keys.length) await this.env.VAULT.delete(quarantine.keys);
     const keys = [note.r2_key];
     let cursor: string | undefined;
     do {
@@ -1549,11 +1499,6 @@ export class VaultWriter extends DurableObject<Env> {
       .run();
   }
 
-  private async auditHash(text: string): Promise<string | null> {
-    if (!this.env.AUDIT_KEY) return null;
-    return hmacSha256Hex(this.env.AUDIT_KEY, text);
-  }
-
   private async replayIntents(): Promise<{ replayed: number; dropped: number }> {
     const rows = this.ctx.storage.sql
       .exec<{ op_id: string; path: string; new_hash: string }>("SELECT op_id, path, new_hash FROM write_intents")
@@ -1609,19 +1554,15 @@ export class VaultWriter extends DurableObject<Env> {
         const file = await this.env.VAULT.get(object.key);
         if (!file) continue;
         const markdown = await file.text();
-        const hit = await this.contentHit(path, markdown);
-        if (hit) await this.quarantine(path, markdown, hit.reasons, actor, false, "reconcile", null, normalizeEtag(file.etag));
-        else {
-          await this.indexBytes({
-            path,
-            markdown,
-            etag: normalizeEtag(file.etag),
-            actor,
-            action: "reconcile",
-            write: false,
-            reason: "reconcile",
-          });
-        }
+        await this.indexBytes({
+          path,
+          markdown,
+          etag: normalizeEtag(file.etag),
+          actor,
+          action: "reconcile",
+          write: false,
+          reason: "reconcile",
+        });
         updated += 1;
       }
       cursor = page.truncated ? page.cursor : undefined;
@@ -1653,23 +1594,6 @@ export class VaultWriter extends DurableObject<Env> {
 
   private cleanupAllowed(): boolean {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
-  }
-
-  private async contentHit(path: string, markdown: string) {
-    if (isGeneratedNote(path)) return null;
-    return inspectWrite(textForFilter(markdown), await this.policy());
-  }
-
-  private async existingNoteId(path: string, markdown: string, metaId: string | null): Promise<string> {
-    const fromFile = stringField(parseMarkdown(markdown).frontmatter.vault_id) ?? null;
-    const prior = await this.env.DB.prepare("SELECT id FROM notes WHERE path = ?").bind(path).first<{ id: string }>();
-    const meta = metaId?.trim() || null;
-    const candidates = [fromFile, prior?.id ?? null, meta].filter((value): value is string => Boolean(value));
-    for (const candidate of candidates) {
-      const clash = await this.env.DB.prepare("SELECT path FROM notes WHERE id = ?").bind(candidate).first<{ path: string }>();
-      if (!clash || clash.path === path) return candidate;
-    }
-    return ulid();
   }
 
   private async replay(agentId: string, key: string | null): Promise<{ [key: string]: JsonValue } | null> {
@@ -1715,11 +1639,6 @@ export class VaultWriter extends DurableObject<Env> {
     return (rows.results ?? []).map((row) => row.id);
   }
 
-  private async policy(): Promise<PolicyTerm[]> {
-    const rows = await this.env.DB.prepare("SELECT term, kind FROM policy_terms").all<PolicyTerm>();
-    return rows.results ?? [];
-  }
-
   private async resolvedLinks(srcId: string, targets: string[]): Promise<{ target: string; dst: string | null }[]> {
     const links: { target: string; dst: string | null }[] = [];
     for (const target of targets) {
@@ -1760,7 +1679,7 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   private async deleteRunObjects(runId: string): Promise<void> {
-    for (const prefix of [this.prefix(), "sys/history/", "sys/quarantine/"]) {
+    for (const prefix of [this.prefix(), "sys/history/"]) {
       const keys = await this.scanObjects(prefix, async (key, read) => key.includes(runId) || (await read()).includes(runId));
       if (!keys.length) continue;
       await this.env.VAULT.delete(keys);
@@ -1788,57 +1707,6 @@ export class VaultWriter extends DurableObject<Env> {
     return keys;
   }
 
-  private async quarantineForPath(path: string): Promise<{ keys: string[]; hashes: string[] }> {
-    const hashes: string[] = [];
-    const keys = await this.scanObjects("sys/quarantine/", async (_key, read) => {
-      const body = await read();
-      if (!body.includes(path)) return false;
-      try {
-        const parsed = JSON.parse(body) as { path?: unknown; content_hash?: unknown };
-        if (parsed.path === path && typeof parsed.content_hash === "string") hashes.push(parsed.content_hash);
-      } catch {
-        return true;
-      }
-      return true;
-    });
-    return { keys, hashes };
-  }
-
-  private async stripQuarantineAlert(path: string, hashes: string[], actor: Actor): Promise<void> {
-    const inbox = await this.noteByPath("inbox/quarantine.md");
-    if (!inbox) return;
-    const needles = [path, ...hashes].filter((needle) => needle.length > 0);
-    if (!needles.some((needle) => inbox.body.includes(needle))) return;
-    const parsed = parseMarkdown(inbox.body);
-    const pieces = parsed.body.split(/\n(?=## )/);
-    const kept = pieces.filter((piece) => !needles.some((needle) => piece.includes(needle)));
-    if (kept.length === pieces.length) return;
-    const body = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-    const markdown = Object.keys(parsed.frontmatter).length > 0 ? buildMarkdown(parsed.frontmatter, body) : body ? `${body}\n` : "";
-    if (!markdown) return;
-    const saved = await this.saveMarkdown({
-      id: inbox.id,
-      path: inbox.path,
-      markdown,
-      type: inbox.type,
-      owner: inbox.owner,
-      domain: inbox.domain,
-      sensitivity: inbox.sensitivity === "sensitive" ? "sensitive" : "normal",
-      factKey: null,
-      title: inbox.title ?? "Quarantine",
-      statementHash: null,
-      observedAt: null,
-      actor,
-      ifMatch: inbox.r2_etag,
-      create: false,
-      reason: "purge",
-      action: "purge_inbox",
-      idempotencyKey: null,
-      journal: null,
-    });
-    if (!saved.ok) throw new VaultError(saved.error.code === "conflict_etag" ? "conflict_etag" : "invalid", saved.error.message);
-  }
-
   private async runLeftovers(runId: string): Promise<{ notes: number; objects: number }> {
     const like = `%${runId}%`;
     const notes = await this.env.DB.prepare(
@@ -1851,7 +1719,7 @@ export class VaultWriter extends DurableObject<Env> {
       .bind(like, like, like, like, like, like)
       .first<{ n: number }>();
     let objects = 0;
-    for (const prefix of [this.prefix(), "sys/history/", "sys/quarantine/"]) {
+    for (const prefix of [this.prefix(), "sys/history/"]) {
       let cursor: string | undefined;
       do {
         const page = await this.env.VAULT.list({ prefix, cursor, limit: 100 });
@@ -1878,6 +1746,15 @@ function normalizeEtag(etag: string | null | undefined): string | null {
   if (!etag) return null;
   const value = etag.trim().replace(/^W\//, "").replaceAll('"', "");
   return value || null;
+}
+
+function noteStatus(frontmatter: Frontmatter): "active" | "forgotten" {
+  return stringField(frontmatter.status) === "forgotten" ? "forgotten" : "active";
+}
+
+function storedSensitivity(frontmatter: Frontmatter, domain: string | null): "normal" | "sensitive" {
+  if (stringField(frontmatter.sensitivity) === "sensitive") return "sensitive";
+  return domain !== null && SENSITIVE_DOMAINS.has(domain) ? "sensitive" : "normal";
 }
 
 function normalizeStatement(value: string): string {
@@ -1965,6 +1842,109 @@ export async function restoreJournalMarkers(env: Env, noteId: string, path: stri
   }
 }
 
+type StagedFile = {
+  note: JsonValue[];
+  chunks: JsonValue[][];
+  journal: JsonValue[][];
+  tombstone: { id: string; hash: string } | null;
+};
+
+// Pre-serialized rows per stage table. add() refuses a file that would push a table past the byte cap.
+class StageRows {
+  notes: string[] = [];
+  chunks: string[] = [];
+  journal: string[] = [];
+  private bytes = { notes: 0, chunks: 0, journal: 0 };
+
+  add(file: StagedFile): boolean {
+    const parts = {
+      notes: [JSON.stringify(file.note)],
+      chunks: file.chunks.map((row) => JSON.stringify(row)),
+      journal: file.journal.map((row) => JSON.stringify(row)),
+    };
+    const sizes = { notes: byteLength(parts.notes), chunks: byteLength(parts.chunks), journal: byteLength(parts.journal) };
+    const empty = this.notes.length === 0;
+    if (!empty && (Object.keys(sizes) as (keyof typeof sizes)[]).some((table) => this.bytes[table] + sizes[table] > STAGE_JSON_BYTES)) return false;
+    for (const table of Object.keys(sizes) as (keyof typeof sizes)[]) {
+      this[table].push(...parts[table]);
+      this.bytes[table] += sizes[table];
+    }
+    return true;
+  }
+
+  json(table: "notes" | "chunks" | "journal"): string {
+    return `[${this[table].join(",")}]`;
+  }
+}
+
+function byteLength(parts: string[]): number {
+  let total = 0;
+  for (const part of parts) total += new TextEncoder().encode(part).length + 1;
+  return total;
+}
+
+function jsonInsert(verb: string, columns: string[]): string {
+  const values = columns.map((_, index) => `json_extract(value, '$[${index}]')`).join(", ");
+  return `${verb} (${columns.join(", ")}) SELECT ${values} FROM json_each(?)`;
+}
+
+function jsonSlices(rows: JsonValue[][]): string[] {
+  const out: string[] = [];
+  let parts: string[] = [];
+  let bytes = 0;
+  for (const row of rows) {
+    const part = JSON.stringify(row);
+    const size = new TextEncoder().encode(part).length + 1;
+    if (parts.length && bytes + size > STAGE_JSON_BYTES) {
+      out.push(`[${parts.join(",")}]`);
+      parts = [];
+      bytes = 0;
+    }
+    parts.push(part);
+    bytes += size;
+  }
+  if (parts.length) out.push(`[${parts.join(",")}]`);
+  return out;
+}
+
+function slices<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let index = 0; index < items.length; index += size) out.push(items.slice(index, index + size));
+  return out;
+}
+
+// Keeps the id in the file, then the id D1 had for the path, then the R2 metadata id, unless another
+// path already owns it in D1 or earlier in this rebuild. A copied file gets a fresh id.
+function stagedNoteId(
+  path: string,
+  fromFile: string | null,
+  metaId: string | null,
+  live: { byPath: Map<string, string>; byId: Map<string, string> },
+  assigned: Map<string, string>,
+): string {
+  const candidates = [fromFile, live.byPath.get(path) ?? null, metaId?.trim() || null].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    const livePath = live.byId.get(candidate);
+    const stagedPath = assigned.get(candidate);
+    if ((!livePath || livePath === path) && (!stagedPath || stagedPath === path)) return candidate;
+  }
+  return ulid();
+}
+
+type RebuildProgress = {
+  phase: "stage" | "swap" | "history" | "done";
+  files: number;
+  notes: number;
+  versions: number;
+  tombstones: number;
+  history_reads: number;
+};
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) return `${err.name}: ${err.message}`.slice(0, 300);
+  return "error";
+}
+
 type CleanupNote = {
   id: string;
   path: string;
@@ -1976,11 +1956,6 @@ type CleanupNote = {
   domain: string | null;
   r2_etag: string | null;
 };
-
-function runMarker(value: string | null | undefined): string | null {
-  if (!value) return null;
-  return /e2e[0-9a-f]{10}/.exec(value)?.[0] ?? null;
-}
 
 function stripRunContent(markdown: string, runId: string): { markdown: string; empty: boolean; changed: boolean } {
   const parsed = parseMarkdown(markdown);

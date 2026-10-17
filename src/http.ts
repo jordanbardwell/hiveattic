@@ -3,7 +3,6 @@ import { ulid } from "./crypto";
 import { ERROR_STATUS, VaultError, asVaultError } from "./errors";
 import { logEvent } from "./log";
 import {
-  addPolicy,
   appendJournal,
   bootstrap,
   cleanupRun,
@@ -14,15 +13,12 @@ import {
   journalOrder,
   list,
   listAudit,
-  listPolicy,
-  listQuarantine,
   mintToken,
   purgeNote,
   readById,
   readPath,
   reconcile,
   reindex,
-  removePolicy,
   restoreVersion,
   revokeToken,
   search,
@@ -32,7 +28,7 @@ import {
   writeNote,
   type Session,
 } from "./service";
-import { cleanupSchema, factSchema, forgetSchema, journalSchema, noteSchema, parseInput, policySchema, purgeSchema, restoreSchema, revokeSchema, termSchema, tokenSchema } from "./schemas";
+import { cleanupSchema, factSchema, forgetSchema, journalSchema, noteSchema, parseInput, purgeSchema, restoreSchema, revokeSchema, tokenSchema } from "./schemas";
 
 export async function handleFetch(request: Request, env: Env, ctx: ExecutionContext, mcp: (request: Request, env: Env, ctx: ExecutionContext) => Promise<Response>): Promise<Response> {
   const url = new URL(request.url);
@@ -90,12 +86,6 @@ async function route(request: Request, env: Env, url: URL, session: Session): Pr
   if (request.method === "POST" && pathname === "/v1/admin/bootstrap") return bootstrap(env, session);
   if (request.method === "POST" && pathname === "/v1/admin/tokens") return mintToken(env, session, parseInput(tokenSchema, await readJson(request)));
   if (request.method === "POST" && pathname === "/v1/admin/tokens/revoke") return revokeToken(env, session, parseInput(revokeSchema, await readJson(request)));
-  if (request.method === "GET" && pathname === "/v1/admin/policy") return listPolicy(env, session);
-  if (request.method === "POST" && pathname === "/v1/admin/policy") {
-    const body = parseInput(policySchema, await readJson(request));
-    return addPolicy(env, session, body.term, body.kind);
-  }
-  if (request.method === "DELETE" && pathname === "/v1/admin/policy") return removePolicy(env, session, parseInput(termSchema, await readJson(request)).term);
   if (request.method === "POST" && pathname === "/v1/admin/reindex") return reindex(env, session);
   if (request.method === "POST" && pathname === "/v1/admin/reconcile") return reconcile(env, session);
   if (request.method === "GET" && pathname === "/v1/admin/journal-order") return journalOrder(env, session, requiredQuery(url, "path"));
@@ -112,7 +102,6 @@ async function route(request: Request, env: Env, url: URL, session: Session): Pr
     );
   }
   if (request.method === "POST" && pathname === "/v1/admin/audit/verify-append-only") return verifyAuditAppendOnly(env, session);
-  if (request.method === "GET" && pathname === "/v1/admin/quarantine") return listQuarantine(env, session);
   throw new VaultError("not_found", "Route not found");
 }
 
