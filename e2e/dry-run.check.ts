@@ -24,7 +24,39 @@ const server = createServer(async (request, response) => {
   const body = await readBody(request);
   if (request.method === "GET" && url.startsWith("/v1/whoami")) {
     counts.whoami += 1;
-    send(response, 200, { ok: true, data: { deploy_env: "staging", staging_resources: true, admin: true, agent_id: "owner", scopes: ["admin"] } });
+    const reviewer = (request.headers.authorization ?? "").includes("reviewer-token");
+    send(response, 200, {
+      ok: true,
+      data: {
+        deploy_env: "staging",
+        staging_resources: true,
+        admin: !reviewer,
+        agent_id: reviewer ? "reviewer" : "owner",
+        scopes: reviewer ? ["read:shared"] : ["admin"],
+      },
+    });
+    return;
+  }
+  if (request.method === "GET" && url.startsWith("/v1/search")) {
+    send(response, 200, { ok: true, data: { results: [] } });
+    return;
+  }
+  if (request.method === "GET" && url.includes("/queues") && !url.includes("/metrics")) {
+    send(response, 200, { result: [{ queue_id: "queue-prod-dlq", queue_name: "hiveattic-index-dlq" }] });
+    return;
+  }
+  if (request.method === "POST" && url.includes("/graphql")) {
+    send(response, 200, {
+      data: {
+        viewer: {
+          accounts: [
+            {
+              queueBacklogAdaptiveGroups: [{ avg: { messages: 0 }, dimensions: { datetime: "2026-10-17T19:00:00Z" } }],
+            },
+          ],
+        },
+      },
+    });
     return;
   }
   if (request.method === "POST" && url === "/v1/admin/tokens") {
@@ -123,6 +155,24 @@ try {
   }
   if (counts.cleanup !== 1) throw new Error(`finally did not call cleanup: ${JSON.stringify(counts)}`);
   if (!dry.output.includes("DRY-RUN")) throw new Error(`dry-run summary missing\n${dry.output}`);
+  const stagingDlq = JSON.parse(readFileSync(join(root, "dlq.json"), "utf8")) as { queue?: string; dlq_depth?: number | null };
+  if (stagingDlq.queue !== "hiveattic-staging-index-dlq") throw new Error(`dry-run labeled the wrong DLQ: ${stagingDlq.queue}`);
+
+  const readOnlyOut = join(root, "readonly", "results.json");
+  const readOnly = await runHarness([], baseEnv({
+    HIVEATTIC_E2E_OUT: readOnlyOut,
+    HIVEATTIC_E2E_READ_ONLY: "1",
+    HIVEATTIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+    HIVEATTIC_REVIEWER_TOKEN: "reviewer-token",
+    HIVEATTIC_CF_API: `http://127.0.0.1:${address.port}/client/v4`,
+    CLOUDFLARE_API_TOKEN: "cf-token",
+    CLOUDFLARE_ACCOUNT_ID: "acct",
+  }));
+  if (readOnly.code !== 0) throw new Error(`read-only exited ${readOnly.code}\n${readOnly.output}`);
+  const readOnlyDlq = JSON.parse(readFileSync(join(root, "readonly", "dlq.json"), "utf8")) as { queue?: string; dlq_depth?: number | null };
+  if (readOnlyDlq.queue !== "hiveattic-index-dlq") throw new Error(`read-only labeled the wrong DLQ: ${readOnlyDlq.queue}`);
+  if (readOnlyDlq.dlq_depth !== 0) throw new Error(`read-only DLQ depth was not read: ${String(readOnlyDlq.dlq_depth)}`);
+  if (!readOnly.output.includes("dlq depth")) throw new Error(`read-only summary missing DLQ depth\n${readOnly.output}`);
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }

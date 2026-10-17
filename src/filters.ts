@@ -243,7 +243,13 @@ function termMatches(text: string, term: string): boolean {
   const needle = term.toLowerCase();
   if (!needle) return false;
   if (/[^a-z0-9\s]/i.test(needle) || needle.includes(" ")) return text.toLowerCase().includes(needle);
-  return new RegExp(`\\b${escapeRegExp(needle)}\\b`, "i").test(text);
+  return new RegExp(`\\b${pluralPattern(needle)}\\b`, "i").test(text);
+}
+
+function pluralPattern(word: string): string {
+  const previous = word[word.length - 2] ?? "";
+  if (word.length > 1 && word.endsWith("y") && !/[aeiou]/.test(previous)) return `${escapeRegExp(word.slice(0, -1))}(?:y|ies)`;
+  return `${escapeRegExp(word)}(?:es|s)?`;
 }
 
 function accountDigits(run: string): string | null {

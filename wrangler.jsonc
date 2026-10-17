@@ -29,7 +29,8 @@
     "DEPLOY_ENV": "",
     "VAULT_BUCKET": "hiveattic-vault",
     "DB_NAME": "hiveattic-index",
-    "WORKER_NAME": "hiveattic"
+    "WORKER_NAME": "hiveattic",
+    "GIT_SHA": ""
   },
   "triggers": {
     "crons": ["15 7 * * *"]

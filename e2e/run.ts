@@ -74,10 +74,12 @@ async function readOnlyReviewer(): Promise<Check[]> {
   const root = prodBase || stagingBase;
   const who = await rest("/v1/whoami", suppliedReviewer, "GET", undefined, root);
   const search = await rest("/v1/search?q=vault", suppliedReviewer, "GET", undefined, root);
+  dlqDepth = await readDlqDepth();
   return [
     check("whoami", who.status === 200 && who.json.data?.admin === false, `status ${who.status}`),
     check("search", search.status === 200, `status ${search.status}`),
     check("no writes sent", true),
+    check("dlq depth", typeof dlqDepth === "number", dlqDepth === null ? "DLQ depth was not readable" : `depth ${dlqDepth}`),
   ];
 }
 
@@ -746,8 +748,15 @@ async function logsOmit(label: string, fragments: string[], fromMs: number): Pro
   return check(name, true);
 }
 
+function cfApi(path: string): string {
+  const root = (process.env.HIVEATTIC_CF_API ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
+  return `${root}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 function dlqName(): string {
-  return process.env.HIVEATTIC_DLQ_NAME?.trim() || "hiveattic-staging-index-dlq";
+  const configured = process.env.HIVEATTIC_DLQ_NAME?.trim();
+  if (configured) return configured;
+  return readOnly ? "hiveattic-index-dlq" : "hiveattic-staging-index-dlq";
 }
 
 async function readDlqDepth(): Promise<number | null> {
@@ -762,7 +771,7 @@ async function readDlqDepth(): Promise<number | null> {
 }
 
 async function queueIdByName(token: string, accountId: string, name: string): Promise<string | null> {
-  const listed = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues`, {
+  const listed = await fetch(cfApi(`/accounts/${accountId}/queues`), {
     headers: { authorization: `Bearer ${token}` },
   }).catch(() => null);
   if (!listed?.ok) return null;
@@ -789,7 +798,7 @@ async function graphqlBacklog(
   start: Date,
   end: Date,
 ): Promise<number | "empty" | "error"> {
-  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+  const response = await fetch(cfApi("/graphql"), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({
@@ -824,7 +833,7 @@ async function graphqlBacklog(
 }
 
 async function backlogFromMetrics(token: string, accountId: string, queueId: string): Promise<number | null> {
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues/${queueId}/metrics`, {
+  const response = await fetch(cfApi(`/accounts/${accountId}/queues/${queueId}/metrics`), {
     headers: { authorization: `Bearer ${token}` },
   }).catch(() => null);
   if (!response?.ok) return null;

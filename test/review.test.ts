@@ -130,6 +130,23 @@ describe("architect review regressions", () => {
     expect(scanEmployer("Got a good deal on a Contoso Example Corp Surface at the shop", [...policy, { term: "Surface", kind: "allow" }])).toEqual([]);
     expect(scanEmployer("Signed an nda with my landlord", policy)).toContain("employer_denylist");
     expect(scanEmployer("The monday market opens at nine.", policy)).toEqual([]);
+    const customers = [
+      { term: "Contoso Example Corp", kind: "context_subject" },
+      { term: "customer", kind: "context_qualifier" },
+    ];
+    expect(scanEmployer("Contoso Example Corp filed the form. The customers renewed.", customers)).toContain("employer_context");
+    expect(scanEmployer("The customers renewed.", customers)).toEqual([]);
+    expect(scanEmployer("customerish note about Contoso Example Corp", customers)).toEqual([]);
+    expect(scanEmployer("The companies signed.", [{ term: "company", kind: "employer" }])).toContain("employer_denylist");
+    expect(scanEmployer("The company signed.", [{ term: "company", kind: "employer" }])).toContain("employer_denylist");
+  });
+
+  it("health reports the git sha injected at deploy", async () => {
+    const response = await rest("/v1/health", null);
+    expect(response.status).toBe(200);
+    expect(response.json.data?.status).toBe("ok");
+    expect(response.json.data?.git_sha).toBe("abc123deploy");
+    expect(response.json.data?.version).toBe("abc123deploy");
   });
 
   it("P8 a domain parameter cannot retag a folder", async () => {

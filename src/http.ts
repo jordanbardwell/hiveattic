@@ -38,7 +38,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const url = new URL(request.url);
   const requestId = ulid();
   const clientRequestId = request.headers.get("x-request-id")?.slice(0, 80) || null;
-  if (url.pathname === "/v1/health" && request.method === "GET") return json(200, envelope(await health(), requestId, clientRequestId));
+  if (url.pathname === "/v1/health" && request.method === "GET") return json(200, envelope(await health(env), requestId, clientRequestId));
   try {
     if (url.pathname === "/mcp") {
       const access = await authenticate(request, env, ctx);

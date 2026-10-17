@@ -66,8 +66,10 @@ printf '%s' "$ADMIN_TOKEN" | TOKEN_PEPPER="$TOKEN_PEPPER" pnpm hash-token
 pnpm exec wrangler secret put TOKEN_PEPPER
 pnpm exec wrangler secret put ADMIN_TOKEN_HASH
 pnpm exec wrangler secret put AUDIT_KEY
-pnpm exec wrangler deploy
+pnpm exec wrangler deploy --var GIT_SHA:$(git rev-parse HEAD)
 ```
+
+`GET /v1/health` returns `version` and `git_sha` from the `GIT_SHA` var. Pass that `--var` on every production deploy so the running build can be checked against a commit. The tracked config leaves `GIT_SHA` empty, and a deploy that omits the flag publishes an empty value.
 
 The Worker URL is the `workers.dev` host printed by deploy, or a custom hostname you attach later. Bootstrap the vault documents and mint the first agent tokens:
 
@@ -127,7 +129,7 @@ The database ships with no employer terms. Copy `policy/employers.example.txt` t
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm policy:apply
 ```
 
-`policy/employers.local.txt` is gitignored. A sentence is rejected when it matches an employer term, or when it matches both a subject and a qualifier. An allow term is the escape hatch for a sentence that would otherwise match, such as a personal purchase. Tests insert only fake names.
+`policy/employers.local.txt` is gitignored. Real terms do not belong in git. A write is rejected when it matches an employer term, or when it matches both a subject and a qualifier. The match is the whole write, not one sentence. See `policy/README.md`. An allow term is the escape hatch for a write that would otherwise match, such as a personal purchase. Tests insert only fake names.
 
 When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`, and the loser reference is that version's timestamp. Journal files are `journal/YYYY/MM/YYYY-MM-DD.md`. A sensitive entry stays in the writer's own `journal-sensitive` file.
 
@@ -139,7 +141,7 @@ Copy `.e2e.env.example` to a file that stays outside git, export the variables, 
 pnpm e2e
 ```
 
-The suite writes only namespaced paths and tags, and only to staging. It revokes every token it mints. Cleanup runs on staging after the cases, including when a case throws. It deletes notes the run owns and rewrites shared journals, decisions, and quarantine alerts by run id, including history objects and quarantine records, and the suite checks that D1 and R2 have nothing left from that run. It prints a summary and writes `e2e-results/results.json`, a markdown summary, and `e2e-results/dlq.json` even if the run aborts. `pnpm e2e --dry-run` exercises setup, `wrangler tail` startup, and that cleanup against a local mock; `pnpm test` runs that check before the suite. DLQ depth comes from the GraphQL dataset `queueBacklogAdaptiveGroups` (`avg.messages`), or from `GET /accounts/{account_id}/queues/{queue_id}/metrics` `backlog_count` when that dataset has no sample. A missing or unreadable backlog fails the check. It is not the queue's producer count. Status values are `passed`, `failed`, `skipped`, and `partial`. T-09 is `partial`: the live checks cover the forgotten stub, empty keyword search, and retained history, and the vector-deletion half is deferred to M2. T-10, T-13, and T-14 are reported as skipped. The account-number check inside T-03 is skipped when the fixture is absent. Without the staging URL and staging admin token the process exits before sending writes.
+The suite writes only namespaced paths and tags, and only to staging. It revokes every token it mints. Cleanup runs on staging after the cases, including when a case throws. It deletes notes the run owns and rewrites shared journals, decisions, and quarantine alerts by run id, including history objects and quarantine records, and the suite checks that D1 and R2 have nothing left from that run. It prints a summary and writes `e2e-results/results.json`, a markdown summary, and `e2e-results/dlq.json` even if the run aborts. Staging labels that file `hiveattic-staging-index-dlq`. A read-only prod smoke labels it `hiveattic-index-dlq` and records the backlog depth from that queue. `HIVEATTIC_DLQ_NAME` overrides either name. `HIVEATTIC_CF_API` overrides the Cloudflare API origin used for that read. `pnpm e2e --dry-run` exercises setup, `wrangler tail` startup, and that cleanup against a local mock; `pnpm test` runs that check before the suite. DLQ depth comes from the GraphQL dataset `queueBacklogAdaptiveGroups` (`avg.messages`), or from `GET /accounts/{account_id}/queues/{queue_id}/metrics` `backlog_count` when that dataset has no sample. A missing or unreadable backlog fails the check. It is not the queue's producer count. Status values are `passed`, `failed`, `skipped`, and `partial`. T-09 is `partial`: the live checks cover the forgotten stub, empty keyword search, and retained history, and the vector-deletion half is deferred to M2. T-10, T-13, and T-14 are reported as skipped. The account-number check inside T-03 is skipped when the fixture is absent. Without the staging URL and staging admin token the process exits before sending writes.
 
 T-06 is 20 runs of 7 parallel appends to the namespaced agent's own journal, then a comparison of heading order with `GET /v1/admin/journal-order`, a stale `if_match` that must return 409 `conflict_etag`, and a rebuild that must leave all 140 entries in the day file. See the rate-limit commands above before running it.
 

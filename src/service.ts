@@ -24,8 +24,9 @@ export function toolRateKind(name: string | undefined): "read" | "write" {
   return name && WRITE_TOOLS.has(name) ? "write" : "read";
 }
 
-export async function health(): Promise<Record<string, unknown>> {
-  return { status: "ok", service: "hiveattic" };
+export async function health(env: Env): Promise<Record<string, unknown>> {
+  const gitSha = env.GIT_SHA?.trim() || null;
+  return { status: "ok", service: "hiveattic", version: gitSha, git_sha: gitSha };
 }
 
 export async function currentAgent(env: Env, session: Session): Promise<Record<string, unknown>> {

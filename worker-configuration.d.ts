@@ -14,6 +14,7 @@ interface __BaseEnv_Env {
 	VAULT_BUCKET: string;
 	DB_NAME: string;
 	WORKER_NAME: string;
+	GIT_SHA: string;
 	TOKEN_PEPPER: string;
 	ADMIN_TOKEN_HASH: string;
 	AUDIT_KEY: string;
@@ -32,7 +33,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "VAULT_PREFIX" | "TZ_DISPLAY" | "RATE_LIMIT_WRITES_PER_MIN" | "RATE_LIMIT_READS_PER_MIN" | "E2E_CLEANUP_ENABLED" | "DEPLOY_ENV" | "VAULT_BUCKET" | "DB_NAME" | "WORKER_NAME" | "TOKEN_PEPPER" | "ADMIN_TOKEN_HASH" | "AUDIT_KEY" | "JOURNAL_MAC_KEY">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "VAULT_PREFIX" | "TZ_DISPLAY" | "RATE_LIMIT_WRITES_PER_MIN" | "RATE_LIMIT_READS_PER_MIN" | "E2E_CLEANUP_ENABLED" | "DEPLOY_ENV" | "VAULT_BUCKET" | "DB_NAME" | "WORKER_NAME" | "GIT_SHA" | "TOKEN_PEPPER" | "ADMIN_TOKEN_HASH" | "AUDIT_KEY" | "JOURNAL_MAC_KEY">> {}
 }
 declare module "*.md" {
 	const value: string;

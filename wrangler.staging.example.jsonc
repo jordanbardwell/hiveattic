@@ -20,7 +20,8 @@
     "DEPLOY_ENV": "staging",
     "VAULT_BUCKET": "hiveattic-staging-vault",
     "DB_NAME": "hiveattic-staging-index",
-    "WORKER_NAME": "hiveattic-staging"
+    "WORKER_NAME": "hiveattic-staging",
+    "GIT_SHA": ""
   },
   "triggers": { "crons": ["15 7 * * *"] },
   "secrets": { "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"] },
