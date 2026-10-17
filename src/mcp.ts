@@ -66,7 +66,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   });
   tool(
     "vault_search",
-    "Keyword search. Hybrid mode is keyword-only until a later milestone.",
+    "Keyword search, the same as GET /v1/search. Hybrid mode is keyword-only until a later milestone.",
     z.object({
       q: z.string().optional(),
       query: z.string().optional(),
@@ -90,15 +90,15 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   tool("vault_history", "List retained versions of a note.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) =>
     history(env, current, typeof args.path === "string" ? args.path : undefined, typeof args.id === "string" ? args.id : undefined),
   );
-  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active.", factSchema, async (current, args) =>
+  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active. Send an idempotency_key so a retry writes once.", factSchema, async (current, args) =>
     (await writeFact(env, current, parseInput(factSchema, args))).data,
   );
-  tool("vault_append_journal", "Append one journal or decision entry.", journalSchema, async (current, args) =>
+  tool("vault_append_journal", "Append one journal or decision entry. Send an idempotency_key so a retry writes once.", journalSchema, async (current, args) =>
     (await appendJournal(env, current, parseInput(journalSchema, args))).data,
   );
-  tool("vault_write_note", "Create or replace a note. Existing notes require if_match.", noteSchema, async (current, args) =>
+  tool("vault_write_note", "Create or replace a note. Existing notes require if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
     (await writeNote(env, current, parseInput(noteSchema, args), null)).data,
   );
-  tool("vault_forget", "Soft-delete a note. History is kept.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
+  tool("vault_forget", "Soft-delete a note. History is kept for the admin. Send an idempotency_key so a retry writes once.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
   return server;
 }

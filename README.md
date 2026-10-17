@@ -20,17 +20,20 @@ The folder decides who can read a file, and the server picks the folder from the
 | --- | --- | --- |
 | Health (a flu shot, a prescription, a diagnosis) | `sensitive/health/<path>` | `read:sensitive/health` |
 | Finance (a budget, a salary, a mortgage, a tax return) | `sensitive/finance/<path>` | `read:sensitive/finance` |
-| Health and finance together, PII alone (phone number, street address, date of birth), or `sensitivity: "sensitive"` with no domain | `sensitive/restricted/<path>` | the admin token only |
+| Notes and facts: health and finance together, PII alone (phone number, street address, date of birth), or `sensitivity: "sensitive"` with no domain | `sensitive/restricted/<path>` | the admin token only |
+| Journal entries: PII alone, for an own, shared, or decisions target | `bots/<writer>/journal-sensitive/<YYYY-MM-DD>.md` | the writer, and the admin token |
+| Journal entries: health and finance together, or the flag with no domain | `sensitive/restricted/journal/<writer>/<YYYY-MM-DD>.md` | the admin token only |
 
 - A rerouted write answers **201** with `{ path, rerouted: true, sensitive_domain }` plus the usual fields. `path` is where the text went. The path the caller named gets nothing.
-- The reroute works without `write:sensitive/<d>`. Reading the result back needs `read:sensitive/<d>`, even for the writer. No scope reaches `sensitive/restricted/`: not `read:all`, not `read:sensitive/*`, and mint refuses any scope that names `restricted`.
+- The reroute works without `write:sensitive/<d>`. Reading a `sensitive/<d>/` result back needs `read:sensitive/<d>`, even for the writer. No scope reaches `sensitive/restricted/`: not `read:all`, not `read:sensitive/*`, and mint refuses any scope that names `restricted`.
+- **A bot's own PII journal.** The writer always reads its own `bots/<writer>/journal-sensitive/` files, with or without any `read:sensitive` scope. This check runs before every other rule. Every other token gets 404 there, whatever it holds (`read:bots/<writer>`, `read:bots/*`, `read:sensitive/*`, and `read:all` included), and the admin token reads them. The reply's `sensitive_domain` is `pii`.
 - A caller that declares a sensitive `domain` still needs `write:sensitive/<d>`, as before. Frontmatter, `extra`, `sensitivity: "normal"`, or an ordinary domain cannot lower what the text classifies as. The classifier reads the body and the caller's frontmatter, not server fields such as `source` or `owner`.
-- **Shared journal entries.** A journal entry (shared, own, or decisions) whose text is sensitive is accepted and appended to the writer's day file under `sensitive/<d>/journal/<agent>/<YYYY-MM-DD>.md` (date in `VAULT_TZ`). The requested day file gets no entry and no placeholder, so a `read:shared` reader sees nothing of it in the file, search, history, or `journal-order`. The audit row is `journal_reroute` with `detail.requested_path`.
+- **Journal entries.** A journal entry (shared, own, or decisions) whose text is sensitive is accepted and appended to one of the writer's sensitive day files: `sensitive/<d>/journal/<agent>/<YYYY-MM-DD>.md` for health alone or finance alone, `bots/<agent>/journal-sensitive/<YYYY-MM-DD>.md` for PII alone, and `sensitive/restricted/journal/<agent>/<YYYY-MM-DD>.md` otherwise. Dates are flat, in `VAULT_TZ`. The requested day file, the decisions log included, gets no entry and no placeholder, so a `read:shared` reader sees nothing of it in the file, search, history, or `journal-order`. The audit row is `journal_reroute` with `detail.requested_path`. A day file never takes the ordinary `domain` of one entry, so one tagged entry cannot change who reads the file.
 - **An update that adds sensitive text moves the note.** The note continues under a new `vault_id` at `sensitive/<d>/<path>`. The old path is tombstoned like a forget, with a stub body and reason `removed`; its history keeps only the earlier versions, and the sensitive version is never stored under the old id. Readers other than the admin token get 404 at the old path, with no pointer to the new one. The old-to-new link is kept in `tombstones.moved_to`, which only the admin reads. Facts move the same way, and `profile/summary.md` drops them.
 - **Outside edits.** A file saved under `shared/` (or any non-sensitive path) through R2 or Obsidian is classified before it is indexed. Sensitive text is moved to `sensitive/<d>/`, the shared object is deleted, and the move leaves a tombstone and a `reroute_move` audit row. It is never searchable at the shared path, not even briefly. Rebuild and reconcile run the same step, so they never bring it back.
 - Updating a rerouted note needs `write:sensitive/<d>` and its etag.
 - The classifier is a narrow word list for personal health and personal finance, plus the phone, address, and date-of-birth patterns. Engineering prose such as "tech debt", "error budget", or "diagnose the bug" stays where it was written. Card, account, and routing numbers are not signals.
-- The legacy own PII journal, `bots/<a>/journal-sensitive/`, is still a sensitive folder its owner can read. New flagged entries go to `sensitive/restricted/journal/<agent>/`.
+- An update keeps a note's or fact's stored domain and sensitivity: it cannot drop a tag or lower them (a different domain is 400), and the caller must be allowed to write the note as it is stored.
 
 Sensitive folders are `domains/<sensitive d>/`, `sensitive/<d>/`, and `bots/<a>/journal-sensitive/`. A write already in one is never rerouted.
 
@@ -75,9 +78,12 @@ pnpm test
 - `test/spec.test.ts`: T-01 through T-12. T-02 and T-03 are retired as filter tests and now check that key-like strings, card numbers, and account numbers are stored as written. T-06 is the 100-run CI soak of 7 parallel appends. The run ends with **T-09 PARTIAL**: full-text search after forget is covered and vector deletion is deferred to M2. T-10, T-13, and T-14 are skipped.
 - `test/reroute.test.ts`: T-15 rerouting for notes, facts, journals, moves on update, outside edits, rebuild and reconcile, and the filter-removal smoke with a log check.
 - `test/jobs.test.ts`: T-12 and T-17 paged jobs, writes during a job, resume after eviction, the cron, 202 on a write timeout, and idempotency keys.
-- `test/quarantine.test.ts`: T-16 quarantine erase.
+- `test/quarantine.test.ts`: T-16 quarantine erase, including a quarantine left by an outside edit with its `inbox/quarantine.md` alert block.
 - `test/limits.test.ts`: T-18 size limits on REST and `/mcp`.
 - `test/hardening.test.ts`: T-19 and the review fixes, plus `VAULT_TZ`.
+- `test/idempotency.test.ts`: T-08 on all four writes over REST and MCP, and L5 replays after a rebuild from R2 alone.
+- `test/oversize.test.ts`: T-17 oversize files on outside edits, reads, search, list, jobs, and appends.
+- `test/fixes.test.ts`, `test/summary.test.ts`, `test/gaps.test.ts`: the full review's remaining fixes (F11-F25, F33), the summary, and the PR #3 and PR #5 test gaps.
 - `test/rebuild.test.ts`: a rebuild of about 150 notes as a paged job, with bounded D1 and R2 round trips, a rebuild after D1 lost its version, link, and idempotency rows, a failed page, and duplicated files.
 - `test/review.test.ts`, `test/pr2.test.ts`, `test/classify.test.ts`: earlier review regressions and the classifier.
 
@@ -107,7 +113,16 @@ pnpm exec wrangler secret put JOURNAL_MAC_KEY --config wrangler.jsonc
 pnpm exec wrangler deploy --config wrangler.jsonc --var GIT_SHA:$(git rev-parse HEAD)
 ```
 
-`TOKEN_PEPPER`, `ADMIN_TOKEN_HASH`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY` are all required. `AUDIT_KEY` keys the HMAC-SHA256 `content_hash` on every audit row and tombstone; without it those hashes are left empty. `GET /v1/health` returns `version` and `git_sha` from the `GIT_SHA` var, plus `vault_tz`. Pass the `--var` on every production deploy so the running build can be checked against a commit.
+All four secrets are required. A deploy missing one answers every request with 500 `misconfigured` naming it, rather than writing rows it cannot hash or sign.
+
+| Secret | Purpose |
+| --- | --- |
+| `TOKEN_PEPPER` | Pepper for bearer-token hashes: the stored value is `sha256(pepper \|\| token)`. Rotating it invalidates every token, the admin token included. |
+| `ADMIN_TOKEN_HASH` | The hash of the admin token, made with `pnpm hash-token`. Only that token is admin. |
+| `AUDIT_KEY` | Keys the HMAC-SHA256 `content_hash` of the content of every write in the audit log, and of tombstones, so a hash cannot be checked against a guessed text. |
+| `JOURNAL_MAC_KEY` | Signs journal entry markers, including the idempotency marker. Rebuild only restores entries and idempotency rows whose MAC verifies. |
+
+`GET /v1/health` answers `{ status, service }` to anyone. A caller with a valid token also gets `version` and `git_sha` from the `GIT_SHA` var, plus `vault_tz`, so check a deploy with a token. Pass the `--var` on every production deploy so the running build can be checked against a commit.
 
 Bootstrap the vault documents and mint the first agent tokens:
 
@@ -131,19 +146,20 @@ Copy `wrangler.example.jsonc` when you create an environment. Leave the tracked 
 
 Plain vars: `VAULT_PREFIX`, `VAULT_TZ`, `SENSITIVE_DOMAINS`, `ORDINARY_DOMAINS`, `ENVIRONMENT`, `RATE_LIMIT_WRITES_PER_MIN`, `RATE_LIMIT_READS_PER_MIN`, `E2E_CLEANUP_ENABLED`, `DEPLOY_ENV`, `VAULT_BUCKET`, `DB_NAME`, `WORKER_NAME`, `GIT_SHA`. Production is any deploy that is not a verified staging deploy, or one that sets `ENVIRONMENT=production`.
 
-`JOURNAL_MAC_KEY` signs journal entries. Rotating it makes existing entries fail verification on the next rebuild, so keep the old key until those files are rewritten. Rotating `TOKEN_PEPPER` invalidates every token, including the admin token. Revocation takes effect within 10 seconds.
+`JOURNAL_MAC_KEY` signs journal entries and their idempotency markers. Rotating it makes existing entries fail verification on the next rebuild, so keep the old key until those files are rewritten. Rotating `TOKEN_PEPPER` invalidates every token, including the admin token. Revocation takes effect within 10 seconds. A reviewer token expires after 30 days; any mint can pass `ttl_days` (1-365), and the reply carries `expires_at`.
 
 ### Upgrading a deployed vault to this release
 
-1. Apply migrations `0003_drop_policy_terms.sql` and `0004_jobs_and_reroute.sql` with `pnpm exec wrangler d1 migrations apply <db> --remote --config <your config>` before or with the deploy. `0004` adds `notes.index_gen` and `tombstones.moved_to` and `tombstones.path`.
+1. Apply migrations `0003_drop_policy_terms.sql` and `0004_jobs_and_reroute.sql` with `pnpm exec wrangler d1 migrations apply <db> --remote --config <your config>` before or with the deploy. `0004` adds `notes.index_gen`, `tombstones.moved_to`, `tombstones.path`, `idempotency.payload_hash`, and the `oversize_files` table.
 2. Make sure `AUDIT_KEY` is set (`pnpm exec wrangler secret list --config <your config>`). If it is missing, `pnpm exec wrangler secret put AUDIT_KEY --config <your config>`.
 3. Set `ORDINARY_DOMAINS` in your untracked deploy config. Its code default is empty, and a domain in neither list reads as sensitive and refuses writes, so `deals`, `x`, and any other ordinary domain must be listed. `SENSITIVE_DOMAINS` defaults to `health,finance`.
 4. Set `VAULT_TZ` (staging: `America/New_York`). `TZ_DISPLAY` is still read when `VAULT_TZ` is unset, for one release.
 5. Replace the vault copy of `AGENTS.md` with `content/vault/AGENTS.md`. Bootstrap does not overwrite an existing file.
 6. Run the quarantine migration (below). Until it has run, rebuild, reindex, reconcile, and the nightly cron refuse to start while quarantine records exist (409 `migration_required`; the cron skips and audits `reconcile_skipped`).
 7. Re-mint the reviewer token under a fresh agent id. A token whose stored scopes include a raw `admin` string is no longer an admin token: only the admin token is.
-8. The first rebuild re-reads every file and moves any existing non-sensitive file whose text classifies as health, finance, or PII into `sensitive/`, including notes the old classifier flagged in place.
-9. After the erase has run on every environment, a later migration can tighten the `notes.status` CHECK to `active|superseded|forgotten`.
+8. Anything that checks the deploy through `GET /v1/health` must send a token to see `git_sha`.
+9. The first rebuild re-reads every file and moves any existing non-sensitive file whose text classifies as health, finance, or PII into `sensitive/`, including notes the old classifier flagged in place.
+10. After the erase has run on every environment, a later migration can tighten the `notes.status` CHECK to `active|superseded|forgotten`.
 
 ## Admin jobs
 
@@ -154,25 +170,31 @@ Rebuild, reindex, reconcile, and the quarantine erase are paged jobs in the writ
 | `POST /v1/admin/reindex` | `{}` | `reindex` (a rebuild) |
 | `POST /v1/admin/rebuild` | `{}` | `rebuild` |
 | `POST /v1/admin/reconcile` | `{}` | `reconcile` |
-| `POST /v1/admin/jobs` | `{ "kind": "rebuild" \| "reindex" \| "reconcile" \| "quarantine-erase", "dry_run"?, "confirm_count"? }` | as given |
-| `POST /v1/admin/migrations/quarantine-erase` | `{ "dry_run"?: true, "confirm_count"?: N }` | `quarantine-erase` |
-| `POST /v1/admin/migrations/retire-quarantine` | `{ "mode": "report" \| "apply", "confirm_count"?: N }` | alias: report is a dry run |
+| `POST /v1/admin/jobs` | `{ "kind": "rebuild" \| "reindex" \| "reconcile" }` | as given |
+| `POST /v1/admin/migrations/quarantine-erase` | `{ "dry_run"?: true, "confirm_count"?: N }` | `quarantine-erase` (its only route) |
 
-A start answers **202** `{ job_id, kind, status: "queued" }`. Only one job runs at a time: a second start answers **409** `job_running` with the running id in `error.job_id`. `GET /v1/admin/jobs/:id` (admin only; 403 for any other token, 404 for an unknown id) answers `{ job_id, kind, status, phase, dry_run, progress, pages, counts, cursor, errors, error, created_at, started_at, finished_at }`, with `status` one of `queued`, `running`, `done`, `failed`. A page that fails is retried twice, then the job is `failed` with `error` and the phase it reached. Each job audits `<name>_started`, then one row with the counts and duration, or the phase and error (`reindex`, `reconcile`, `quarantine_erase`). The nightly cron starts a reconcile job. `pnpm rebuild` starts a rebuild and polls it for up to ten minutes.
+A start answers **202** `{ job_id, kind, status: "queued" }`. Only one job runs at a time: a second start answers **409** `job_running` with the running id in `error.job_id`. `GET /v1/admin/jobs/:id` (admin only; 403 for any other token, 404 for an unknown id) answers `{ job_id, kind, status, phase, dry_run, progress, pages, counts, cursor, errors, error, created_at, started_at, finished_at }`, with `status` one of `queued`, `running`, `done`, `failed`. A page that fails is retried twice, then the job is `failed` with `error` and the phase it reached. Within a page, each object's etag is checked against D1 under the writer lock, so a key a write touched between pages is read again and never overwritten with older text. Each job audits `<name>_started`, then one row with the counts and duration, or the phase and error (`reindex`, `reconcile`, `quarantine_erase`). The nightly cron starts a reconcile job. `pnpm rebuild` starts a rebuild and polls it for up to ten minutes.
 
 ## Quarantine migration
 
 The old content filter left quarantined notes behind: the original text in the vault object, a stub row with status `quarantined`, history snapshots, `sys/quarantine/*.json` records, and `inbox/quarantine.md`. `POST /v1/admin/migrations/quarantine-erase` hard-erases all of it once.
 
+- `POST /v1/admin/migrations/quarantine-erase` is its only route. There is no alias (`retire-quarantine` is 404), and `/v1/admin/jobs` does not take it.
 - It lists D1 rows with status `quarantined` and every `sys/quarantine/` record, and matches by exact note id or path. For a record whose path has no D1 row, the object at that exact path is erased unless its HMAC under `AUDIT_KEY` shows it changed since. A record that does not parse is counted as an error, never a match, and is deleted.
-- For each match it erases the vault object, `sys/history/<id>/`, and the D1 note, chunks, FTS, links, and version rows, and leaves a tombstone with an HMAC hash and reason `quarantine_retired`. Then it erases `inbox/quarantine.md`. Nothing else is touched: `bots/x/shared/a.md` survives the erase of `shared/a.md`.
-- `{ "dry_run": true }` counts and erases nothing. The job shows counts only: `records`, `quarantined_notes`, `unindexed_matches`, `erased`, `orphans_deleted`, `errors`, `alert_file`, and `total` (`records + quarantined_notes`). `GET /v1/admin/jobs/:id/report` (admin) lists the matched note ids and paths for a human to check.
-- On production, an erase needs `{ "confirm_count": N }` with N equal to the current `total`; otherwise it answers **409** `count_mismatch` with `reasons: ["current_count:<n>"]`. Run the dry run, send the total to a human, then erase with that count. Staging erases without `confirm_count`.
-- When it finishes it sets the writer flag `quarantine_retired_at`. A second run erases 0. From then on, rebuild and reconcile delete stray `sys/quarantine/` records and audit `quarantine_orphans_deleted`. The audit rows carry counts and note ids only.
+- For each match it erases the vault object, `sys/history/<id>/`, and the D1 note, chunks, FTS, links, and version rows, and leaves a tombstone with an HMAC hash and reason `quarantine_erased`. Then it erases `inbox/quarantine.md`, alert blocks included. Nothing else is touched: `bots/x/shared/a.md` survives the erase of `shared/a.md`.
+- `{ "dry_run": true }` is allowed in every environment. It counts and erases nothing. The job shows counts only: `records`, `quarantined_notes`, `unindexed_matches`, `erased`, `orphans_deleted`, `errors`, `alert_file`, and `total` (`records + quarantined_notes`). `GET /v1/admin/jobs/:id/report` (admin) lists the matched note ids and paths for a human to check.
+- On production, the erase runs only with `{ "confirm_count": N }` where N is the dry run's `counts.total`. A wrong count answers **409** `confirm_count_mismatch`, and a missing one **400** `invalid` with reason `confirm_count_required`; both carry `actual_count`, and neither is ever 403. Run the dry run, send the total to a human, then erase with that count. Staging erases without `confirm_count`.
+- Until the erase has run, a quarantined row stays exactly as it is: no outside edit or delete, reconcile, replay, or rebuild indexes its file again or makes it active (an outside edit is audited as `quarantined_skip`).
+- When it finishes it sets the writer flag `quarantine_erased_at`. A second run erases 0. From then on, rebuild and reconcile delete stray `sys/quarantine/` records and audit `quarantine_orphans_deleted`. The audit rows carry counts and note ids only.
 
 ## Idempotency and timeouts
 
-Note PUT, fact upsert, journal append, and forget accept an `Idempotency-Key` header or an `idempotency_key` body field (or MCP argument), `[A-Za-z0-9_.:-]{1,64}`. If both are sent and differ, the write answers 400. A retry with the same key from the same agent returns the stored result, including a reroute's 201, and writes nothing. Keys are kept for 7 days, written into the file (journal markers and `vault_idempotency` frontmatter), and restored by rebuild.
+Note PUT, fact upsert, journal append, and forget take an idempotency key, `[A-Za-z0-9_.:-]{1,64}`, kept per agent for 7 days with a hash of the canonical payload (the operation and its fields, without the key).
+
+- **REST** takes the `Idempotency-Key` header or the `idempotency_key` body field. Both at once must be equal; if they differ the write answers **400** `idempotency_key_conflict` and writes nothing.
+- **MCP** takes only the `idempotency_key` tool argument and ignores the header, since one `/mcp` request can carry several tool calls.
+- The same key with the same payload replays the original reply (status and `data`, including a reroute's 201) under a new `request_id`, and writes nothing. The same key with any other payload answers **422** `idempotency_key_reused` and writes nothing. A key whose write failed may be retried with a corrected payload.
+- **Rebuild restores keys (L5).** Notes and facts carry `vault_idempotency`, `vault_idempotency_hash`, `vault_outcome`, `vault_rerouted`, and `vault_created_at` in frontmatter; a journal entry's idempotency marker carries the key and payload hash under a `JOURNAL_MAC_KEY` MAC; a keyed forget leaves its key and hash in the stub. A rebuild from R2 alone restores the rows still inside the 7-day window and each note's `created_at`, so a replay afterwards returns the original reply. A journal append answers `{ entry_id, path, block_ref }` (plus the reroute fields), without the day file's etag, so that reply is restored exactly.
 
 Ordinary writes answer within 25 seconds. A write still running then answers **202** `{ pending: true, operation_id }` and keeps running; it is not repeated. `GET /v1/operations/:id` (the writing agent or the admin token; 7 days) answers `{ operation_id, status: "pending" | "done", http_status, result, error }`. A retry with the same idempotency key while the write is running gets the same `operation_id`.
 
@@ -181,14 +203,16 @@ Ordinary writes answer within 25 seconds. A write still running then answers **2
 Both limits answer **413** `payload_too_large` with a `limit` tag in the error: `{ "ok": false, "error": { "code": "payload_too_large", "limit": "request" | "content" | "file", ... }, "request_id": ... }`.
 
 - `limit: "request"`: the whole HTTP request, JSON envelope and MCP framing included, is over 256,000 bytes. It is checked first, on raw bytes, before authentication or any parse. A declared `Content-Length` over the cap is refused unread, and a chunked body is counted as it streams and cancelled when it passes the cap. So when both limits are over, the answer is `request`.
-- `limit: "content"`: a note body is over 200,000 bytes of UTF-8 after JSON decoding (200,000 is accepted, 200,001 is not).
-- `limit: "file"`: a stored file would pass 1,900,000 bytes, which only an append target such as a journal day file can reach. An outside object over that size is skipped and audited, not retried.
+- `limit: "content"`: a note body or fact statement is over 200,000 bytes of UTF-8 after JSON decoding (200,000 is accepted, 200,001 is not). It is checked before the schema.
+- `limit: "file"`: a stored file would pass 1,900,000 bytes, which only an append target such as a journal day file can reach.
+
+**Oversize files.** An object over 1,900,000 bytes, from an outside edit or found by a rebuild or reconcile, is not indexed, not deleted, and not served. Its index status is `oversize`: the `oversize_files` table keeps its path and size only, and a row the path had before keeps its history but loses its chunks, links, and etag. Reads by path or id and history answer 413 `limit: "file"` to a caller who could read the path (404 to anyone else), search and list skip it, writes to it answer 413 `file`, and one audit row (`oversize`, path and bytes, no content) records each object version. Jobs never load it, count it in `counts.oversize`, and carry on with their pages. Shrinking the file in Obsidian lets the next event or job index it normally.
 
 The rules are the same on REST and `/mcp`, where the 413 is an HTTP 413, comes before rate-limit parsing, and is not charged to the rate limit. Schema limits stay **400**: fact statement 2,000 characters, journal body 8,000, title 120, query 1,000.
 
 ## Time zone
 
-`VAULT_TZ` is an IANA zone name; the code default is `UTC`, and staging uses `America/New_York`. Journal day files (`journal/YYYY/MM/YYYY-MM-DD.md` and the sensitive day files) and heading times follow it, daylight saving included, and headings carry the zone abbreviation, for example `## 12:00 EDT · agent · title`. An unknown zone answers 500 `misconfigured` rather than filing an entry on the wrong day. `GET /v1/health` and `GET /v1/whoami` report `vault_tz`.
+`VAULT_TZ` is an IANA zone name; the code default is `UTC`, and staging uses `America/New_York`. `TZ_DISPLAY` is read as a deprecated alias for one release when `VAULT_TZ` is unset. Journal day files (`journal/YYYY/MM/YYYY-MM-DD.md` and the flat sensitive day files) and heading times follow it, daylight saving included, and headings carry the zone abbreviation, for example `## 12:00 EDT · agent · title`. An unknown zone answers 500 `misconfigured` rather than filing an entry on the wrong day. `GET /v1/whoami` reports `vault_tz`, and so does `GET /v1/health` for a caller with a token.
 
 ## Scopes
 
@@ -204,21 +228,24 @@ A folder under `domains/<name>/` is that domain. A `domain` field that disagrees
 
 The same matrix is in `examples/scopes.example.json`. Mint checks scope grammar and refuses a raw `admin` scope, any scope naming `restricted`, and unsafe prefixes. It refuses reserved agent ids: `admin`, `owner`, `operator`, `system`, `sys`, `shared`, `external`, `replay`, `rebuild`, `reconcile`, `indexer`, `migration`, `hiveattic`, `restricted`, and `sensitive`. Only the admin token is admin. `read:domain/*` expands to ordinary domains only and `read:sensitive/*` to sensitive domains only. A `domains/<d>/` folder needs `read:domain/<d>` and, for a sensitive domain, `read:sensitive/<d>`; `sensitive/<d>/` needs `read:sensitive/<d>`. A write that declares a sensitive domain, including into the caller's own folder, needs `write:sensitive/<domain>`. Summary scopes see summary paths only.
 
-`forget` on append-only and server-managed files is admin-only (400 `forget_protected_path`): `journal/**`, `bots/*/journal/**`, `bots/*/journal-sensitive/**`, `sensitive/*/journal/**`, `shared/decisions.md`, `inbox/**`, `profile/summary.md`, `AGENTS.md`, and `README.md`. Appends to a protected day file keep working. Journal and fact tags cannot contain a newline, `·`, or `^` (400).
+`forget` on append-only and server-managed files is admin-only (400 `forget_protected_path`): `journal/**`, `bots/*/journal/**`, `bots/*/journal-sensitive/**`, `sensitive/*/journal/**`, `shared/decisions.md`, `inbox/**`, `profile/summary.md`, `AGENTS.md`, and `README.md`. Appends to a protected day file keep working. Forget resolves the note the way the writer does (id first), checks write access against the note's stored path, domain, and sensitivity, answers 400 when `path` and `id` name different notes, and the writer checks all of it again. A path in an unclassified domain is 400 `unclassified_domain`. Journal and fact tags cannot contain a newline, `·`, or `^` (400), and journal bodies are escaped so a line cannot forge a heading, a `Tags:` line, or a server marker.
 
 A non-admin `audit:read` token sees only rows for paths it can read and never a reroute row, and `?path=` is admin-only.
 
 ## Facts and journals
 
-When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`. `profile/summary.md` lists active shared facts that are normal and carry no domain tag. A forget stub carries no caller text; the reason stays in the tombstone row.
+When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`. `profile/summary.md` lists active shared facts that are normal and carry no domain tag. It is regenerated when a shared fact is forgotten, purged, erased, deleted outside, or moved, and a purge also drops the summary's earlier snapshots, so no forgotten, purged, moved, or tagged statement shows through it. A forget stub carries no caller text; the reason stays in the tombstone row.
 
-An outside delete, or a reconcile that finds the object missing, forgets the note like the API does: readers get a stub without the body, and the last indexed body stays in history for the admin token. An outside create or copy gets its `vault_id` written into its frontmatter, so a rebuild keeps the same id.
+Only active notes are served to non-admin callers: a forgotten, moved, or superseded note is 404 by path, id, and history. The admin token reads the stub. An outside delete, or a reconcile that finds the object missing, forgets the note like the API does, and the last indexed body stays in history for the admin token. A delete event for a key that exists again is ignored. An outside create or copy gets its `vault_id` written into its frontmatter, so a rebuild keeps the same id. A forgotten note's path, a forgotten fact's key, and a day file the admin forgot can be written again; the new write gets a new id and the forgotten row keeps its admin-only history.
+
+Every version is an immutable copy under `sys/history/<id>/`, labelled with the write that produced it, so history shows each version's own text and `POST /v1/admin/restore` restores it. Journal day files keep no copies.
 
 ## Live end-to-end suite
 
 The live suite runs against staging only and fails closed. Copy `.e2e.env.example` to a file outside the checkout, export it, and run `pnpm e2e`.
 
-- It reads only `HIVEATTIC_STAGING_*` names for its target and tokens, never falls back to an unprefixed name, and refuses to start if `HIVEATTIC_BASE_URL`, `HIVEATTIC_ADMIN_TOKEN`, `HIVEATTIC_REVIEWER_TOKEN`, or `HIVEATTIC_E2E_READ_ONLY` is set.
+- It reads only `HIVEATTIC_STAGING_*` names for its target and tokens, never falls back to an unprefixed name, and refuses to start if `HIVEATTIC_BASE_URL`, `HIVEATTIC_ADMIN_TOKEN`, `HIVEATTIC_E2E_READ_ONLY`, `HIVEATTIC_E2E_MODE`, or `HIVEATTIC_CF_API` is set. `HIVEATTIC_REVIEWER_TOKEN` is refused too, unless it is the same value as `HIVEATTIC_STAGING_REVIEWER_TOKEN` (the run plan maps one onto the other); it is never read.
+- The Cloudflare API token, when set, goes only to `https://api.cloudflare.com`.
 - `HIVEATTIC_STAGING_BASE_URL` must be the `hiveattic-staging` workers.dev host over https. It then checks `GET /v1/whoami` for `deploy_env: staging` and `staging_resources: true` before any write.
 - T-11 needs an R2 S3 key scoped to the staging bucket. `R2_BUCKET` has no default, and every S3 put, copy, and delete checks that it is a `hiveattic-staging-*` bucket first.
 - T-CLEANUP and the final cleanup only run against the accepted staging URL. Production is never contacted.
@@ -235,13 +262,13 @@ The suite writes only namespaced paths and tags, revokes every token it mints, a
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm mint-reviewer architect-reviewer
 ```
 
-The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read` or any summary scope. Finance and health notes, `sensitive/` files, summaries, reads by id, history, and shared notes tagged with those domains return 404 and stay out of search, and `GET /v1/admin/audit` returns 403.
+The token is printed once and expires after 30 days. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read` or any summary scope. Finance and health notes, `sensitive/` files, summaries, reads by id, history, and shared notes tagged with those domains return 404 and stay out of search, and `GET /v1/admin/audit` returns 403.
 
 Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before the preset dropped `audit:read` and the summary scopes keeps its old scopes. Revoke it and mint a new one under a fresh agent id.
 
 ## API
 
-Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(pepper || token)`. `GET /v1/health` is the only unauthenticated route.
+Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(pepper || token)`. `GET /v1/health` is the only unauthenticated route, and it shows the build only to a caller with a token.
 
 | Method | Path | Tool |
 | --- | --- | --- |
@@ -260,7 +287,7 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 
 Admin routes, all requiring the admin token (403 for any other token): bootstrap, token mint and revoke, the job and migration routes above, journal order, restore, purge, cleanup, audit read, and append-only verification. `/v1/admin/policy` and `/v1/admin/quarantine` are gone (404). The server always assigns `request_id`; a caller `x-request-id` is echoed as `client_request_id`.
 
-Errors are 400 `invalid`, `unclassified_domain`, `forget_protected_path`; 401 `unauthorized`; 403 `forbidden_scope`; 404 `not_found`; 409 `conflict_etag`, `job_running`, `migration_required`, `count_mismatch`; 413 `payload_too_large`; 429 `rate_limited`; and 500 `misconfigured`. No error depends on what the content says. Writes to a forgotten note return 409.
+Errors are 400 `invalid`, `unclassified_domain`, `forget_protected_path`, `idempotency_key_conflict`; 401 `unauthorized`; 403 `forbidden_scope`; 404 `not_found`; 409 `conflict_etag`, `job_running`, `migration_required`, `confirm_count_mismatch`; 413 `payload_too_large`; 422 `idempotency_key_reused`; 429 `rate_limited`; and 500 `misconfigured`. No error depends on what the content says.
 
 ## Bindings
 
