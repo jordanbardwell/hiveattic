@@ -174,21 +174,30 @@ export async function forgetNote(
 ): Promise<Record<string, unknown>> {
   if (!input.path && !input.id) throw new VaultError("invalid", "path or id is required");
   const path = input.path ? assertVaultPath(input.path) : undefined;
-  const note = path
-    ? await env.DB.prepare("SELECT owner, domain, sensitivity, path FROM notes WHERE path = ?")
-        .bind(path)
-        .first<{ owner: string; domain: string | null; sensitivity: string; path: string }>()
-    : await env.DB.prepare("SELECT owner, domain, sensitivity, path FROM notes WHERE id = ?")
-        .bind(input.id ?? "")
-        .first<{ owner: string; domain: string | null; sensitivity: string; path: string }>();
+  // Resolve the target the same way the writer does (id wins), then authorize against that note.
+  const note = input.id
+    ? await env.DB.prepare("SELECT id, owner, domain, sensitivity, path FROM notes WHERE id = ?")
+        .bind(input.id)
+        .first<{ id: string; owner: string; domain: string | null; sensitivity: string; path: string }>()
+    : await env.DB.prepare("SELECT id, owner, domain, sensitivity, path FROM notes WHERE path = ?")
+        .bind(path ?? "")
+        .first<{ id: string; owner: string; domain: string | null; sensitivity: string; path: string }>();
   if (note) {
     const sensitivity = note.sensitivity === "sensitive" || note.domain === "health" || note.domain === "finance" ? "sensitive" : "normal";
     assertCanWrite(session.access, note.path, sensitivity, note.domain);
+    if (path && note.path !== path) throw new VaultError("invalid", "path and id refer to different notes");
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
   }
   await rejectFiltered(env, session, path ?? "forget.md", input.reason, "forget");
-  return perform(env, { kind: "forget", actor: actor(session), path, id: input.id, reason: input.reason });
+  return perform(env, {
+    kind: "forget",
+    actor: actor(session),
+    access: session.access,
+    path: note?.path ?? path,
+    id: note?.id ?? input.id,
+    reason: input.reason,
+  });
 }
 
 export async function bootstrap(env: Env, session: Session): Promise<Record<string, unknown>> {
