@@ -1,6 +1,6 @@
 # HiveAttic
 
-HiveAttic is a shared memory vault for agents. Markdown in R2 is the source of truth. D1 is a rebuildable keyword index. A single Durable Object serializes writes.
+HiveAttic is a shared memory vault for agents. Markdown in R2 is the source of truth. D1 is a rebuildable keyword index. A single Durable Object serializes writes and runs the long admin jobs.
 
 This repository is the Milestone 1 vault: REST and MCP, bearer tokens and scopes, an append-only audit log, and a queue consumer for R2 object notifications. Semantic search, OAuth, and the cost load test are later milestones.
 
@@ -8,11 +8,31 @@ The `database_id` in `wrangler.jsonc` is a placeholder. No Cloudflare account id
 
 ## Content is not filtered
 
-HiveAttic does not filter content. It stores what a caller with the right scope sends, through the API or as an outside edit in R2. There is no secret, card-number, account-number, government-id, or employer filter, no quarantine, and no write is rejected for what it says.
+HiveAttic does not filter content. It stores what a caller with the right scope sends, through the API or as an outside edit in R2. There is no secret, card-number, account-number, government-id, or employer filter, no quarantine, and no write is refused for what it says.
 
-Bots must never write secrets: no passwords, API keys, tokens, private keys, card numbers, bank or brokerage account or routing numbers, or government IDs. Nothing on the server catches them. Anything written is indexed for search, copied into `sys/history/` on the next change, and readable by every token whose scopes cover that path. Removing it takes an admin purge.
+Bots must never write secrets: no passwords, API keys, tokens, private keys, card numbers, bank or brokerage account or routing numbers, or government IDs, and no employer work content. Nothing on the server catches them. Anything written is indexed for search, copied into `sys/history/` on the next change, and readable by every token whose scopes cover that path. Removing it takes an admin purge. `AGENTS.md` (the repo copy and the vault copy in `content/vault/AGENTS.md`, which bootstrap seeds) says the same thing to bots: guidance only, and the responsibility is theirs.
 
-Access is controlled by scopes, not content. Sensitivity comes from the domain folder or from an explicit `sensitivity: "sensitive"` on the write. The server does not read the text to decide it. Paths are still checked for shape: vault-relative markdown, a safe character set, no `..`, no `//`, no backslash, at most 200 characters, and nothing under `sys/`.
+## Sensitive text is rerouted
+
+The folder decides who can read a file, and the server picks the folder from the text. A write whose text reads as health, finance, or other personal detail, at a path that is not already sensitive, is stored under `sensitive/<d>/` at the same relative path instead. Nothing is refused.
+
+| Text | Stored under | Readable with |
+| --- | --- | --- |
+| Health (a flu shot, a prescription, a diagnosis) | `sensitive/health/<path>` | `read:sensitive/health` |
+| Finance (a budget, a salary, a mortgage, a tax return) | `sensitive/finance/<path>` | `read:sensitive/finance` |
+| Health and finance together, PII alone (phone number, street address, date of birth), or `sensitivity: "sensitive"` with no domain | `sensitive/restricted/<path>` | the admin token only |
+
+- A rerouted write answers **201** with `{ path, rerouted: true, sensitive_domain }` plus the usual fields. `path` is where the text went. The path the caller named gets nothing.
+- The reroute works without `write:sensitive/<d>`. Reading the result back needs `read:sensitive/<d>`, even for the writer. No scope reaches `sensitive/restricted/`: not `read:all`, not `read:sensitive/*`, and mint refuses any scope that names `restricted`.
+- A caller that declares a sensitive `domain` still needs `write:sensitive/<d>`, as before. Frontmatter, `extra`, `sensitivity: "normal"`, or an ordinary domain cannot lower what the text classifies as. The classifier reads the body and the caller's frontmatter, not server fields such as `source` or `owner`.
+- **Shared journal entries.** A journal entry (shared, own, or decisions) whose text is sensitive is accepted and appended to the writer's day file under `sensitive/<d>/journal/<agent>/<YYYY-MM-DD>.md` (date in `VAULT_TZ`). The requested day file gets no entry and no placeholder, so a `read:shared` reader sees nothing of it in the file, search, history, or `journal-order`. The audit row is `journal_reroute` with `detail.requested_path`.
+- **An update that adds sensitive text moves the note.** The note continues under a new `vault_id` at `sensitive/<d>/<path>`. The old path is tombstoned like a forget, with a stub body and reason `removed`; its history keeps only the earlier versions, and the sensitive version is never stored under the old id. Readers other than the admin token get 404 at the old path, with no pointer to the new one. The old-to-new link is kept in `tombstones.moved_to`, which only the admin reads. Facts move the same way, and `profile/summary.md` drops them.
+- **Outside edits.** A file saved under `shared/` (or any non-sensitive path) through R2 or Obsidian is classified before it is indexed. Sensitive text is moved to `sensitive/<d>/`, the shared object is deleted, and the move leaves a tombstone and a `reroute_move` audit row. It is never searchable at the shared path, not even briefly. Rebuild and reconcile run the same step, so they never bring it back.
+- Updating a rerouted note needs `write:sensitive/<d>` and its etag.
+- The classifier is a narrow word list for personal health and personal finance, plus the phone, address, and date-of-birth patterns. Engineering prose such as "tech debt", "error budget", or "diagnose the bug" stays where it was written. Card, account, and routing numbers are not signals.
+- The legacy own PII journal, `bots/<a>/journal-sensitive/`, is still a sensitive folder its owner can read. New flagged entries go to `sensitive/restricted/journal/<agent>/`.
+
+Sensitive folders are `domains/<sensitive d>/`, `sensitive/<d>/`, and `bots/<a>/journal-sensitive/`. A write already in one is never rerouted.
 
 ## Layout
 
@@ -20,7 +40,7 @@ Access is controlled by scopes, not content. Sensitivity comes from the domain f
 - `migrations/` D1 schema. Add a new file for each change; never edit an applied migration
 - `content/vault/` generic `AGENTS.md` and `README.md` seeded into the bucket
 - `test/` acceptance tests named by spec id
-- `e2e/run.ts` live suite against a deployed URL
+- `e2e/run.ts` live suite against staging
 - `scripts/` token hash, pilot provisioning, reviewer mint, and rebuild
 
 ## Local setup
@@ -30,93 +50,149 @@ pnpm install
 cp .dev.vars.example .dev.vars
 ```
 
-Put a long random string in `TOKEN_PEPPER`. Hash the admin token with the same pepper and put the hex digest in `ADMIN_TOKEN_HASH`:
+Put long random strings in `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`. Hash the admin token with the same pepper and put the hex digest in `ADMIN_TOKEN_HASH`:
 
 ```sh
 printf '%s' 'the-admin-token' | TOKEN_PEPPER='the-pepper' pnpm hash-token
 ```
 
-`pnpm dev` starts Wrangler against local D1 and R2. Apply migrations locally with `pnpm exec wrangler d1 migrations apply hiveattic-index --local` before the first request, then `POST /v1/admin/bootstrap`.
+Apply migrations locally before the first request, start the dev server, then `POST /v1/admin/bootstrap`:
+
+```sh
+pnpm exec wrangler d1 migrations apply hiveattic-index --local --config wrangler.jsonc
+pnpm dev
+```
 
 ## Tests
 
 ```sh
-pnpm test
 pnpm typecheck
+pnpm test
 ```
 
-`pnpm test` runs T-01 through T-09 (there is no T-04), the keyword parts of T-11, and the D1 rebuild parts of T-12. T-02 and T-03 check that a key-like string, a card number, and an account number are accepted and stored as written. The run ends with an explicit line: **T-09 PARTIAL**. Full-text search after forget is covered (the read is a stub, search is empty, history remains, and chunk ids are queued). Vector deletion is deferred to M2. T-10, T-13, and T-14 are skipped because they belong to later milestones.
+`pnpm typecheck` covers `src/`, `test/`, `e2e/`, and `scripts/`. `pnpm test` first runs `e2e/dry-run.check.ts`: the live harness against a local mock, every refusal the harness must make before it sends a request, static checks on the harness, the docs, and `.e2e.env.example`, and the T-20 domain check (every domain the repo names must be classified in the deploy configs, and no config lists one as both). Then it runs the vitest suites:
 
-`test/rebuild.test.ts` rebuilds a vault of about 150 notes with history, journals, decisions, and a forgotten note, and counts the writer's D1 and R2 calls. It also checks the reindex audit rows, a rebuild from R2 alone, a failed rebuild that must leave the live index untouched, and duplicated files that share a `vault_id` or a fact key.
+- `test/spec.test.ts`: T-01 through T-12. T-02 and T-03 are retired as filter tests and now check that key-like strings, card numbers, and account numbers are stored as written. T-06 is the 100-run CI soak of 7 parallel appends. The run ends with **T-09 PARTIAL**: full-text search after forget is covered and vector deletion is deferred to M2. T-10, T-13, and T-14 are skipped.
+- `test/reroute.test.ts`: T-15 rerouting for notes, facts, journals, moves on update, outside edits, rebuild and reconcile, and the filter-removal smoke with a log check.
+- `test/jobs.test.ts`: T-12 and T-17 paged jobs, writes during a job, resume after eviction, the cron, 202 on a write timeout, and idempotency keys.
+- `test/quarantine.test.ts`: T-16 quarantine erase.
+- `test/limits.test.ts`: T-18 size limits on REST and `/mcp`.
+- `test/hardening.test.ts`: T-19 and the review fixes, plus `VAULT_TZ`.
+- `test/rebuild.test.ts`: a rebuild of about 150 notes as a paged job, with bounded D1 and R2 round trips, a rebuild after D1 lost its version, link, and idempotency rows, a failed page, and duplicated files.
+- `test/review.test.ts`, `test/pr2.test.ts`, `test/classify.test.ts`: earlier review regressions and the classifier.
+
+CI (`.github/workflows/test.yml`) runs install, typecheck, and the full suite on every push and pull request. It uses no secrets and deploys nothing.
 
 ## Deploy
 
-Create the resources, replace the placeholder `database_id`, then deploy. These commands are the runbook. They are not run by CI.
+Create the resources, replace the placeholder `database_id`, then deploy. These commands are the runbook. They are not run by CI. Every command names its config file: `wrangler.jsonc` here, or your copy of `wrangler.staging.example.jsonc` for staging.
 
 ```sh
-pnpm exec wrangler d1 create hiveattic-index
-pnpm exec wrangler r2 bucket create hiveattic-vault
-pnpm exec wrangler queues create hiveattic-index-jobs
-pnpm exec wrangler queues create hiveattic-index-dlq
-pnpm exec wrangler r2 bucket notification create hiveattic-vault \
-  --event-type object-create \
-  --event-type object-delete \
-  --prefix vault/ \
-  --queue hiveattic-index-jobs
+pnpm exec wrangler d1 create hiveattic-index --config wrangler.jsonc
+pnpm exec wrangler r2 bucket create hiveattic-vault --config wrangler.jsonc
+pnpm exec wrangler queues create hiveattic-index-jobs --config wrangler.jsonc
+pnpm exec wrangler queues create hiveattic-index-dlq --config wrangler.jsonc
+pnpm exec wrangler r2 bucket notification create hiveattic-vault --event-type object-create --event-type object-delete --prefix vault/ --queue hiveattic-index-jobs --config wrangler.jsonc
 ```
 
-Put the new D1 id into `wrangler.jsonc` at `d1_databases[0].database_id`.
+Put the new D1 id into `wrangler.jsonc` at `d1_databases[0].database_id`. Then apply the migrations, set the four required secrets, and deploy:
 
 ```sh
-pnpm exec wrangler d1 migrations apply hiveattic-index --remote
+pnpm exec wrangler d1 migrations apply hiveattic-index --remote --config wrangler.jsonc
 printf '%s' "$ADMIN_TOKEN" | TOKEN_PEPPER="$TOKEN_PEPPER" pnpm hash-token
-pnpm exec wrangler secret put TOKEN_PEPPER
-pnpm exec wrangler secret put ADMIN_TOKEN_HASH
-pnpm exec wrangler secret put JOURNAL_MAC_KEY
-pnpm exec wrangler deploy --var GIT_SHA:$(git rev-parse HEAD)
+pnpm exec wrangler secret put TOKEN_PEPPER --config wrangler.jsonc
+pnpm exec wrangler secret put ADMIN_TOKEN_HASH --config wrangler.jsonc
+pnpm exec wrangler secret put AUDIT_KEY --config wrangler.jsonc
+pnpm exec wrangler secret put JOURNAL_MAC_KEY --config wrangler.jsonc
+pnpm exec wrangler deploy --config wrangler.jsonc --var GIT_SHA:$(git rev-parse HEAD)
 ```
 
-`GET /v1/health` returns `version` and `git_sha` from the `GIT_SHA` var. Pass that `--var` on every production deploy so the running build can be checked against a commit. The tracked config leaves `GIT_SHA` empty, and a deploy that omits the flag publishes an empty value.
+`TOKEN_PEPPER`, `ADMIN_TOKEN_HASH`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY` are all required. `AUDIT_KEY` keys the HMAC-SHA256 `content_hash` on every audit row and tombstone; without it those hashes are left empty. `GET /v1/health` returns `version` and `git_sha` from the `GIT_SHA` var, plus `vault_tz`. Pass the `--var` on every production deploy so the running build can be checked against a commit.
 
-The Worker URL is the `workers.dev` host printed by deploy, or a custom hostname you attach later. Bootstrap the vault documents and mint the first agent tokens:
+Bootstrap the vault documents and mint the first agent tokens:
 
 ```sh
-curl -X POST "$HIVEATTIC_BASE_URL/v1/admin/bootstrap" \
-  -H "authorization: Bearer $HIVEATTIC_ADMIN_TOKEN"
+curl -X POST "$HIVEATTIC_BASE_URL/v1/admin/bootstrap" -H "authorization: Bearer $HIVEATTIC_ADMIN_TOKEN"
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm provision
 ```
 
-`pnpm provision` prints each pilot token once. It does not write tokens to disk.
+`pnpm provision` prints each pilot token once. It does not write tokens to disk. The Durable Object class is created by the `v1` migration during deploy. Set a $10/month budget alert on the Cloudflare account; that alert is account configuration, not a binding in this repo.
 
-The Durable Object class is created by the `v1` migration during deploy. There is no separate create command.
-
-Set a $10/month budget alert on the Cloudflare account. That alert is account configuration, not a binding in this repo.
-
-Production rate limits are 60 writes per minute and 300 reads per minute per token. `0` disables a limit.
-
-The live T-06 case sends 140 journal writes in one window, so a deployed limit of 60 returns `429` before the case finishes. Raise the plain var for the run, then deploy again to restore `60` from `wrangler.jsonc`:
+Production rate limits are 60 writes per minute and 300 reads per minute per token. `0` disables a limit. The live T-06 case sends 140 journal writes in one window. Raising the staging limit for that run is Forge's job, against the staging config only, and Forge restores 60 afterwards:
 
 ```sh
-pnpm exec wrangler deploy --var RATE_LIMIT_WRITES_PER_MIN:10000
-pnpm e2e
-pnpm exec wrangler deploy
+pnpm exec wrangler deploy --config wrangler.staging.jsonc --var RATE_LIMIT_WRITES_PER_MIN:140
+pnpm exec wrangler deploy --config wrangler.staging.jsonc
 ```
 
-`--var` overrides that one key for the deploy and leaves the other bindings in `wrangler.jsonc` in place. Secrets are left in place. A deploy with no `--var` writes `RATE_LIMIT_WRITES_PER_MIN` back to `60`. If the dashboard holds extra plain vars that are absent from this config, add `--keep-vars` to both deploy commands so those vars stay.
+`--var` overrides that one key for the deploy and leaves the other bindings in place. Secrets are left in place. If the dashboard holds extra plain vars that are absent from the config, add `--keep-vars` to both commands.
 
-Set `HIVEATTIC_RATE_LIMIT_WRITES_PER_MIN` to the value you deployed (`0` when the limit is disabled). When that value is greater than zero and below 140, the suite fails T-06 before sending the burst and prints the same commands. A `429` during the burst fails the case the same way.
+Copy `wrangler.example.jsonc` when you create an environment. Leave the tracked `wrangler.jsonc` `database_id` as the placeholder `00000000-0000-0000-0000-000000000001`. Production stays on `workers.dev`: `workers_dev` is true and `wrangler.jsonc` has no routes. Staging is a separate worker, `hiveattic-staging`, with its own D1, R2 bucket, and queue; start from `wrangler.staging.example.jsonc`. Cleanup runs only when `E2E_CLEANUP_ENABLED` is `true`, `DEPLOY_ENV` is `staging`, `VAULT_BUCKET` and `DB_NAME` contain `-staging`, and `WORKER_NAME` contains `staging`. Otherwise `POST /v1/admin/cleanup` returns 404.
 
-Copy `wrangler.example.jsonc` when you create an environment. Leave the tracked `wrangler.jsonc` `database_id` as the placeholder `00000000-0000-0000-0000-000000000001`. Production stays on `workers.dev` for now: `workers_dev` is true and `wrangler.jsonc` has no routes. Attaching `hiveattic.com` is a later step. When that hostname is ready, set `workers_dev` to false and add `{ "pattern": "hiveattic.com", "custom_domain": true }` under `routes`. Staging is a separate worker, `hiveattic-staging`, with its own D1, R2 bucket, and queue. Start from `wrangler.staging.example.jsonc`. Cleanup runs only when `E2E_CLEANUP_ENABLED` is `true`, `DEPLOY_ENV` is `staging`, `VAULT_BUCKET` and `DB_NAME` contain `-staging`, and `WORKER_NAME` contains `staging`. The production config leaves the flag empty and `DEPLOY_ENV` empty, and `POST /v1/admin/cleanup` then returns 404. Turning the flag on by itself is not enough. Mint a staging-only admin token for the architect.
+Plain vars: `VAULT_PREFIX`, `VAULT_TZ`, `SENSITIVE_DOMAINS`, `ORDINARY_DOMAINS`, `ENVIRONMENT`, `RATE_LIMIT_WRITES_PER_MIN`, `RATE_LIMIT_READS_PER_MIN`, `E2E_CLEANUP_ENABLED`, `DEPLOY_ENV`, `VAULT_BUCKET`, `DB_NAME`, `WORKER_NAME`, `GIT_SHA`. Production is any deploy that is not a verified staging deploy, or one that sets `ENVIRONMENT=production`.
 
-The write suite targets `HIVEATTIC_STAGING_BASE_URL` only. It reads `deploy_env` and `staging_resources` from `GET /v1/whoami` and exits before any write when the target is not staging. `HIVEATTIC_E2E_READ_ONLY=1` runs a reviewer smoke against `HIVEATTIC_BASE_URL` and sends no writes.
+`JOURNAL_MAC_KEY` signs journal entries. Rotating it makes existing entries fail verification on the next rebuild, so keep the old key until those files are rewritten. Rotating `TOKEN_PEPPER` invalidates every token, including the admin token. Revocation takes effect within 10 seconds.
 
-`JOURNAL_MAC_KEY` signs journal entries. Rotating it makes existing entries fail verification on the next rebuild, so keep the old key until those files are rewritten. Rotating `TOKEN_PEPPER` invalidates every token, including the admin token, and does not invalidate journal markers. Revocation itself takes effect within 10 seconds: the auth cache is cleared on revoke and entries expire after that interval. Journal appends do not copy the whole day file into `sys/history/`. A full snapshot is kept for rewrites and outside edits.
+### Upgrading a deployed vault to this release
 
-Set `TZ_DISPLAY` to the zone journal headings should use. The default in this repo is `UTC`.
+1. Apply migrations `0003_drop_policy_terms.sql` and `0004_jobs_and_reroute.sql` with `pnpm exec wrangler d1 migrations apply <db> --remote --config <your config>` before or with the deploy. `0004` adds `notes.index_gen` and `tombstones.moved_to` and `tombstones.path`.
+2. Make sure `AUDIT_KEY` is set (`pnpm exec wrangler secret list --config <your config>`). If it is missing, `pnpm exec wrangler secret put AUDIT_KEY --config <your config>`.
+3. Set `ORDINARY_DOMAINS` in your untracked deploy config. Its code default is empty, and a domain in neither list reads as sensitive and refuses writes, so `deals`, `x`, and any other ordinary domain must be listed. `SENSITIVE_DOMAINS` defaults to `health,finance`.
+4. Set `VAULT_TZ` (staging: `America/New_York`). `TZ_DISPLAY` is still read when `VAULT_TZ` is unset, for one release.
+5. Replace the vault copy of `AGENTS.md` with `content/vault/AGENTS.md`. Bootstrap does not overwrite an existing file.
+6. Run the quarantine migration (below). Until it has run, rebuild, reindex, reconcile, and the nightly cron refuse to start while quarantine records exist (409 `migration_required`; the cron skips and audits `reconcile_skipped`).
+7. Re-mint the reviewer token under a fresh agent id. A token whose stored scopes include a raw `admin` string is no longer an admin token: only the admin token is.
+8. The first rebuild re-reads every file and moves any existing non-sensitive file whose text classifies as health, finance, or PII into `sensitive/`, including notes the old classifier flagged in place.
+9. After the erase has run on every environment, a later migration can tighten the `notes.status` CHECK to `active|superseded|forgotten`.
+
+## Admin jobs
+
+Rebuild, reindex, reconcile, and the quarantine erase are paged jobs in the writer Durable Object. Each alarm runs one page (at most 100 R2 objects, about 10 seconds, or 16 MB of text) and holds the writer lock for that page only, so ordinary writes land between pages. The cursor and counts live in Durable Object storage, so a job resumes after an eviction or a deploy. A rebuild stamps `notes.index_gen` with a new generation on every row it reads back from R2 and then sweeps rows left on an older one; there is no up-front wipe, and a row a write touched during the job carries the new generation and stays. It also re-reads history, re-resolves the `links` table (wikilinks and backlinks), restores journal markers, idempotency rows, and `created_at`, and rebuilds the FTS index.
+
+| Start | Body | Kind |
+| --- | --- | --- |
+| `POST /v1/admin/reindex` | `{}` | `reindex` (a rebuild) |
+| `POST /v1/admin/rebuild` | `{}` | `rebuild` |
+| `POST /v1/admin/reconcile` | `{}` | `reconcile` |
+| `POST /v1/admin/jobs` | `{ "kind": "rebuild" \| "reindex" \| "reconcile" \| "quarantine-erase", "dry_run"?, "confirm_count"? }` | as given |
+| `POST /v1/admin/migrations/quarantine-erase` | `{ "dry_run"?: true, "confirm_count"?: N }` | `quarantine-erase` |
+| `POST /v1/admin/migrations/retire-quarantine` | `{ "mode": "report" \| "apply", "confirm_count"?: N }` | alias: report is a dry run |
+
+A start answers **202** `{ job_id, kind, status: "queued" }`. Only one job runs at a time: a second start answers **409** `job_running` with the running id in `error.job_id`. `GET /v1/admin/jobs/:id` (admin only; 403 for any other token, 404 for an unknown id) answers `{ job_id, kind, status, phase, dry_run, progress, pages, counts, cursor, errors, error, created_at, started_at, finished_at }`, with `status` one of `queued`, `running`, `done`, `failed`. A page that fails is retried twice, then the job is `failed` with `error` and the phase it reached. Each job audits `<name>_started`, then one row with the counts and duration, or the phase and error (`reindex`, `reconcile`, `quarantine_erase`). The nightly cron starts a reconcile job. `pnpm rebuild` starts a rebuild and polls it for up to ten minutes.
+
+## Quarantine migration
+
+The old content filter left quarantined notes behind: the original text in the vault object, a stub row with status `quarantined`, history snapshots, `sys/quarantine/*.json` records, and `inbox/quarantine.md`. `POST /v1/admin/migrations/quarantine-erase` hard-erases all of it once.
+
+- It lists D1 rows with status `quarantined` and every `sys/quarantine/` record, and matches by exact note id or path. For a record whose path has no D1 row, the object at that exact path is erased unless its HMAC under `AUDIT_KEY` shows it changed since. A record that does not parse is counted as an error, never a match, and is deleted.
+- For each match it erases the vault object, `sys/history/<id>/`, and the D1 note, chunks, FTS, links, and version rows, and leaves a tombstone with an HMAC hash and reason `quarantine_retired`. Then it erases `inbox/quarantine.md`. Nothing else is touched: `bots/x/shared/a.md` survives the erase of `shared/a.md`.
+- `{ "dry_run": true }` counts and erases nothing. The job shows counts only: `records`, `quarantined_notes`, `unindexed_matches`, `erased`, `orphans_deleted`, `errors`, `alert_file`, and `total` (`records + quarantined_notes`). `GET /v1/admin/jobs/:id/report` (admin) lists the matched note ids and paths for a human to check.
+- On production, an erase needs `{ "confirm_count": N }` with N equal to the current `total`; otherwise it answers **409** `count_mismatch` with `reasons: ["current_count:<n>"]`. Run the dry run, send the total to a human, then erase with that count. Staging erases without `confirm_count`.
+- When it finishes it sets the writer flag `quarantine_retired_at`. A second run erases 0. From then on, rebuild and reconcile delete stray `sys/quarantine/` records and audit `quarantine_orphans_deleted`. The audit rows carry counts and note ids only.
+
+## Idempotency and timeouts
+
+Note PUT, fact upsert, journal append, and forget accept an `Idempotency-Key` header or an `idempotency_key` body field (or MCP argument), `[A-Za-z0-9_.:-]{1,64}`. If both are sent and differ, the write answers 400. A retry with the same key from the same agent returns the stored result, including a reroute's 201, and writes nothing. Keys are kept for 7 days, written into the file (journal markers and `vault_idempotency` frontmatter), and restored by rebuild.
+
+Ordinary writes answer within 25 seconds. A write still running then answers **202** `{ pending: true, operation_id }` and keeps running; it is not repeated. `GET /v1/operations/:id` (the writing agent or the admin token; 7 days) answers `{ operation_id, status: "pending" | "done", http_status, result, error }`. A retry with the same idempotency key while the write is running gets the same `operation_id`.
+
+## Size limits
+
+Both limits answer **413** `payload_too_large` with a `limit` tag in the error: `{ "ok": false, "error": { "code": "payload_too_large", "limit": "request" | "content" | "file", ... }, "request_id": ... }`.
+
+- `limit: "request"`: the whole HTTP request, JSON envelope and MCP framing included, is over 256,000 bytes. It is checked first, on raw bytes, before authentication or any parse. A declared `Content-Length` over the cap is refused unread, and a chunked body is counted as it streams and cancelled when it passes the cap. So when both limits are over, the answer is `request`.
+- `limit: "content"`: a note body is over 200,000 bytes of UTF-8 after JSON decoding (200,000 is accepted, 200,001 is not).
+- `limit: "file"`: a stored file would pass 1,900,000 bytes, which only an append target such as a journal day file can reach. An outside object over that size is skipped and audited, not retried.
+
+The rules are the same on REST and `/mcp`, where the 413 is an HTTP 413, comes before rate-limit parsing, and is not charged to the rate limit. Schema limits stay **400**: fact statement 2,000 characters, journal body 8,000, title 120, query 1,000.
+
+## Time zone
+
+`VAULT_TZ` is an IANA zone name; the code default is `UTC`, and staging uses `America/New_York`. Journal day files (`journal/YYYY/MM/YYYY-MM-DD.md` and the sensitive day files) and heading times follow it, daylight saving included, and headings carry the zone abbreviation, for example `## 12:00 EDT · agent · title`. An unknown zone answers 500 `misconfigured` rather than filing an entry on the wrong day. `GET /v1/health` and `GET /v1/whoami` report `vault_tz`.
 
 ## Scopes
 
-A folder under `domains/<name>/` is that domain. A `domain` field that disagrees with the path is rejected. Sensitive domains are `health` and `finance`. Reading a note the caller cannot see returns 404.
+A folder under `domains/<name>/` is that domain. A `domain` field that disagrees with the path is rejected. Domain classes come from `SENSITIVE_DOMAINS` (default `health,finance`) and `ORDINARY_DOMAINS` (default empty). A domain in neither list is refused on write (400 `unclassified_domain`) and read as sensitive. A deploy that lists a domain in both fails closed (500 `misconfigured`). Reading a note the caller cannot see returns 404.
 
 | Role | Scopes |
 | --- | --- |
@@ -126,57 +202,40 @@ A folder under `domains/<name>/` is that domain. A `domain` field that disagrees
 | reader-x | `read:shared`, `read:own`, `write:own`, `read:domain/x`, `write:domain/x` |
 | shared-writer | `read:shared`, `read:own`, `write:own`, `write:shared` |
 
-The same matrix is in `examples/scopes.example.json`. A write into `health` or `finance`, including a note in the caller's own `bots/<self>/` folder, needs `write:sensitive/<domain>`. Finance read-only cannot write finance anywhere. A sensitive note with no domain needs `write:sensitive/pii`, except the owner's own `journal-sensitive` file, which `write:own` can append. Summary scopes see summary paths only. `read:domain/*` does not grant `read:sensitive/finance`.
+The same matrix is in `examples/scopes.example.json`. Mint checks scope grammar and refuses a raw `admin` scope, any scope naming `restricted`, and unsafe prefixes. It refuses reserved agent ids: `admin`, `owner`, `operator`, `system`, `sys`, `shared`, `external`, `replay`, `rebuild`, `reconcile`, `indexer`, `migration`, `hiveattic`, `restricted`, and `sensitive`. Only the admin token is admin. `read:domain/*` expands to ordinary domains only and `read:sensitive/*` to sensitive domains only. A `domains/<d>/` folder needs `read:domain/<d>` and, for a sensitive domain, `read:sensitive/<d>`; `sensitive/<d>/` needs `read:sensitive/<d>`. A write that declares a sensitive domain, including into the caller's own folder, needs `write:sensitive/<domain>`. Summary scopes see summary paths only.
+
+`forget` on append-only and server-managed files is admin-only (400 `forget_protected_path`): `journal/**`, `bots/*/journal/**`, `bots/*/journal-sensitive/**`, `sensitive/*/journal/**`, `shared/decisions.md`, `inbox/**`, `profile/summary.md`, `AGENTS.md`, and `README.md`. Appends to a protected day file keep working. Journal and fact tags cannot contain a newline, `·`, or `^` (400).
+
+A non-admin `audit:read` token sees only rows for paths it can read and never a reroute row, and `?path=` is admin-only.
 
 ## Facts and journals
 
-When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`, and the loser reference is that version's timestamp. Journal files are `journal/YYYY/MM/YYYY-MM-DD.md`. An entry sent with `sensitivity: "sensitive"`, or with a sensitive domain, goes to the writer's own `journal-sensitive` file, and a shared or decisions target refuses it.
+When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`. `profile/summary.md` lists active shared facts that are normal and carry no domain tag. A forget stub carries no caller text; the reason stays in the tombstone row.
+
+An outside delete, or a reconcile that finds the object missing, forgets the note like the API does: readers get a stub without the body, and the last indexed body stays in history for the admin token. An outside create or copy gets its `vault_id` written into its frontmatter, so a rebuild keeps the same id.
 
 ## Live end-to-end suite
 
-Copy `.e2e.env.example` to a file that stays outside git, export the variables, and run:
+The live suite runs against staging only and fails closed. Copy `.e2e.env.example` to a file outside the checkout, export it, and run `pnpm e2e`.
 
-```sh
-pnpm e2e
-```
+- It reads only `HIVEATTIC_STAGING_*` names for its target and tokens, never falls back to an unprefixed name, and refuses to start if `HIVEATTIC_BASE_URL`, `HIVEATTIC_ADMIN_TOKEN`, `HIVEATTIC_REVIEWER_TOKEN`, or `HIVEATTIC_E2E_READ_ONLY` is set.
+- `HIVEATTIC_STAGING_BASE_URL` must be the `hiveattic-staging` workers.dev host over https. It then checks `GET /v1/whoami` for `deploy_env: staging` and `staging_resources: true` before any write.
+- T-11 needs an R2 S3 key scoped to the staging bucket. `R2_BUCKET` has no default, and every S3 put, copy, and delete checks that it is a `hiveattic-staging-*` bucket first.
+- T-CLEANUP and the final cleanup only run against the accepted staging URL. Production is never contacted.
+- The only wrangler command it runs is `pnpm exec wrangler tail hiveattic-staging --config wrangler.staging.example.jsonc` for the log check, when Workers Logs credentials are absent. On Windows it starts pnpm through a shell. `HIVEATTIC_LOG_MODE=api` uses only Workers Logs.
+- T-06 is 20 runs of 7 parallel appends with a `journal-order` check, plus one batch to the shared day file from 7 different tokens. It needs a staging write limit of at least 140 per minute. Ask Forge to raise it and to restore 60 afterwards; the harness never changes it. Set `HIVEATTIC_RATE_LIMIT_WRITES_PER_MIN` to the confirmed value.
+- Rebuild, reindex, and reconcile calls in T-06, T-11, and T-12 start a job and poll `GET /v1/admin/jobs/:id` with a ten-minute ceiling. T-12 also writes a note while its rebuild runs and checks that it survives.
+- The SMOKE case replaces the retired T-02, T-03, and T-04: a fake key, a test card, `password: x`, and fake employer text are accepted and stored as written, and Workers Logs (or tail) and the audit log do not echo the bodies. T-15 checks a health reroute end to end.
 
-The suite writes only namespaced paths and tags, and only to staging. It revokes every token it mints. Cleanup runs on staging after the cases, including when a case throws. It deletes notes the run owns and rewrites shared journals and decisions by run id, including history objects, and the suite checks that D1 and R2 have nothing left from that run. The cleanup audit row lists the deleted token ids. It prints a summary and writes `e2e-results/results.json`, a markdown summary, and `e2e-results/dlq.json` even if the run aborts. Staging labels that file `hiveattic-staging-index-dlq`. A read-only prod smoke labels it `hiveattic-index-dlq` and records the backlog depth from that queue. `HIVEATTIC_DLQ_NAME` overrides either name. `HIVEATTIC_CF_API` overrides the Cloudflare API origin used for that read. `pnpm e2e --dry-run` exercises setup and that cleanup against a local mock; `pnpm test` runs that check before the suite, along with a read-only run against the same mock. DLQ depth comes from the GraphQL dataset `queueBacklogAdaptiveGroups` (`avg.messages`), or from `GET /accounts/{account_id}/queues/{queue_id}/metrics` `backlog_count` when that dataset has no sample. A missing or unreadable backlog fails the check. It is not the queue's producer count. Status values are `passed`, `failed`, `skipped`, and `partial`. T-09 is `partial`: the live checks cover the forgotten stub, empty keyword search, and retained history, and the vector-deletion half is deferred to M2. T-10, T-13, and T-14 are reported as skipped. Without the staging URL and staging admin token the process exits before sending writes.
-
-Every check in `results.json` lists the responses it judged under `responses`: a label, `via` (`rest` or `mcp`), the HTTP `status` (null for MCP tool calls), `ok`, `error_code`, and `request_id`. The markdown summary repeats them for each failed check, so a failure names the request to look up with `GET /v1/admin/audit?request_id=`.
-
-T-06 is 20 runs of 7 parallel appends to the namespaced agent's own journal, then a comparison of heading order with `GET /v1/admin/journal-order`, a stale `if_match` that must return 409 `conflict_etag`, and a rebuild that must leave all 140 entries in the day file. See the rate-limit commands above before running it.
-
-T-02 writes a key-like string through REST and a password line through MCP, and T-03 writes a card number, an account number, and a routing number. Each must return 200 and read back unchanged. The samples are fake.
-
-T-12 reports its reindex on its own line with the note and version counts and the duration, then checks the `reindex` audit row for that `request_id`. Setup writes, the decision, and the own-journal write are separate checks, so a failure names the call that failed.
-
-T-11 needs an R2 S3 API token that can write the bucket, plus the event notification from the deploy section. The suite treats a missing credential set as a skipped T-11, and a credentialed edit that is not keyword-searchable within 10 seconds as a failure.
+The suite writes only namespaced paths and tags, revokes every token it mints, and cleans up its run id on staging even when a case throws. It writes `e2e-results/results.json`, a markdown summary, and `e2e-results/dlq.json`. Every check lists the responses it judged under `responses`: a label, `via` (`rest` or `mcp`), the HTTP `status`, `ok`, `error_code`, and `request_id`. `pnpm e2e --dry-run` exercises setup and cleanup against a local mock only.
 
 ### Reviewer token
-
-Mint a read-only token for someone who should run the read checks and nothing else:
 
 ```sh
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm mint-reviewer architect-reviewer
 ```
 
-The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read`, `read:sensitive:summary/finance`, or `read:sensitive:summary/health`. Summary reads belong to the chief-of-staff role. `GET /v1/admin/audit` returns 403. Finance and health notes, including summaries, raw notes, reads by id, history, and shared notes tagged with those domains, return 404 and stay out of search. Put the token in `HIVEATTIC_REVIEWER_TOKEN`. The suite uses it for the read checks and does not revoke a token you supplied. A run with only that token, and no admin token, executes the read checks and skips the write cases.
-
-Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before this change can still read finance and health summaries and the audit log. Revoke it and mint a new one.
-
-Domains are classified in `src/access.ts`. `health` and `finance` are sensitive. `deals` and `x` are not. A domain that is in neither set is rejected on write and treated as sensitive on read.
-
-Rebuild the D1 index from R2 at any time:
-
-```sh
-HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm rebuild
-```
-
-A reindex writes a `reindex_started` audit row, then one `reindex` row when it ends: outcome `ok` with `files`, `notes`, `versions`, `tombstones`, `history_reads`, and `duration_ms` in `detail`, or outcome `failed` with the phase it reached, the counts so far, and the error. Both rows carry the reindex request's `request_id`. The new tables and the version rows are swapped in one D1 batch, so a failed rebuild leaves the live index as it was. Rows are staged as JSON arrays, a few statements per megabyte. The previous rebuild issued one D1 query per chunk and per history file: 916 sequential D1 calls and 213 R2 reads for 143 notes. On remote D1 that outran the 25-second write deadline, which is the likely cause of a live T-12 reindex failure; this rebuild makes 9 D1 calls for the same vault. Version rows that D1 already holds keep their hash, writer, and reason, so a routine rebuild reads only the current files from R2. When the reindex request outlives its 120-second deadline, it returns 400 while the rebuild continues, and the audit row records the result.
-
-### Upgrading a deployed vault
-
-Migration `0003_drop_policy_terms.sql` drops the `policy_terms` table. Apply it with `pnpm exec wrangler d1 migrations apply hiveattic-index --remote` before or with the deploy. A note quarantined by the old filter keeps `status: quarantined` in D1 until the next reindex, which reads the original from R2 and indexes it. Older `sys/quarantine/*.json` records and `inbox/quarantine.md` stay in R2 until an admin deletes or purges them; nothing writes to them now. Bootstrap does not overwrite an existing `AGENTS.md`, so replace the vault copy with `content/vault/AGENTS.md`. The `AUDIT_KEY` secret is no longer read and can be deleted with `pnpm exec wrangler secret delete AUDIT_KEY`.
+The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read` or any summary scope. Finance and health notes, `sensitive/` files, summaries, reads by id, history, and shared notes tagged with those domains return 404 and stay out of search, and `GET /v1/admin/audit` returns 403.
 
 ## API
 
@@ -186,19 +245,20 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 | --- | --- | --- |
 | GET | `/v1/whoami` | `vault_whoami` |
 | GET | `/v1/notes?path=` or `?id=` | `vault_read` |
-| GET | `/v1/search?q=` (`query` is an alias) | `vault_search` |
-| GET | `/v1/list?prefix=` | `vault_list` |
-| GET | `/v1/history?path=` | `vault_history` |
+| GET | `/v1/search?q=` (`query` is an alias; `limit`, `domains`, `types`, `since`, `mode`) | `vault_search` |
+| GET | `/v1/list?prefix=&cursor=` | `vault_list` (`cursor` argument) |
+| GET | `/v1/history?path=` or `?id=` | `vault_history` |
 | POST | `/v1/facts` | `vault_write_fact` |
 | POST | `/v1/journal` | `vault_append_journal` |
 | PUT | `/v1/notes` | `vault_write_note` |
 | POST | `/v1/forget` | `vault_forget` |
+| GET | `/v1/operations/:id` | |
 
-MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` return the keyword results plus `warning: semantic_deferred`.
+`GET /v1/search` is the canonical search; there is no `POST /v1/search` (404). MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` return the keyword results plus `warning: semantic_deferred`. List pages fill with notes the caller can read and return a `cursor` until the prefix is exhausted.
 
-Admin routes, all requiring the admin token: bootstrap, token mint and revoke, reindex, reconcile, journal order, restore, purge, audit read, and append-only verification. `POST /v1/admin/cleanup` returns 404 unless the staging flag and the staging resource names are both set. A refusal while the flag is on is audited. `GET /v1/admin/audit` accepts `limit`, `request_id`, and `path`. The server always assigns `request_id`. A caller `x-request-id` is echoed as `client_request_id`. Writes to a forgotten note return 409.
+Admin routes, all requiring the admin token (403 for any other token): bootstrap, token mint and revoke, the job and migration routes above, journal order, restore, purge, cleanup, audit read, and append-only verification. `/v1/admin/policy` and `/v1/admin/quarantine` are gone (404). The server always assigns `request_id`; a caller `x-request-id` is echoed as `client_request_id`.
 
-Errors are 400 `invalid`, 401 `unauthorized`, 403 `forbidden_scope`, 404 `not_found`, 409 `conflict_etag`, and 429 `rate_limited`. No error depends on what the content says. A human edit in R2 is indexed as written; malformed frontmatter is kept and indexed as body text. An outside delete tombstones the D1 row and does not write the object back.
+Errors are 400 `invalid`, `unclassified_domain`, `forget_protected_path`; 401 `unauthorized`; 403 `forbidden_scope`; 404 `not_found`; 409 `conflict_etag`, `job_running`, `migration_required`, `count_mismatch`; 413 `payload_too_large`; 429 `rate_limited`; and 500 `misconfigured`. No error depends on what the content says. Writes to a forgotten note return 409.
 
 ## Bindings
 
@@ -208,10 +268,9 @@ Errors are 400 `invalid`, 401 `unauthorized`, 403 `forbidden_scope`, 404 `not_fo
 | `DB` | D1 database `hiveattic-index` |
 | `WRITER` | Durable Object class `VaultWriter`, instance name `main` |
 | `INDEX_Q` | Queue `hiveattic-index-jobs`, dead letter `hiveattic-index-dlq` |
-| `TOKEN_PEPPER`, `ADMIN_TOKEN_HASH`, `JOURNAL_MAC_KEY` | Worker secrets |
-| `VAULT_PREFIX`, `TZ_DISPLAY`, `RATE_LIMIT_*`, `E2E_CLEANUP_ENABLED`, `DEPLOY_ENV`, `VAULT_BUCKET`, `DB_NAME`, `WORKER_NAME`, `GIT_SHA` | Plain vars |
+| `TOKEN_PEPPER`, `ADMIN_TOKEN_HASH`, `AUDIT_KEY`, `JOURNAL_MAC_KEY` | Worker secrets |
 
-The queue consumer receives both agent index jobs and R2 event notifications for `vault/` object create, copy, and delete. `copySource` may be a string or `{ bucket, object }`. A copy is treated as ours only when the bucket matches `VAULT_BUCKET`. An event is skipped only when the object etag equals `notes.r2_etag` and the `vault-id` metadata equals `notes.id`. A nightly cron reconciles R2 into D1 and, in batches of 200, forgets active rows whose object is missing. Each write, including forget, records an intent in the Durable Object so a crash after the R2 put can be replayed. The caller-facing timeout does not release the writer while the operation is still running.
+The queue consumer receives both agent index jobs and R2 event notifications for `vault/` object create, copy, and delete. `copySource` may be a string or `{ bucket, object }`. A copy is treated as ours only when the bucket matches `VAULT_BUCKET`. An event is skipped only when the object etag equals `notes.r2_etag` and the `vault-id` metadata equals `notes.id`. Each write records an intent in the Durable Object so a crash after the R2 put can be replayed.
 
 ## License
 
