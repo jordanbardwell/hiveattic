@@ -1,4 +1,4 @@
-import { canWrite, hasScope, resolveDomain, REVIEWER_SCOPES, type Access } from "./access";
+import { assertClassifiedDomain, canWrite, hasScope, NON_SENSITIVE_DOMAINS, resolveDomain, REVIEWER_SCOPES, type Access } from "./access";
 import { clearAuthCache } from "./auth";
 import { AGENTS_MD, README_MD } from "./content";
 import { hashToken, hmacSha256Hex, randomToken, ulid } from "./crypto";
@@ -109,6 +109,7 @@ export async function appendJournal(
   },
 ): Promise<Record<string, unknown>> {
   const domain = input.domain ?? null;
+  assertClassifiedDomain(domain);
   const text = `${input.title}\n${input.body}\n${input.tags.join(" ")}`;
   const sensitivity = sensitivityFor(undefined, domain, text);
   if (sensitivity === "sensitive" && input.target !== "own") {
@@ -182,7 +183,7 @@ export async function forgetNote(
         .bind(input.id ?? "")
         .first<{ owner: string; domain: string | null; sensitivity: string; path: string }>();
   if (note) {
-    const sensitivity = note.sensitivity === "sensitive" || note.domain === "health" || note.domain === "finance" ? "sensitive" : "normal";
+    const sensitivity = note.sensitivity === "sensitive" || (note.domain !== null && !NON_SENSITIVE_DOMAINS.has(note.domain)) ? "sensitive" : "normal";
     assertCanWrite(session.access, note.path, sensitivity, note.domain);
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
