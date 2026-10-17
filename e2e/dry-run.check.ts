@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -125,6 +125,51 @@ try {
   if (!dry.output.includes("DRY-RUN")) throw new Error(`dry-run summary missing\n${dry.output}`);
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function domainSet(source: string, name: string): Set<string> {
+  const match = new RegExp(`export const ${name} = new Set\\(\\[([^\\]]+)\\]\\)`).exec(source);
+  if (!match?.[1]) throw new Error(`${name} is missing from src/access.ts`);
+  return new Set([...match[1].matchAll(/"([a-z0-9-]+)"/g)].map((item) => item[1]!).filter((item) => item.length > 0));
+}
+const accessSource = readFileSync("src/access.ts", "utf8");
+const classified = new Set<string>([...domainSet(accessSource, "SENSITIVE_DOMAINS"), ...domainSet(accessSource, "NON_SENSITIVE_DOMAINS")]);
+if (classified.size < 2) throw new Error("domain classification is empty");
+const domainPatterns = [
+  /domains\/([a-z0-9-]+)\//g,
+  /(?:read|write):domain\/([a-z0-9-]+)/g,
+  /(?:read|write):sensitive\/([a-z0-9-]+)/g,
+  /read:sensitive:summary\/([a-z0-9-]+)/g,
+  /domain["']?\s*[:=]\s*["']([a-z0-9-]+)["']/g,
+];
+const skipDir = new Set(["node_modules", ".git", "e2e-results", "dist"]);
+function sourceFiles(dir: string): string[] {
+  const info = statSync(dir);
+  if (info.isFile()) return /\.(ts|md|json|txt)$/.test(dir) ? [dir] : [];
+  const found: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (skipDir.has(name)) continue;
+    const full = join(dir, name);
+    const child = statSync(full);
+    if (child.isDirectory()) found.push(...sourceFiles(full));
+    else if (/\.(ts|md|json|txt)$/.test(name) && name !== "worker-configuration.d.ts") found.push(full);
+  }
+  return found;
+}
+const missing = new Set<string>();
+for (const file of ["src", "e2e", "examples", "policy", "README.md"].flatMap((root) => sourceFiles(root))) {
+  const text = readFileSync(file, "utf8");
+  for (const pattern of domainPatterns) {
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const name = match[1] ?? "";
+      if (!name || name === "pii") continue;
+      if (!classified.has(name)) missing.add(`${name} (${file})`);
+    }
+  }
+}
+if (missing.size > 0) {
+  throw new Error(`Unclassified domains:\n${[...missing].sort().join("\n")}`);
 }
 
 console.log("e2e dry-run check passed");

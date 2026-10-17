@@ -1,4 +1,4 @@
-import { canRead, hasScope, type Access, type NoteView } from "./access";
+import { canRead, hasScope, NON_SENSITIVE_DOMAINS, SENSITIVE_DOMAINS, type Access, type NoteView } from "./access";
 import { sha256Hex } from "./crypto";
 import { VaultError } from "./errors";
 import { AGENTS_MD } from "./content";
@@ -277,21 +277,39 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
   }
   if (visible.length) {
     const tag = domainTagSql(access);
-    const notSensitive = "(n.sensitivity != 'sensitive' AND IFNULL(n.domain, '') NOT IN ('health', 'finance') AND n.path NOT LIKE 'domains/health/%' AND n.path NOT LIKE 'domains/finance/%')";
+    const visibleDomains = ordinaryDomainSql();
     parts.push({
-      sql: `(${notSensitive} AND (${tag.sql}) AND (${visible.map((item) => item.sql).join(" OR ")}))`,
-      binds: [...tag.binds, ...visible.flatMap((item) => item.binds)],
+      sql: `(${visibleDomains.sql} AND (${tag.sql}) AND (${visible.map((item) => item.sql).join(" OR ")}))`,
+      binds: [...visibleDomains.binds, ...tag.binds, ...visible.flatMap((item) => item.binds)],
     });
   }
   for (const scope of access.scopes) {
     const sens = /^read:sensitive\/([a-z0-9-]+)$/.exec(scope);
     if (sens && sens[1] !== "pii") parts.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/%`] });
-    if (scope === "read:sensitive/*") parts.push({ sql: "(n.sensitivity = 'sensitive' OR n.domain IN ('health', 'finance') OR n.path LIKE 'domains/%')", binds: [] });
+    if (scope === "read:sensitive/*") {
+      const names = [...SENSITIVE_DOMAINS];
+      parts.push({
+        sql: `(n.sensitivity = 'sensitive' OR n.domain IN (${names.map(() => "?").join(", ")}) OR n.path LIKE 'domains/%')`,
+        binds: names,
+      });
+    }
   }
   if (hasScope(access, "read:sensitive/pii")) {
     parts.push({ sql: "(n.sensitivity = 'sensitive' AND n.domain IS NULL AND n.path NOT LIKE 'domains/%')", binds: [] });
   }
   return { sql: parts.map((part) => part.sql).join(" OR "), binds: parts.flatMap((part) => part.binds) };
+}
+
+function ordinaryDomainSql(): { sql: string; binds: string[] } {
+  const ordinary = [...NON_SENSITIVE_DOMAINS];
+  const sensitive = [...SENSITIVE_DOMAINS];
+  const ordinarySlots = ordinary.map(() => "?").join(", ");
+  const sensitivePaths = sensitive.map(() => "n.path NOT LIKE ?").join(" AND ");
+  const ordinaryPaths = ordinary.map(() => "n.path LIKE ?").join(" OR ");
+  return {
+    sql: `(n.sensitivity != 'sensitive' AND (n.domain IS NULL OR n.domain IN (${ordinarySlots})) AND ${sensitivePaths} AND (n.path NOT LIKE 'domains/%' OR ${ordinaryPaths}))`,
+    binds: [...ordinary, ...sensitive.map((name) => `domains/${name}/%`), ...ordinary.map((name) => `domains/${name}/%`)],
+  };
 }
 
 function ftsQuery(query: string): string {

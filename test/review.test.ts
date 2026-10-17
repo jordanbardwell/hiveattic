@@ -291,6 +291,7 @@ describe("architect review regressions", () => {
     expect(Array.isArray(scopes)).toBe(true);
     expect(scopes).not.toContain("read:sensitive:summary/finance");
     expect(scopes).not.toContain("read:sensitive:summary/health");
+    expect(scopes).not.toContain("audit:read");
     const token = String(minted.json.data?.token);
     const finance = `domains/finance/summaries/month-${nid()}.md`;
     const health = `domains/health/summaries/visit-${nid()}.md`;
@@ -299,6 +300,94 @@ describe("architect review regressions", () => {
     expect((await rest(`/v1/notes?path=${encodeURIComponent(finance)}`, token)).status).toBe(404);
     expect((await rest(`/v1/notes?path=${encodeURIComponent(health)}`, token)).status).toBe(404);
     expect(results((await rest("/v1/search?q=qxrev", token)).json)).toEqual([]);
+    const audit = await rest(`/v1/admin/audit?path=${encodeURIComponent(health)}`, token);
+    expect(audit.status).toBe(403);
+    expect(audit.text.includes("qxrev")).toBe(false);
+    expect(audit.text.includes(health)).toBe(false);
+    expect((await rest("/v1/admin/audit", token)).status).toBe(403);
+  });
+
+  it("a reviewer preset cannot read raw finance or health notes, history, or tagged shared notes", async () => {
+    await resetVault();
+    const minted = await rest("/v1/admin/tokens", ADMIN, {
+      method: "POST",
+      body: JSON.stringify({ preset: "reviewer", agent_id: "rev-probe", label: "rev-probe" }),
+    });
+    expect(minted.status).toBe(200);
+    const token = String(minted.json.data?.token);
+    const marker = `qxprobe${nid()}`;
+    const notes = [
+      { path: `domains/finance/raw-${nid()}.md`, body: `Finance raw ${marker}`, domain: "finance" },
+      { path: `domains/health/raw-${nid()}.md`, body: `Health raw ${marker}`, domain: "health" },
+      { path: `shared/tagged-finance-${nid()}.md`, body: `Shared finance ${marker}`, domain: "finance" },
+      { path: `shared/tagged-health-${nid()}.md`, body: `Shared health ${marker}`, domain: "health" },
+    ];
+    const ids: string[] = [];
+    for (const note of notes) {
+      const written = await rest("/v1/notes", ADMIN, {
+        method: "PUT",
+        body: JSON.stringify({ path: note.path, body: note.body, type: "note", domain: note.domain }),
+      });
+      expect(written.status, written.text).toBe(200);
+      ids.push(String(written.json.data?.id));
+      const revised = await rest("/v1/notes", ADMIN, {
+        method: "PUT",
+        body: JSON.stringify({
+          path: note.path,
+          body: `${note.body} revised`,
+          type: "note",
+          domain: note.domain,
+          if_match: written.json.data?.etag,
+        }),
+      });
+      expect(revised.status, revised.text).toBe(200);
+    }
+    for (const note of notes) {
+      const byPath = await rest(`/v1/notes?path=${encodeURIComponent(note.path)}`, token);
+      expect(byPath.status).toBe(404);
+      expect(byPath.text.includes(marker)).toBe(false);
+      const history = await rest(`/v1/history?path=${encodeURIComponent(note.path)}`, token);
+      expect(history.status).toBe(404);
+      expect(history.text.includes(marker)).toBe(false);
+      expect(history.text.includes("revised")).toBe(false);
+    }
+    for (const id of ids) {
+      const byId = await rest(`/v1/notes?id=${encodeURIComponent(id)}`, token);
+      expect(byId.status).toBe(404);
+      expect(byId.text.includes(marker)).toBe(false);
+      const history = await rest(`/v1/history?id=${encodeURIComponent(id)}`, token);
+      expect(history.status).toBe(404);
+      expect(history.text.includes(marker)).toBe(false);
+    }
+    const found = await rest(`/v1/search?q=${marker}`, token);
+    expect(found.status).toBe(200);
+    expect(results(found.json)).toEqual([]);
+    expect(found.text.includes(marker)).toBe(false);
+    for (const prefix of ["domains/finance/", "domains/health/"]) {
+      const listed = await rest(`/v1/list?prefix=${encodeURIComponent(prefix)}`, token);
+      expect(listed.text.includes(marker)).toBe(false);
+      expect(JSON.stringify(listed.json.data ?? {})).not.toContain(marker);
+    }
+    const shared = await rest("/v1/list?prefix=shared/", token);
+    const listed = JSON.stringify(shared.json.data ?? {});
+    expect(listed.includes(marker)).toBe(false);
+    expect(listed.includes("tagged-finance")).toBe(false);
+    expect(listed.includes("tagged-health")).toBe(false);
+  });
+
+  it("an unclassified domain is rejected", async () => {
+    await resetVault();
+    const written = await rest("/v1/notes", ADMIN, {
+      method: "PUT",
+      body: JSON.stringify({ path: `domains/legal/note-${nid()}.md`, body: "unclassified qxlegal", type: "note" }),
+    });
+    expect(written.status).toBe(400);
+    expect(written.json.error?.message).toContain("not classified");
+    const tagged = await rest("/v1/notes", sharedWriter, {
+      method: "PUT",
+      body: JSON.stringify({ path: `shared/legal-${nid()}.md`, body: "tagged qxlegal", type: "note", domain: "legal" }),
+    });
+    expect(tagged.status).toBe(400);
   });
 
   it("P19 notes can be read by id", async () => {

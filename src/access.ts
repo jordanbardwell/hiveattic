@@ -15,9 +15,14 @@ export type NoteView = {
   frontmatter?: Record<string, unknown>;
 };
 
-export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox", "audit:read"];
+export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox"];
 
+// Domain config. A name has to be in one of these sets. Sensitive domains stay
+// hidden without read:sensitive/<domain>. Anything not listed is rejected on
+// write and treated as sensitive on read, so a new folder cannot leak through
+// read:domain/*.
 export const SENSITIVE_DOMAINS = new Set(["health", "finance"]);
+export const NON_SENSITIVE_DOMAINS = new Set(["deals", "x"]);
 
 export function hasScope(access: Access, scope: string): boolean {
   if (access.admin || access.scopes.includes("admin") || access.scopes.includes(scope)) return true;
@@ -32,12 +37,23 @@ export function domainOf(path: string): string | null {
 }
 
 // A path under domains/<d>/ always owns that domain. A caller-supplied domain that disagrees is invalid.
+export function isClassifiedDomain(domain: string): boolean {
+  return SENSITIVE_DOMAINS.has(domain) || NON_SENSITIVE_DOMAINS.has(domain);
+}
+
+export function assertClassifiedDomain(domain: string | null | undefined): void {
+  if (!domain) return;
+  if (!isClassifiedDomain(domain)) throw new VaultError("invalid", "domain is not classified");
+}
+
 export function resolveDomain(path: string, supplied: string | null | undefined): string | null {
   const fromPath = domainOf(path);
   if (fromPath) {
     if (supplied && supplied !== fromPath) throw new VaultError("invalid", "domain does not match the path");
+    assertClassifiedDomain(fromPath);
     return fromPath;
   }
+  assertClassifiedDomain(supplied);
   return supplied ?? null;
 }
 
@@ -52,7 +68,10 @@ export function isSummary(note: NoteView): boolean {
 
 export function isSensitive(note: NoteView): boolean {
   const domain = effectiveDomain(note);
-  return note.sensitivity === "sensitive" || (domain !== null && SENSITIVE_DOMAINS.has(domain));
+  if (note.sensitivity === "sensitive") return true;
+  if (domain === null) return false;
+  if (NON_SENSITIVE_DOMAINS.has(domain)) return false;
+  return true;
 }
 
 export function canRead(access: Access, note: NoteView): boolean {
@@ -101,7 +120,7 @@ export function canWrite(access: Access, path: string, sensitivity: "normal" | "
   if (access.admin) return true;
   const pathDomain = domainOf(path) ?? domain;
   const ownFolder = path.startsWith(`bots/${access.agentId}/`);
-  const sensitive = sensitivity === "sensitive" || (pathDomain !== null && SENSITIVE_DOMAINS.has(pathDomain));
+  const sensitive = sensitivity === "sensitive" || (pathDomain !== null && !NON_SENSITIVE_DOMAINS.has(pathDomain));
   const ownPiiJournal = ownFolder && !pathDomain && path.includes("/journal-sensitive/");
   if (sensitive && !ownPiiJournal) {
     if (pathDomain) {
