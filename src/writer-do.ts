@@ -16,7 +16,7 @@ import {
   type Frontmatter,
   type JournalEntry,
 } from "./markdown";
-import { domainOf } from "./access";
+import { canWrite, domainOf, type Access } from "./access";
 import { stagingResources } from "./query";
 import { isAppendOnlyPath, isFactPath, isGeneratedNote, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
 import { etStamp, versionStamp, within24h } from "./time";
@@ -67,7 +67,7 @@ export type WriterOp =
       domain: string | null;
       noteType: string;
     }
-  | { kind: "forget"; actor: Actor; path?: string; id?: string; reason: string }
+  | { kind: "forget"; actor: Actor; access: Access; path?: string; id?: string; reason: string }
   | { kind: "restore"; actor: Actor; path?: string; id?: string; versionTs: string }
   | { kind: "purge"; actor: Actor; path?: string; id?: string }
   | { kind: "bootstrap"; actor: Actor; files: { path: string; markdown: string }[] }
@@ -477,6 +477,11 @@ export class VaultWriter extends DurableObject<Env> {
   private async forget(op: Extract<WriterOp, { kind: "forget" }>): Promise<ApiResult> {
     const note = await this.resolveNote(op.id, op.path);
     if (!note) throw new VaultError("not_found", "Note not found");
+    // Authorize against the resolved note, never the caller-supplied path.
+    if (!canWrite(op.access, note.path, note.sensitivity === "sensitive" ? "sensitive" : "normal", note.domain)) {
+      throw new VaultError("forbidden_scope", "Scope does not allow this write");
+    }
+    if (op.path && note.path !== op.path) throw new VaultError("invalid", "path and id refer to different notes");
     if (note.status === "forgotten") {
       return { ok: true, data: { id: note.id, path: note.path, status: "forgotten" } };
     }

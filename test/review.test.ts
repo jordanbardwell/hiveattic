@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { hmacSha256Hex, sha256Hex } from "../src/crypto";
 import { inspectWrite, scanEmployer, scanFinancial, scanSecrets } from "../src/filters";
 import worker from "../src/index";
-import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, mcp, mint, nid, resetVault, rest, testEnv } from "./helpers";
 
 let financeRw = "";
 let financeRo = "";
@@ -599,6 +599,85 @@ describe("architect review regressions", () => {
       testEnv().VAULT_BUCKET = "hiveattic-vault";
       testEnv().DB_NAME = "hiveattic-index";
       testEnv().WORKER_NAME = "hiveattic";
+    }
+  });
+});
+
+describe("forget authorizes the resolved note", () => {
+  async function put(token: string, path: string, body: string): Promise<string> {
+    const written = await rest("/v1/notes", token, { method: "PUT", body: JSON.stringify({ path, body, type: "note" }) });
+    expect(written.status).toBe(200);
+    return String(written.json.data?.id);
+  }
+
+  async function forget(token: string, args: { path?: string; id?: string }): Promise<{ rest: number; mcp: string | undefined }> {
+    const viaRest = await rest("/v1/forget", token, { method: "POST", body: JSON.stringify({ ...args, reason: "cleanup" }) });
+    const viaMcp = await mcp(token, "vault_forget", { ...args, reason: "cleanup" });
+    return { rest: viaRest.status, mcp: viaMcp.json.ok ? "ok" : viaMcp.json.error?.code };
+  }
+
+  async function expectUntouched(id: string, body: string): Promise<void> {
+    const row = await testEnv().DB.prepare("SELECT status, body FROM notes WHERE id = ?").bind(id).first<{ status: string; body: string }>();
+    expect(row?.status).toBe("active");
+    expect(row?.body).toContain(body);
+    const tombstone = await testEnv().DB.prepare("SELECT note_id FROM tombstones WHERE note_id = ?").bind(id).first();
+    expect(tombstone).toBeNull();
+  }
+
+  for (const domain of ["finance", "health"]) {
+    it(`F-${domain} write:shared cannot forget a ${domain} note by pairing its own path with the victim id`, async () => {
+      await resetVault();
+      const own = `shared/own-${nid()}.md`;
+      await put(sharedWriter, own, "my own note");
+      const body = `Private ${domain} note ${nid()}`;
+      const victim = await put(ADMIN, `domains/${domain}/victim-${nid()}.md`, body);
+      expect(await forget(sharedWriter, { path: own, id: victim })).toEqual({ rest: 403, mcp: "forbidden_scope" });
+      expect(await forget(sharedWriter, { id: victim })).toEqual({ rest: 403, mcp: "forbidden_scope" });
+      await expectUntouched(victim, body);
+      const ownRow = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(own).first<{ status: string }>();
+      expect(ownRow?.status).toBe("active");
+
+      const writer = testEnv().WRITER as unknown as { get(id: DurableObjectId): { perform(op: unknown): Promise<{ ok: boolean; error?: { code: string } }> } };
+      const stub = writer.get(testEnv().WRITER.idFromName("main"));
+      const access = { agentId: "rev-shared", tokenId: "direct", scopes: ["read:shared", "read:own", "write:own", "write:shared"], admin: false };
+      const actor = { agentId: "rev-shared", tokenId: "direct", client: "test", requestId: nid(), ipCountry: null };
+      const direct = await stub.perform({ kind: "forget", actor, access, path: own, id: victim, reason: "cleanup" });
+      expect(direct.ok).toBe(false);
+      expect(direct.error?.code).toBe("forbidden_scope");
+      await expectUntouched(victim, body);
+    });
+  }
+
+  it("F-mismatch a path and id for different notes is rejected", async () => {
+    await resetVault();
+    const first = `shared/first-${nid()}.md`;
+    const second = `shared/second-${nid()}.md`;
+    await put(sharedWriter, first, "first note");
+    const secondId = await put(sharedWriter, second, "second note");
+    expect(await forget(sharedWriter, { path: first, id: secondId })).toEqual({ rest: 400, mcp: "invalid" });
+    const rows = await testEnv().DB.prepare("SELECT status FROM notes WHERE path IN (?, ?)").bind(first, second).all<{ status: string }>();
+    expect((rows.results ?? []).map((row) => row.status)).toEqual(["active", "active"]);
+  });
+
+  it("F-legit forget by id, by path and by a matching pair still works", async () => {
+    await resetVault();
+    for (const shape of ["id", "path", "both"] as const) {
+      for (const channel of ["rest", "mcp"] as const) {
+        const path = `shared/legit-${shape}-${channel}-${nid()}.md`;
+        const id = await put(sharedWriter, path, `legit ${shape}`);
+        const args = shape === "id" ? { id } : shape === "path" ? { path } : { path, id };
+        if (channel === "rest") {
+          const response = await rest("/v1/forget", sharedWriter, { method: "POST", body: JSON.stringify({ ...args, reason: "done" }) });
+          expect(response.status).toBe(200);
+          expect(response.json.data?.id).toBe(id);
+        } else {
+          const response = await mcp(sharedWriter, "vault_forget", { ...args, reason: "done" });
+          expect(response.json.ok).toBe(true);
+          expect(response.json.data?.id).toBe(id);
+        }
+        const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE id = ?").bind(id).first<{ status: string }>();
+        expect(row?.status).toBe("forgotten");
+      }
     }
   });
 });
