@@ -76,6 +76,10 @@ export type JournalEntry = {
   title: string;
   body: string;
   idempotency: string | null;
+  // From the current idempotency marker: the payload hash ("-" when none) and its MAC. Both are
+  // null for the older marker, which carried only the key.
+  idempotencyHash: string | null;
+  idempotencyMac: string | null;
   mac: string | null;
 };
 
@@ -86,7 +90,7 @@ export function journalEntries(markdown: string): JournalEntry[] {
   for (const block of blocks) {
     const heading = /^## .+ · ([^·\n]+) · (.+?) \^([0-9A-HJKMNP-TV-Z]{26})/m.exec(block);
     if (!heading) continue;
-    const idem = /<!-- hiveattic:idempotency=([A-Za-z0-9_.:-]{1,64}) -->/.exec(block);
+    const idem = /<!-- hiveattic:idempotency=([A-Za-z0-9_.:-]{1,64})(?: h=([0-9a-f]{64}|-) mac=([0-9a-f]{16})?)? -->/.exec(block);
     const mac = /<!-- hiveattic:e=([0-9A-HJKMNP-TV-Z]{26}):([^:\s]+):([0-9a-f]{16}) -->/.exec(block);
     entries.push({
       id: heading[3]!,
@@ -94,6 +98,8 @@ export function journalEntries(markdown: string): JournalEntry[] {
       title: heading[2]!.trim(),
       body: journalBlockBody(block),
       idempotency: idem?.[1] ?? null,
+      idempotencyHash: idem?.[2] ?? null,
+      idempotencyMac: idem?.[2] ? (idem[3] ?? "") : null,
       mac: mac && mac[1] === heading[3] ? mac[3]! : null,
     });
   }
@@ -111,11 +117,14 @@ function journalBlockBody(block: string): string {
   return kept.join("\n").trim();
 }
 
+// Makes a caller's journal body safe to append. Nothing is dropped: a heading line, a line that
+// starts like the server's `Tags:` line, and the `hiveattic:` marker prefix are escaped, so the
+// entry can't forge a heading, tags, or a server marker, and its MAC still verifies on rebuild.
 export function guardJournalBody(body: string): string {
   return body
     .split(/\r?\n/)
-    .filter((line) => !line.toLowerCase().includes("hiveattic:"))
-    .map((line) => (/^\s*#/.test(line) ? `\\${line}` : line))
+    .map((line) => line.replace(/hiveattic:/gi, (match) => `${match.slice(0, -1)}\\:`))
+    .map((line) => (/^\s*#/.test(line) || /^Tags: /.test(line) ? `\\${line}` : line))
     .join("\n");
 }
 

@@ -1,6 +1,6 @@
 import { isClassifiedDomain, isOrdinaryDomain, isSensitiveDomain, RESTRICTED } from "./config";
 import { VaultError } from "./errors";
-import { innerPath, isRestrictedPath, sensitiveSegment } from "./paths";
+import { innerPath, inSensitiveFolder, isRestrictedPath, piiJournalOwner, sensitiveSegment } from "./paths";
 
 export type Access = {
   agentId: string;
@@ -81,9 +81,21 @@ export function isSensitive(note: NoteView): boolean {
   return !isOrdinaryDomain(domain);
 }
 
+// How a stored note is classified for access checks. The service and the writer both use this,
+// so they agree on what a forget or an update has to be allowed to touch.
+export function noteSensitivity(note: { path: string; sensitivity: string; domain: string | null }): "normal" | "sensitive" {
+  if (note.sensitivity === "sensitive" || inSensitiveFolder(note.path)) return "sensitive";
+  return note.domain !== null && !isOrdinaryDomain(note.domain) ? "sensitive" : "normal";
+}
+
 export function canRead(access: Access, note: NoteView): boolean {
   // sensitive/restricted/ is the admin token's alone. No scope, read:all included, reaches it.
   if (isRestrictedPath(note.path)) return access.admin;
+  // A bot's own PII journal: its writer always reads it, with or without a read:sensitive scope.
+  // Nobody else does, whatever scopes they hold (read:bots/<writer> and read:all included), except
+  // the admin token. This runs before every other rule.
+  const piiOwner = piiJournalOwner(note.path);
+  if (piiOwner) return access.admin || piiOwner === access.agentId;
   if (access.admin || hasScope(access, "read:all")) return true;
   if (note.path === "AGENTS.md" || note.path === "README.md") return true;
   const segment = sensitiveSegment(note.path);

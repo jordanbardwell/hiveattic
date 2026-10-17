@@ -28,7 +28,8 @@ export function mcpHandler(request: Request, env: Env, ctx: ExecutionContext, or
 
 function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServer {
   const server = new McpServer({ name: "hiveattic", version: "0.1.0" });
-  const idempotency = request.headers.get("idempotency-key");
+  // One /mcp request can carry several tool calls, so the Idempotency-Key header is ignored here.
+  // Only the idempotency_key tool argument counts.
   const session = async (): Promise<Session> => {
     const access = await authenticate(request, env, ctx);
     return { access, requestId: ulid(), client: "mcp", country: countryOf(request) };
@@ -90,14 +91,14 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
     history(env, current, typeof args.path === "string" ? args.path : undefined, typeof args.id === "string" ? args.id : undefined),
   );
   tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active.", factSchema, async (current, args) =>
-    (await writeFact(env, current, parseInput(factSchema, args), idempotency)).data,
+    (await writeFact(env, current, parseInput(factSchema, args))).data,
   );
   tool("vault_append_journal", "Append one journal or decision entry.", journalSchema, async (current, args) =>
-    (await appendJournal(env, current, parseInput(journalSchema, args), idempotency)).data,
+    (await appendJournal(env, current, parseInput(journalSchema, args))).data,
   );
   tool("vault_write_note", "Create or replace a note. Existing notes require if_match.", noteSchema, async (current, args) =>
-    (await writeNote(env, current, parseInput(noteSchema, args), null, idempotency)).data,
+    (await writeNote(env, current, parseInput(noteSchema, args), null)).data,
   );
-  tool("vault_forget", "Soft-delete a note. History is kept.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args), idempotency)).data);
+  tool("vault_forget", "Soft-delete a note. History is kept.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
   return server;
 }

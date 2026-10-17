@@ -6,3 +6,5 @@ CREATE INDEX notes_index_gen ON notes(index_gen);
 -- admin token only. path records the old location, including for files that never had a row.
 ALTER TABLE tombstones ADD COLUMN moved_to TEXT;
 ALTER TABLE tombstones ADD COLUMN path TEXT;
+-- An idempotency key is bound to a hash of its payload: the same key with another payload is refused.
+ALTER TABLE idempotency ADD COLUMN payload_hash TEXT;

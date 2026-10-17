@@ -11,6 +11,9 @@ export const ERROR_STATUS: Record<string, number> = {
   job_running: 409,
   migration_required: 409,
   count_mismatch: 409,
+  confirm_count_mismatch: 409,
+  idempotency_key_conflict: 400,
+  idempotency_key_reused: 422,
   misconfigured: 500,
 };
 
@@ -21,13 +24,16 @@ export function isErrorCode(code: string): code is ErrorCode {
 }
 
 // `extra` holds small machine-readable fields that ride on the error object, such as the 413
-// `limit` tag or the `job_id` of a running job. Never put content in it.
+// `limit` tag, the `job_id` of a running job, or the `actual_count` of a quarantine erase. Never
+// put content in it.
+export type ErrorExtra = Record<string, string | number>;
+
 export class VaultError extends Error {
   readonly reasons: string[];
   readonly status: number;
-  readonly extra: Record<string, string>;
+  readonly extra: ErrorExtra;
 
-  constructor(readonly code: ErrorCode, message: string, reasons: string[] = [], extra: Record<string, string> = {}) {
+  constructor(readonly code: ErrorCode, message: string, reasons: string[] = [], extra: ErrorExtra = {}) {
     super(message);
     this.name = "VaultError";
     this.reasons = reasons;
@@ -56,10 +62,10 @@ export function failure(error: VaultError): ApiFailure {
 
 export function fromFailure(error: ApiError): VaultError {
   const code = isErrorCode(error.code) ? error.code : "invalid";
-  const extra: Record<string, string> = {};
+  const extra: ErrorExtra = {};
   for (const [key, value] of Object.entries(error)) {
     if (key === "code" || key === "message" || key === "reasons") continue;
-    if (typeof value === "string") extra[key] = value;
+    if (typeof value === "string" || typeof value === "number") extra[key] = value;
   }
   return new VaultError(code, error.message, Array.isArray(error.reasons) ? error.reasons : [], extra);
 }

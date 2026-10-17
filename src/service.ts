@@ -1,9 +1,10 @@
-import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, resolveDomain, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
+import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
 import { clearAuthCache } from "./auth";
-import { classifyText, frontmatterText, routeFor } from "./classify";
+import { classifyText, frontmatterText, journalRouteFor, routeFor } from "./classify";
 import { CONTENT_LIMIT_BYTES, domainConfig, isOrdinaryDomain, isSensitiveDomain, stagingResources, utf8Length, vaultTimeZone } from "./config";
 import { AGENTS_MD, README_MD } from "./content";
 import { hashToken, randomToken, ulid } from "./crypto";
+import { payloadHash } from "./idempotency";
 import { fromFailure, VaultError, type ApiResult, type JsonValue } from "./errors";
 import { logEvent } from "./log";
 import { factPath, inSensitiveFolder, isForgetProtectedPath, journalPath, ownerForPath } from "./paths";
@@ -89,12 +90,19 @@ export async function history(env: Env, session: Session, path?: string, id?: st
   return noteHistory(env, session.access, path ? assertVaultPath(path) : undefined, id);
 }
 
-// A key may come as the Idempotency-Key header or the idempotency_key field. Both at once must agree.
+// On REST a key may come as the Idempotency-Key header or the idempotency_key field. Both at once
+// must agree, or nothing is written. MCP passes no header: only the tool argument counts there.
 export function idempotencyKeyFrom(header: string | null | undefined, field: string | null | undefined): string | null {
   const fromHeader = header?.trim() || null;
   if (fromHeader && !IDEMPOTENCY_KEY.test(fromHeader)) throw new VaultError("invalid", "Idempotency-Key is not valid", ["idempotency_key"]);
-  if (fromHeader && field && fromHeader !== field) throw new VaultError("invalid", "Idempotency-Key and idempotency_key differ", ["idempotency_key"]);
+  if (fromHeader && field && fromHeader !== field) {
+    throw new VaultError("idempotency_key_conflict", "The Idempotency-Key header and the idempotency_key field differ", ["idempotency_key"]);
+  }
   return fromHeader ?? field ?? null;
+}
+
+async function keyedHash(key: string | null, kind: string, payload: Record<string, unknown>): Promise<string | null> {
+  return key ? payloadHash(kind, payload) : null;
 }
 
 export function assertContentSize(text: string): void {
@@ -126,9 +134,21 @@ export async function writeFact(
   const declared = resolveDomain(path, input.domain);
   const reroute = routeFor(classifyText([input.statement, ...input.tags, ...input.links].join("\n")), input.sensitivity === "sensitive", declared);
   assertRerouteWrite(session.access, path, declared, reroute);
+  const hash = await keyedHash(idempotencyKey, "fact", {
+    key: input.key,
+    statement: input.statement,
+    scope: input.scope,
+    domain: input.domain ?? null,
+    observed_at: input.observed_at,
+    confidence: input.confidence,
+    tags: input.tags,
+    links: input.links,
+    sensitivity: input.sensitivity ?? null,
+  });
   return perform(env, {
     kind: "fact",
     actor: actor(session),
+    access: session.access,
     grants: grants(session.access),
     key: input.key,
     statement: input.statement,
@@ -139,6 +159,7 @@ export async function writeFact(
     tags: input.tags,
     links: input.links,
     idempotencyKey,
+    payloadHash: hash,
     reroute,
   });
 }
@@ -165,9 +186,19 @@ export async function appendJournal(
   if (!hasScope(session.access, needed)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
   const at = input.at ?? new Date().toISOString();
   const journalFile = journalPath(session.access.agentId, input.target, etStamp(at, vaultTimeZone(env)).date);
-  // Sensitive text is never refused. It is appended to the writer's day file under sensitive/<d>/journal/ instead.
-  const reroute = routeFor(classifyText([input.title, input.body, ...input.tags].join("\n")), input.sensitivity === "sensitive", declared);
+  // Sensitive text is never refused. It is appended to a sensitive day file of the writer's instead:
+  // bots/<writer>/journal-sensitive/ for PII alone, sensitive/<d>/journal/<writer>/ otherwise.
+  const reroute = journalRouteFor(classifyText([input.title, input.body, ...input.tags].join("\n")), input.sensitivity === "sensitive", declared);
   assertRerouteWrite(session.access, journalFile, declared, reroute);
+  const hash = await keyedHash(idempotencyKey, "journal", {
+    target: input.target,
+    title: input.title,
+    body: input.body,
+    at: input.at ?? null,
+    tags: input.tags,
+    domain: input.domain ?? null,
+    sensitivity: input.sensitivity ?? null,
+  });
   return perform(env, {
     kind: "journal",
     actor: actor(session),
@@ -177,6 +208,7 @@ export async function appendJournal(
     at,
     tags: input.tags,
     idempotencyKey,
+    payloadHash: hash,
     domain: reroute ? null : declared,
     reroute,
   });
@@ -215,18 +247,30 @@ export async function writeNote(
     sensitivity = inSensitiveFolder(path) || (declared !== null && !isOrdinaryDomain(declared)) ? "sensitive" : "normal";
     assertCanWrite(session.access, path, sensitivity, declared);
   }
+  const ifMatch = headerMatch ?? input.if_match ?? null;
+  const hash = await keyedHash(idempotencyKey, "note", {
+    path,
+    body: input.body,
+    extra,
+    sensitivity: input.sensitivity ?? null,
+    domain: input.domain ?? null,
+    type: input.type,
+    if_match: ifMatch,
+  });
   return perform(env, {
     kind: "note",
     actor: actor(session),
+    access: session.access,
     grants: grants(session.access),
     path,
     body: input.body,
     extra,
-    ifMatch: headerMatch ?? input.if_match ?? null,
+    ifMatch,
     sensitivity,
     domain: reroute ? null : declared,
     noteType: input.type,
     idempotencyKey,
+    payloadHash: hash,
     reroute,
   });
 }
@@ -252,13 +296,13 @@ export async function forgetNote(
         .bind(path ?? "")
         .first<{ id: string; owner: string; domain: string | null; sensitivity: string; path: string }>();
   if (note) {
-    const sensitivity = note.sensitivity === "sensitive" || inSensitiveFolder(note.path) || (note.domain !== null && !isOrdinaryDomain(note.domain)) ? "sensitive" : "normal";
-    assertCanWrite(session.access, note.path, sensitivity, note.domain);
+    assertCanWrite(session.access, note.path, noteSensitivity(note), note.domain);
     if (path && note.path !== path) throw new VaultError("invalid", "path and id refer to different notes");
   } else if (path) {
     assertCanWrite(session.access, path, "normal");
   }
   if (note) assertForgettable(session.access, note.path);
+  const hash = await keyedHash(idempotencyKey, "forget", { path: path ?? null, id: input.id ?? null, reason: input.reason });
   return perform(env, {
     kind: "forget",
     actor: actor(session),
@@ -267,6 +311,7 @@ export async function forgetNote(
     id: note?.id ?? input.id,
     reason: input.reason,
     idempotencyKey,
+    payloadHash: hash,
   });
 }
 

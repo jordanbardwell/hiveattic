@@ -1,8 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import { canWrite, domainOf, type Access } from "./access";
+import { canWrite, domainOf, noteSensitivity, type Access } from "./access";
 import { frontmatterRoute } from "./classify";
 import { configure, FILE_LIMIT_BYTES, isOrdinaryDomain, isProductionDeploy, RESTRICTED, stagingResources, utf8Length, vaultTimeZone, writeTimeoutMs } from "./config";
 import { hash8, hmacSha256Hex, sha256Hex, ulid } from "./crypto";
+import { ulidTime } from "./idempotency";
 import { asVaultError, ERROR_STATUS, failure, VaultError, type ApiResult, type JsonValue } from "./errors";
 import { logEvent } from "./log";
 import {
@@ -25,6 +26,8 @@ import {
   isServerDocument,
   journalPath,
   ownerForPath,
+  PII_ROUTE,
+  piiJournalOwner,
   r2KeyFor,
   reroutedPath,
   sensitiveJournalPath,
@@ -49,6 +52,7 @@ export type WriterOp =
   | {
       kind: "fact";
       actor: Actor;
+      access: Access;
       grants: Grants;
       key: string;
       statement: string;
@@ -59,6 +63,7 @@ export type WriterOp =
       tags: string[];
       links: string[];
       idempotencyKey: string | null;
+      payloadHash: string | null;
       reroute: string | null;
     }
   | {
@@ -70,12 +75,14 @@ export type WriterOp =
       at: string;
       tags: string[];
       idempotencyKey: string | null;
+      payloadHash: string | null;
       domain: string | null;
       reroute: string | null;
     }
   | {
       kind: "note";
       actor: Actor;
+      access: Access;
       grants: Grants;
       path: string;
       body: string;
@@ -85,9 +92,10 @@ export type WriterOp =
       domain: string | null;
       noteType: string;
       idempotencyKey: string | null;
+      payloadHash: string | null;
       reroute: string | null;
     }
-  | { kind: "forget"; actor: Actor; access: Access; path?: string; id?: string; reason: string; idempotencyKey: string | null }
+  | { kind: "forget"; actor: Actor; access: Access; path?: string; id?: string; reason: string; idempotencyKey: string | null; payloadHash: string | null }
   | { kind: "restore"; actor: Actor; path?: string; id?: string; versionTs: string }
   | { kind: "purge"; actor: Actor; path?: string; id?: string }
   | { kind: "bootstrap"; actor: Actor; files: { path: string; markdown: string }[] }
@@ -169,7 +177,7 @@ type SaveInput = {
   reason: string;
   action: string;
   journal: { id: string; title: string; at: string; idempotencyKey: string | null } | null;
-  remember?: { key: string; status: number; data: (etag: string) => { [key: string]: JsonValue } } | null;
+  remember?: { key: string; hash: string | null; status: number; data: (etag: string) => { [key: string]: JsonValue } } | null;
   allowRetry?: boolean;
   skipPut?: boolean;
   storedEtag?: string | null;
@@ -225,9 +233,12 @@ export class VaultWriter extends DurableObject<Env> {
           status TEXT NOT NULL,
           result TEXT,
           created_at INTEGER NOT NULL,
-          finished_at INTEGER
+          finished_at INTEGER,
+          payload_hash TEXT
         )`,
       );
+      const opColumns = sql.exec<{ name: string }>("PRAGMA table_info(operations)").toArray().map((column) => column.name);
+      if (!opColumns.includes("payload_hash")) sql.exec("ALTER TABLE operations ADD COLUMN payload_hash TEXT");
       sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS operations_idem ON operations(agent_id, idem_key) WHERE idem_key IS NOT NULL");
       sql.exec(
         `CREATE TABLE IF NOT EXISTS jobs (
@@ -259,26 +270,29 @@ export class VaultWriter extends DurableObject<Env> {
     if (!API_OPS.has(op.kind)) return this.serialize(() => this.dispatch(op));
     const actor = (op as { actor: Actor }).actor;
     const key = idempotencyKeyOf(op);
+    const hash = payloadHashOf(op);
     if (key) {
       const row = this.ctx.storage.sql
-        .exec<{ op_id: string; status: string; result: string | null }>(
-          "SELECT op_id, status, result FROM operations WHERE agent_id = ? AND idem_key = ? AND created_at > ?",
+        .exec<{ op_id: string; status: string; result: string | null; payload_hash: string | null }>(
+          "SELECT op_id, status, result, payload_hash FROM operations WHERE agent_id = ? AND idem_key = ? AND created_at > ?",
           actor.agentId,
           key,
           Date.now() - OPERATION_TTL_MS,
         )
         .toArray()[0];
       if (row) {
-        if (row.status === "done" && row.result) {
-          const stored = JSON.parse(row.result) as ApiResult;
-          if (stored.ok) return stored;
-        }
+        const stored = row.status === "done" && row.result ? (JSON.parse(row.result) as ApiResult) : null;
+        // A key that wrote something, or is still writing, belongs to its payload. A failed attempt
+        // wrote nothing, so its key may be retried with a corrected payload.
+        const bound = row.status === "pending" || Boolean(stored?.ok);
+        if (bound && row.payload_hash && hash && row.payload_hash !== hash) return failure(keyReused());
+        if (stored?.ok) return stored;
         const running = this.inflight.get(row.op_id);
         if (row.status === "pending" && running) return this.withTimeout(row.op_id, running);
-        return this.launch(row.op_id, op, actor.agentId, key);
+        return this.launch(row.op_id, op, actor.agentId, key, hash);
       }
     }
-    return this.launch(operationId ?? ulid(), op, actor.agentId, key);
+    return this.launch(operationId ?? ulid(), op, actor.agentId, key, hash);
   }
 
   // RPC: a result stored for a write that answered 202. Only the writing agent or the admin token can read it.
@@ -398,16 +412,17 @@ export class VaultWriter extends DurableObject<Env> {
     return run;
   }
 
-  private launch(opId: string, op: WriterOp, agentId: string, key: string | null): Promise<ApiResult> {
+  private launch(opId: string, op: WriterOp, agentId: string, key: string | null, hash: string | null): Promise<ApiResult> {
     if (key) this.ctx.storage.sql.exec("DELETE FROM operations WHERE agent_id = ? AND idem_key = ? AND op_id != ?", agentId, key, opId);
     this.ctx.storage.sql.exec(
-      `INSERT INTO operations (op_id, agent_id, idem_key, kind, status, result, created_at, finished_at) VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL)
-       ON CONFLICT(op_id) DO UPDATE SET status = 'pending', result = NULL, finished_at = NULL`,
+      `INSERT INTO operations (op_id, agent_id, idem_key, kind, status, result, created_at, finished_at, payload_hash) VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)
+       ON CONFLICT(op_id) DO UPDATE SET status = 'pending', result = NULL, finished_at = NULL, payload_hash = excluded.payload_hash`,
       opId,
       agentId,
       key,
       op.kind,
       Date.now(),
+      hash,
     );
     const run = this.serialize(() => this.dispatch(op));
     this.inflight.set(opId, run);
@@ -466,7 +481,8 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   private async fact(op: Extract<WriterOp, { kind: "fact" }>): Promise<ApiResult> {
-    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
+    const replay = await this.replay(op.actor.agentId, idem);
     if (replay) return replay;
     const owner = op.scope === "shared" ? "shared" : op.actor.agentId;
     const basePath = factPath(op.actor.agentId, op.scope, op.key);
@@ -486,15 +502,18 @@ export class VaultWriter extends DurableObject<Env> {
     if (moving && existing && existing.status !== "active" && existing.status !== "superseded") {
       throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
     }
-    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
-    const sensitivity = route ? "sensitive" : "normal";
+    // An update keeps the stored domain and sensitivity: it cannot drop a tag or lower them, and the
+    // caller must be allowed to write the fact as it is stored.
+    const kept = active && !moving && !route ? keepClass(op.access, active, op.domain) : null;
+    const domain = route ? (route === RESTRICTED ? null : route) : (kept?.domain ?? op.domain);
+    const sensitivity = route || kept?.sensitivity === "sensitive" ? "sensitive" : "normal";
     const rerouted = rerouteFields(route);
     const status = route ? 201 : 200;
     const statementHash = await sha256Hex(normalizeStatement(op.statement));
     if (active && !moving && active.statement_hash === statementHash) {
       await this.env.DB.prepare("UPDATE notes SET last_confirmed_at = ? WHERE id = ?").bind(new Date().toISOString(), active.id).run();
       const data = { id: active.id, path: active.path, outcome: "deduped", etag: active.r2_etag, ...rerouted };
-      await this.remember(op.actor.agentId, op.idempotencyKey, data, status);
+      await this.remember(op.actor.agentId, idem, data, status);
       return withStatus(data, status);
     }
     // Tie-break is (observed_at, server written_at). Equal observed_at lets the incoming write win:
@@ -502,12 +521,27 @@ export class VaultWriter extends DurableObject<Env> {
     const incomingNewer = !active?.observed_at || Date.parse(op.observedAt) >= Date.parse(active.observed_at);
     const crossBot = Boolean(active && active.last_writer !== op.actor.agentId);
     const conflict = Boolean(active && crossBot && within24h(active.observed_at, op.observedAt) && active.statement_hash !== statementHash);
-    const facts = { key: op.key, owner, statement: op.statement, domain, sensitivity, observedAt: op.observedAt, confidence: op.confidence, tags: op.tags, links: op.links, source: op.actor.agentId, idempotencyKey: op.idempotencyKey };
+    const now = new Date().toISOString();
+    const facts = {
+      key: op.key,
+      owner,
+      statement: op.statement,
+      domain,
+      sensitivity,
+      observedAt: op.observedAt,
+      confidence: op.confidence,
+      tags: op.tags,
+      links: op.links,
+      source: op.actor.agentId,
+      idem,
+      rerouted: Boolean(route),
+    };
     if (moving && !incomingNewer) {
       // The newer neutral fact stays active. The older sensitive observation is kept in the sensitive
       // folder as superseded, never in the neutral fact's history.
       const id = existing?.id ?? ulid();
-      const markdown = this.factMarkdown({ ...facts, id, status: "superseded", supersedes: null });
+      const createdAt = existing ? createdAtOf(existing) : now;
+      const markdown = this.factMarkdown({ ...facts, id, status: "superseded", supersedes: null, outcome: "superseded_older", createdAt });
       const saved = await this.saveMarkdown({
         ...factSave(id, path, markdown, facts, statementHash, op.actor),
         ifMatch: existing?.r2_etag ?? null,
@@ -515,23 +549,26 @@ export class VaultWriter extends DurableObject<Env> {
         reason: existing ? "updated" : "created",
         action: "reroute",
         detail: rerouteDetail(basePath, route!),
-        remember: rememberFor(op.idempotencyKey, 201, (etag) => ({ id, path, outcome: "superseded_older", etag, ...rerouted })),
+        createdAt,
+        remember: rememberFor(idem, 201, (etag) => ({ id, path, outcome: "superseded_older", etag, ...rerouted })),
       });
       if (!saved.ok) return saved;
       return withStatus({ id, path, outcome: "superseded_older", etag: saved.data.etag, ...rerouted }, 201);
     }
     if (active && !moving && !incomingNewer) {
-      const loser = this.factMarkdown({ ...facts, id: active.id, status: "active", supersedes: null });
+      const loserOutcome = conflict ? "conflict_flagged" : "superseded_older";
+      const loser = this.factMarkdown({ ...facts, id: active.id, status: "active", supersedes: null, outcome: loserOutcome, createdAt: createdAtOf(active) });
       const loserTs = await this.snapshotBytes(active, loser, op.actor.agentId, "superseded");
       if (conflict) await this.flagConflict(op.key, active.id, loserTs, op.actor, op.observedAt, active.observed_at);
-      const data = { id: active.id, path: active.path, outcome: conflict ? "conflict_flagged" : "superseded_older", etag: active.r2_etag, ...rerouted };
-      await this.remember(op.actor.agentId, op.idempotencyKey, data, status);
+      const data = { id: active.id, path: active.path, outcome: loserOutcome, etag: active.r2_etag, ...rerouted };
+      await this.remember(op.actor.agentId, idem, data, status);
       await this.audit(op.actor, "write_fact", active.path, active.id, "ok", [], await this.auditHash(loser), utf8Length(loser));
       return withStatus(data, status);
     }
     const id = existing?.id ?? ulid();
-    const markdown = this.factMarkdown({ ...facts, id, status: "active", supersedes: existing?.version_ts ?? null });
     const outcome = conflict ? "conflict_flagged" : moving ? "moved" : existing ? "updated" : "created";
+    const createdAt = existing ? createdAtOf(existing) : now;
+    const markdown = this.factMarkdown({ ...facts, id, status: "active", supersedes: existing?.version_ts ?? null, outcome, createdAt });
     // A moving fact is saved without its key, the old fact is retired, and then the new one takes
     // the key, so the unique (owner, fact_key) index never sees two active rows.
     const saved = await this.saveMarkdown({
@@ -542,7 +579,8 @@ export class VaultWriter extends DurableObject<Env> {
       reason: existing ? "updated" : "created",
       action: route ? "reroute" : "write_fact",
       detail: route ? rerouteDetail(basePath, route) : null,
-      remember: rememberFor(op.idempotencyKey, status, (etag) => ({ id, path, outcome, etag, ...rerouted })),
+      createdAt,
+      remember: rememberFor(idem, status, (etag) => ({ id, path, outcome, etag, ...rerouted })),
     });
     if (!saved.ok) return saved;
     if (moving && active) {
@@ -550,7 +588,7 @@ export class VaultWriter extends DurableObject<Env> {
       await this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id).run();
     }
     if (conflict && active) await this.flagConflict(op.key, id, active.version_ts ?? active.id, op.actor, op.observedAt, active.observed_at);
-    if (op.scope === "shared") await this.refreshSummary(op.actor);
+    if (op.scope === "shared" || moving) await this.refreshSummary(op.actor);
     return withStatus({ id, path, outcome, etag: saved.data.etag, ...rerouted }, status);
   }
 
@@ -566,7 +604,10 @@ export class VaultWriter extends DurableObject<Env> {
     tags: string[];
     links: string[];
     source: string;
-    idempotencyKey: string | null;
+    idem: Idem;
+    rerouted: boolean;
+    outcome: string;
+    createdAt: string;
     status: string;
     supersedes: string | null;
   }): string {
@@ -587,32 +628,37 @@ export class VaultWriter extends DurableObject<Env> {
         confidence: input.confidence,
         status: input.status,
         tags: input.tags,
-        vault_idempotency: input.idempotencyKey,
         supersedes: input.supersedes,
+        vault_created_at: input.createdAt,
+        ...idempotencyFields(input.idem, input.outcome, input.rerouted),
       },
       body,
     );
   }
 
   private async journal(op: Extract<WriterOp, { kind: "journal" }>): Promise<ApiResult> {
-    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
+    const replay = await this.replay(op.actor.agentId, idem);
     if (replay) return replay;
     const stamp = etStamp(op.at, vaultTimeZone(this.env));
     const route = op.reroute;
-    // A rerouted entry goes to the writer's day file in the sensitive folder. The requested day
-    // file gets no entry and no placeholder.
+    // A rerouted entry goes to a sensitive day file of the writer's: PII alone to its own
+    // bots/<writer>/journal-sensitive/, one domain to sensitive/<d>/journal/<writer>/, anything else
+    // to sensitive/restricted/journal/<writer>/. The requested day file gets no entry and no placeholder.
     const requested = journalPath(op.actor.agentId, op.target, stamp.date);
     const path = route ? sensitiveJournalPath(route, op.actor.agentId, stamp.date) : requested;
     const decisions = !route && op.target === "decisions";
     const type = decisions ? "decision" : "journal";
     const owner = route || op.target === "own" ? op.actor.agentId : "shared";
-    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
+    // A day file holds many entries, so it never takes an entry's ordinary domain: a tag on one
+    // entry must not change who can read the file. Only a rerouted file carries its sensitive domain.
+    const domain = route && route !== RESTRICTED && route !== PII_ROUTE ? route : null;
     const sensitivity = route ? "sensitive" : "normal";
-    const rerouted = rerouteFields(route);
     const status = route ? 201 : 200;
     const entryId = ulid();
     const body = guardJournalBody(op.body).trim();
     const mac = await journalMac(this.env, entryId, op.actor.agentId, op.title, body);
+    const idemMarker = idem.key ? await journalIdempotencyMarker(this.env, entryId, op.actor.agentId, idem.key, idem.hash) : "";
     let attempt = 0;
     while (attempt < 3) {
       attempt += 1;
@@ -626,7 +672,7 @@ export class VaultWriter extends DurableObject<Env> {
         body,
         op.tags.length ? `Tags: ${op.tags.join(", ")}` : "",
         `<!-- hiveattic:e=${entryId}:${op.actor.agentId}:${mac} -->`,
-        op.idempotencyKey ? `<!-- hiveattic:idempotency=${op.idempotencyKey} -->` : "",
+        idemMarker,
       ]
         .filter(Boolean)
         .join("\n");
@@ -667,10 +713,11 @@ export class VaultWriter extends DurableObject<Env> {
         action: route ? "journal_reroute" : "append_journal",
         detail: route ? rerouteDetail(requested, route) : null,
         journal: { id: entryId, title: op.title, at: stamp.iso, idempotencyKey: op.idempotencyKey },
-        remember: rememberFor(op.idempotencyKey, status, (etag) => ({ entry_id: entryId, path, block_ref: `^${entryId}`, etag, ...rerouted })),
+        // The reply names the entry, not the day file's etag, so a rebuild can restore it exactly.
+        remember: rememberFor(idem, status, () => journalReply(entryId, path, route)),
         allowRetry: true,
       });
-      if (saved.ok) return withStatus({ entry_id: entryId, path, block_ref: `^${entryId}`, etag: saved.data.etag, ...rerouted }, status);
+      if (saved.ok) return withStatus(journalReply(entryId, path, route), status);
       if (saved.error.code !== "conflict_etag" || attempt === 3) return saved;
     }
     return failure(new VaultError("conflict_etag", "Journal changed while appending"));
@@ -680,7 +727,8 @@ export class VaultWriter extends DurableObject<Env> {
     if (isAppendOnlyPath(op.path) || isFactPath(op.path) || op.path === "profile/summary.md") {
       throw new VaultError("invalid", "That path is append-only or server-managed");
     }
-    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
+    const replay = await this.replay(op.actor.agentId, idem);
     if (replay) return replay;
     const route = op.reroute;
     const path = route ? reroutedPath(route, op.path) : op.path;
@@ -704,9 +752,13 @@ export class VaultWriter extends DurableObject<Env> {
     }
     const id = existing?.id ?? ulid();
     const now = new Date().toISOString();
-    const domain = route ? (route === RESTRICTED ? null : route) : op.domain;
-    const sensitivity = route ? "sensitive" : op.sensitivity;
-    const createdAt = existing ? (stringField(parseFrontmatter(existing.frontmatter).created_at) ?? existing.created_at) : now;
+    // An update keeps the stored domain and sensitivity: it cannot drop a tag or lower them, and the
+    // caller must be allowed to write the note as it is stored.
+    const kept = existing && !route ? keepClass(op.access, existing, op.domain) : null;
+    const domain = route ? (route === RESTRICTED ? null : route) : (kept?.domain ?? op.domain);
+    const sensitivity = route || kept?.sensitivity === "sensitive" ? "sensitive" : op.sensitivity;
+    const createdAt = existing ? createdAtOf(existing) : now;
+    const outcome = moving ? "moved" : existing ? "updated" : "created";
     const markdown = buildMarkdown(
       {
         ...stripReserved(op.extra),
@@ -721,11 +773,11 @@ export class VaultWriter extends DurableObject<Env> {
         updated_at: now,
         tags: stringList(op.extra.tags),
         aliases: stringList(op.extra.aliases),
-        vault_idempotency: op.idempotencyKey,
+        vault_created_at: createdAt,
+        ...idempotencyFields(idem, outcome, Boolean(route)),
       },
       op.body,
     );
-    const outcome = moving ? "moved" : existing ? "updated" : "created";
     const rerouted = rerouteFields(route);
     const status = route ? 201 : 200;
     const saved = await this.saveMarkdown({
@@ -748,7 +800,7 @@ export class VaultWriter extends DurableObject<Env> {
       detail: route ? rerouteDetail(op.path, route) : null,
       journal: null,
       createdAt,
-      remember: rememberFor(op.idempotencyKey, status, (etag) => ({ id, path, etag, outcome, ...rerouted })),
+      remember: rememberFor(idem, status, (etag) => ({ id, path, etag, outcome, ...rerouted })),
     });
     if (!saved.ok) return saved;
     if (moving) await this.retireMoved(original!, path, op.actor, true);
@@ -756,24 +808,26 @@ export class VaultWriter extends DurableObject<Env> {
   }
 
   private async forget(op: Extract<WriterOp, { kind: "forget" }>): Promise<ApiResult> {
-    const replay = await this.replay(op.actor.agentId, op.idempotencyKey);
+    const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
+    const replay = await this.replay(op.actor.agentId, idem);
     if (replay) return replay;
     const note = await this.resolveNote(op.id, op.path);
     if (!note) throw new VaultError("not_found", "Note not found");
     // Authorize against the resolved note, never the caller-supplied path.
-    if (!canWrite(op.access, note.path, note.sensitivity === "sensitive" ? "sensitive" : "normal", note.domain)) {
+    if (!canWrite(op.access, note.path, noteSensitivity(note), note.domain)) {
       throw new VaultError("forbidden_scope", "Scope does not allow this write");
     }
     if (op.path && note.path !== op.path) throw new VaultError("invalid", "path and id refer to different notes");
     if (note.status === "forgotten") {
       const data = { id: note.id, path: note.path, status: "forgotten" };
-      await this.remember(op.actor.agentId, op.idempotencyKey, data, 200);
+      await this.remember(op.actor.agentId, idem, data, 200);
       return { ok: true, data };
     }
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
-    // The stub carries no caller text. The reason stays in the tombstone row, which only the admin reads.
-    const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
+    // The stub carries no caller text. The reason stays in the tombstone row, which only the admin
+    // reads. A keyed forget leaves its key and payload hash in the stub, so a rebuild restores it.
+    const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date, idem.key ? { by: op.actor.agentId, at: now, idem } : null);
     await this.snapshotBytes(note, note.body, op.actor.agentId, "forgotten");
     const hash = await sha256Hex(stub);
     const intentId = ulid();
@@ -806,7 +860,7 @@ export class VaultWriter extends DurableObject<Env> {
         `INSERT INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, 'forgotten')`,
       ).bind(note.id, etag.versionTs, r2KeyFor(this.prefix(), note.path), hash, op.actor.agentId),
       ...this.vectorDeletes(chunkIds, note.id, now),
-      ...this.rememberStatements(op.actor.agentId, op.idempotencyKey, data, 200),
+      ...this.rememberStatements(op.actor.agentId, idem, data, 200),
     ]);
     this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
     await this.audit(op.actor, "forget", note.path, note.id, "ok", [], await this.auditHash(stub), utf8Length(stub));
@@ -858,7 +912,7 @@ export class VaultWriter extends DurableObject<Env> {
       const id = ulid();
       const current = parseMarkdown(file.markdown);
       const markdown = buildMarkdown(
-        { ...current.frontmatter, vault_id: id, type: inferType(file.path), owner: ownerForPath(file.path), status: "active" },
+        { ...current.frontmatter, vault_id: id, type: inferType(file.path), owner: ownerForPath(file.path), status: "active", vault_created_at: new Date().toISOString() },
         current.body,
       );
       const put = await this.putVault(file.path, markdown, id, null);
@@ -1187,7 +1241,7 @@ export class VaultWriter extends DurableObject<Env> {
           r2Key,
           status,
           input.observedAt,
-          input.createdAt ?? stringField(parsed.frontmatter.created_at) ?? now,
+          input.createdAt ?? stringField(parsed.frontmatter.vault_created_at) ?? stringField(parsed.frontmatter.created_at) ?? now,
           now,
           versionTs,
           input.actor.agentId,
@@ -1288,7 +1342,10 @@ export class VaultWriter extends DurableObject<Env> {
         input.detail ?? null,
       ),
     );
-    if (input.remember) statements.push(...this.rememberStatements(input.actor.agentId, input.remember.key, input.remember.data(put.etag), input.remember.status));
+    if (input.remember) {
+      const { key, hash } = input.remember;
+      statements.push(...this.rememberStatements(input.actor.agentId, { key, hash }, input.remember.data(put.etag), input.remember.status));
+    }
     try {
       await this.env.DB.batch(statements);
       if (!input.skipPut) this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
@@ -1798,7 +1855,7 @@ export class VaultWriter extends DurableObject<Env> {
     }
     const chosen = entries.slice(0, take);
     const loads = chosen.filter((entry) => entry.path && !isCurrent(live.get(entry.path), entry.object.etag, gen));
-    const texts = new Map<string, { text: string; etag: string | null; metaId: string | null }>();
+    const texts = new Map<string, { text: string; etag: string | null; metaId: string | null; uploaded: string | null }>();
     let loadedUpTo = chosen.length;
     for (const group of slices(loads, R2_READ_CONCURRENCY)) {
       if (Date.now() > deadline && texts.size > 0) {
@@ -1808,7 +1865,9 @@ export class VaultWriter extends DurableObject<Env> {
       const files = await Promise.all(
         group.map(async (entry) => {
           const file = await this.env.VAULT.get(entry.object.key);
-          return file ? { key: entry.object.key, text: await file.text(), etag: normalizeEtag(file.etag), metaId: file.customMetadata?.["vault-id"] ?? null } : null;
+          return file
+            ? { key: entry.object.key, text: await file.text(), etag: normalizeEtag(file.etag), metaId: file.customMetadata?.["vault-id"] ?? null, uploaded: file.uploaded.toISOString() }
+            : null;
         }),
       );
       for (const file of files) if (file) texts.set(file.key, file);
@@ -1877,7 +1936,7 @@ export class VaultWriter extends DurableObject<Env> {
         }
       }
       const hash = await sha256Hex(file.text);
-      const createdAt = row?.created_at ?? stringField(fm.created_at) ?? stringField(fm.updated_at) ?? now;
+      const createdAt = row?.created_at ?? stringField(fm.vault_created_at) ?? stringField(fm.created_at) ?? stringField(fm.updated_at) ?? file.uploaded ?? now;
       rows.notes.push([
         id,
         file.path,
@@ -1905,21 +1964,19 @@ export class VaultWriter extends DurableObject<Env> {
         for (const chunk of chunkMarkdown(file.path, title, file.parsed.body)) rows.chunks.push([`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, file.path, chunk.tokenCount]);
         for (const target of linkTargets(file.parsed.body)) rows.links.push([id, target]);
       }
-      const rerouted = rerouteFields(sensitiveSegment(file.path));
-      const replyStatus = file.path.startsWith("sensitive/") ? 201 : 200;
+      // L5: idempotency rows inside the 7-day window come back from the files themselves: the MAC'd
+      // markers of journal entries, and the frontmatter of notes, facts, and keyed forget stubs.
       if (type === "journal" || type === "decision") {
         for (const entry of journalEntries(file.text)) {
           const agent = entry.agent || owner;
           if (!(await journalMacMatches(this.env, { ...entry, agent }))) continue;
-          rows.journal.push([entry.id, id, agent, now, entry.title, `^${entry.id}`, entry.idempotency]);
-          if (entry.idempotency) {
-            rows.idempotency.push([agent, entry.idempotency, stored(replyStatus, { entry_id: entry.id, path: file.path, block_ref: `^${entry.id}`, ...rerouted }), now]);
-          }
+          rows.journal.push([entry.id, id, agent, journalAt(entry.id, now), entry.title, `^${entry.id}`, entry.idempotency]);
+          const restored = await journalIdempotencyRow(this.env, entry, agent, file.path);
+          if (restored) rows.idempotency.push([restored.agent, restored.key, restored.response, restored.at, restored.hash]);
         }
       } else {
-        const key = stringField(fm.vault_idempotency);
-        const agent = stringField(fm.source);
-        if (key && agent) rows.idempotency.push([agent, key, stored(replyStatus, { id, path: file.path, etag: file.etag, outcome: "restored", ...rerouted }), now]);
+        const restored = frontmatterIdempotencyRow(fm, { id, path: file.path, etag: file.etag, type, status });
+        if (restored) rows.idempotency.push([restored.agent, restored.key, restored.response, restored.at, restored.hash]);
       }
       if (status === "forgotten") {
         rows.tombstones.push([id, hash]);
@@ -1992,7 +2049,7 @@ export class VaultWriter extends DurableObject<Env> {
       statements.push(db.prepare(`INSERT OR IGNORE INTO links (src_note_id, target, dst_note_id) SELECT ${jsonSelect(["src", "target"])}, NULL FROM json_each(?)`).bind(json));
     }
     for (const json of jsonSlices(rows.journal)) statements.push(db.prepare(jsonInsert("INSERT OR IGNORE INTO journal_entries", JOURNAL_COLUMNS)).bind(json));
-    for (const json of jsonSlices(rows.idempotency)) statements.push(db.prepare(jsonInsert("INSERT OR IGNORE INTO idempotency", ["agent_id", "key", "response", "at"])).bind(json));
+    for (const json of jsonSlices(rows.idempotency)) statements.push(db.prepare(jsonInsert("INSERT OR IGNORE INTO idempotency", ["agent_id", "key", "response", "at", "payload_hash"])).bind(json));
     for (const json of jsonSlices(rows.tombstones)) {
       statements.push(
         db.prepare(
@@ -2324,31 +2381,34 @@ export class VaultWriter extends DurableObject<Env> {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
   }
 
-  private async replay(agentId: string, key: string | null): Promise<ApiResult | null> {
-    if (!key) return null;
-    const row = await this.env.DB.prepare("SELECT response, at FROM idempotency WHERE agent_id = ? AND key = ?")
-      .bind(agentId, key)
-      .first<{ response: string; at: string }>();
+  // A stored reply for (agent, key) inside the 7-day window. The same payload replays it; any
+  // other payload is refused with 422. A row with no hash predates payload binding and replays.
+  private async replay(agentId: string, idem: Idem): Promise<ApiResult | null> {
+    if (!idem.key) return null;
+    const row = await this.env.DB.prepare("SELECT response, at, payload_hash FROM idempotency WHERE agent_id = ? AND key = ?")
+      .bind(agentId, idem.key)
+      .first<{ response: string; at: string; payload_hash: string | null }>();
     if (!row) return null;
     if (Date.now() - Date.parse(row.at) > OPERATION_TTL_MS) return null;
+    if (row.payload_hash && idem.hash && row.payload_hash !== idem.hash) throw keyReused();
     const parsed = JSON.parse(row.response) as { v?: number; status?: number; data?: { [key: string]: JsonValue }; pending?: boolean };
     if (parsed.pending) return null;
     if (parsed.v === 2 && parsed.data) return withStatus(parsed.data, parsed.status ?? 200);
     return { ok: true, data: parsed as { [key: string]: JsonValue } };
   }
 
-  private rememberStatements(agentId: string, key: string | null, data: { [key: string]: JsonValue }, status: number): D1PreparedStatement[] {
-    if (!key) return [];
+  private rememberStatements(agentId: string, idem: Idem, data: { [key: string]: JsonValue }, status: number): D1PreparedStatement[] {
+    if (!idem.key) return [];
     return [
       this.env.DB.prepare(
-        `INSERT INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(agent_id, key) DO UPDATE SET response = excluded.response, at = excluded.at`,
-      ).bind(agentId, key, stored(status, data), new Date().toISOString()),
+        `INSERT INTO idempotency (agent_id, key, response, at, payload_hash) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id, key) DO UPDATE SET response = excluded.response, at = excluded.at, payload_hash = excluded.payload_hash`,
+      ).bind(agentId, idem.key, stored(status, data), new Date().toISOString(), idem.hash),
     ];
   }
 
-  private async remember(agentId: string, key: string | null, data: { [key: string]: JsonValue }, status: number): Promise<void> {
-    const statements = this.rememberStatements(agentId, key, data, status);
+  private async remember(agentId: string, idem: Idem, data: { [key: string]: JsonValue }, status: number): Promise<void> {
+    const statements = this.rememberStatements(agentId, idem, data, status);
     if (statements.length) await this.env.DB.batch(statements);
   }
 
@@ -2482,6 +2542,43 @@ function idempotencyKeyOf(op: WriterOp): string | null {
   return null;
 }
 
+function payloadHashOf(op: WriterOp): string | null {
+  if (op.kind === "fact" || op.kind === "journal" || op.kind === "note" || op.kind === "forget") return op.payloadHash ?? null;
+  return null;
+}
+
+type Idem = { key: string | null; hash: string | null };
+
+function keyReused(): VaultError {
+  return new VaultError("idempotency_key_reused", "This idempotency key was already used with a different payload", ["idempotency_key"]);
+}
+
+// Frontmatter that lets a rebuild restore a keyed write's reply: the key, the payload hash, the
+// outcome, and whether it was rerouted. Nothing is written for a write without a key.
+function idempotencyFields(idem: Idem, outcome: string, rerouted: boolean): Frontmatter {
+  if (!idem.key) return {};
+  return { vault_idempotency: idem.key, vault_idempotency_hash: idem.hash, vault_outcome: outcome, vault_rerouted: rerouted ? true : null };
+}
+
+function journalReply(entryId: string, path: string, route: string | null): { [key: string]: JsonValue } {
+  return { entry_id: entryId, path, block_ref: `^${entryId}`, ...rerouteFields(route) };
+}
+
+// An update keeps what the stored note already is. The caller must be allowed to write the note as
+// it is stored, may not change its domain, and cannot lower it to normal.
+function keepClass(access: Access, existing: NoteRow, next: string | null): { domain: string | null; sensitivity: "normal" | "sensitive" } {
+  const sensitivity = noteSensitivity(existing);
+  if (!canWrite(access, existing.path, sensitivity, existing.domain)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
+  if (existing.domain && next && next !== existing.domain) throw new VaultError("invalid", "A write cannot change a note's domain", ["domain"]);
+  return { domain: existing.domain ?? next, sensitivity };
+}
+
+// The created_at a stored note keeps across updates and rebuilds.
+function createdAtOf(note: { frontmatter: string; created_at: string }): string {
+  const fm = parseFrontmatter(note.frontmatter);
+  return stringField(fm.vault_created_at) ?? stringField(fm.created_at) ?? note.created_at;
+}
+
 function jobRunning(id: string): VaultError {
   return new VaultError("job_running", "A job is already running", [id], { job_id: id });
 }
@@ -2529,8 +2626,8 @@ function stored(status: number, data: { [key: string]: JsonValue }): string {
   return JSON.stringify({ v: 2, status, data });
 }
 
-function rememberFor(key: string | null, status: number, data: (etag: string) => { [key: string]: JsonValue }): SaveInput["remember"] {
-  return key ? { key, status, data } : null;
+function rememberFor(idem: Idem, status: number, data: (etag: string) => { [key: string]: JsonValue }): SaveInput["remember"] {
+  return idem.key ? { key: idem.key, hash: idem.hash, status, data } : null;
 }
 
 function rerouteDetail(requested: string, domain: string): string {
@@ -2562,8 +2659,17 @@ function factSave(
   };
 }
 
-function forgottenStub(note: { id: string; type: string; owner: string; sensitivity: string }, day: string): string {
-  return buildMarkdown({ vault_id: note.id, type: note.type, owner: note.owner, status: "forgotten", sensitivity: note.sensitivity }, `Forgotten on ${day}.`);
+// The body a forgotten or moved note keeps. A keyed forget also records who forgot it, when, and
+// its key and payload hash, which is the tombstone a rebuild restores the forget's reply from.
+function forgottenStub(
+  note: { id: string; type: string; owner: string; sensitivity: string; created_at?: string; frontmatter?: string },
+  day: string,
+  keyed: { by: string; at: string; idem: Idem } | null = null,
+): string {
+  const createdAt = note.created_at && note.frontmatter !== undefined ? createdAtOf({ created_at: note.created_at, frontmatter: note.frontmatter }) : null;
+  const fm: Frontmatter = { vault_id: note.id, type: note.type, owner: note.owner, status: "forgotten", sensitivity: note.sensitivity, vault_created_at: createdAt };
+  if (keyed?.idem.key) Object.assign(fm, { source: keyed.by, updated_at: keyed.at, vault_idempotency: keyed.idem.key, vault_idempotency_hash: keyed.idem.hash });
+  return buildMarkdown(fm, `Forgotten on ${day}.`);
 }
 
 function isCurrent(row: { index_gen: number | null; r2_etag: string | null } | undefined, etag: string, gen: number): boolean {
@@ -2668,6 +2774,68 @@ async function journalMac(env: Env, id: string, agent: string, title: string, bo
   return (await hmacSha256Hex(env.JOURNAL_MAC_KEY, `${id}:${agent}:${material}`)).slice(0, 16);
 }
 
+// The marker that carries a journal entry's idempotency key and payload hash. Its MAC binds both to
+// the entry id and the writer, so a rebuild restores only what the server wrote.
+async function journalIdempotencyMarker(env: Env, entryId: string, agent: string, key: string, hash: string | null): Promise<string> {
+  const h = hash ?? "-";
+  const mac = await idempotencyMac(env, entryId, agent, key, h);
+  return `<!-- hiveattic:idempotency=${key} h=${h} mac=${mac} -->`;
+}
+
+async function idempotencyMac(env: Env, entryId: string, agent: string, key: string, hash: string): Promise<string> {
+  if (!env.JOURNAL_MAC_KEY) return "";
+  return (await hmacSha256Hex(env.JOURNAL_MAC_KEY, `idempotency:${entryId}:${agent}:${key}:${hash}`)).slice(0, 16);
+}
+
+// The idempotency row a rebuild restores for one MAC-checked journal entry, inside the 7-day window.
+// An old marker with no hash restores the key without one, which replays for any payload.
+async function journalIdempotencyRow(
+  env: Env,
+  entry: JournalEntry,
+  agent: string,
+  path: string,
+): Promise<{ agent: string; key: string; hash: string | null; at: string; response: string } | null> {
+  if (!entry.idempotency) return null;
+  const time = ulidTime(entry.id);
+  if (time === null || Date.now() - time > OPERATION_TTL_MS) return null;
+  let hash: string | null = null;
+  if (entry.idempotencyMac !== null) {
+    const h = entry.idempotencyHash ?? "-";
+    if ((await idempotencyMac(env, entry.id, agent, entry.idempotency, h)) !== entry.idempotencyMac) return null;
+    hash = h === "-" ? null : h;
+  }
+  const route = journalRouteOf(path);
+  return { agent, key: entry.idempotency, hash, at: new Date(time).toISOString(), response: stored(route ? 201 : 200, journalReply(entry.id, path, route)) };
+}
+
+// The route a stored journal path was written by: the writer's own PII day file, a sensitive folder, or none.
+function journalRouteOf(path: string): string | null {
+  if (piiJournalOwner(path)) return PII_ROUTE;
+  return sensitiveSegment(path);
+}
+
+// The idempotency row a rebuild restores from a note's or fact's frontmatter, or from a keyed
+// forget's stub, inside the 7-day window.
+function frontmatterIdempotencyRow(
+  fm: Frontmatter,
+  file: { id: string; path: string; etag: string | null; type: string; status: string },
+): { agent: string; key: string; hash: string | null; at: string; response: string } | null {
+  const key = stringField(fm.vault_idempotency);
+  const agent = stringField(fm.source);
+  const at = stringField(fm.updated_at);
+  if (!key || !agent || !at || Number.isNaN(Date.parse(at)) || Date.now() - Date.parse(at) > OPERATION_TTL_MS) return null;
+  const hash = stringField(fm.vault_idempotency_hash) ?? null;
+  if (file.status === "forgotten") return { agent, key, hash, at, response: stored(200, { id: file.id, path: file.path, status: "forgotten" }) };
+  const outcome = stringField(fm.vault_outcome) ?? "restored";
+  const reroute = fm.vault_rerouted === true ? sensitiveSegment(file.path) : null;
+  const rerouted = rerouteFields(reroute);
+  const data =
+    file.type === "fact"
+      ? { id: file.id, path: file.path, outcome, etag: file.etag, ...rerouted }
+      : { id: file.id, path: file.path, etag: file.etag, outcome, ...rerouted };
+  return { agent, key, hash, at, response: stored(reroute ? 201 : 200, data) };
+}
+
 async function journalMacMatches(env: Env, entry: JournalEntry): Promise<boolean> {
   if (!entry.mac) return false;
   const expected = await journalMac(env, entry.id, entry.agent, entry.title, entry.body);
@@ -2675,21 +2843,28 @@ async function journalMacMatches(env: Env, entry: JournalEntry): Promise<boolean
 }
 
 export async function restoreJournalMarkers(env: Env, noteId: string, path: string, markdown: string, agentHint: string): Promise<void> {
-  const sensitive = path.startsWith("sensitive/");
+  const now = new Date().toISOString();
   for (const entry of journalEntries(markdown)) {
     const agent = entry.agent || agentHint;
     if (!(await journalMacMatches(env, { ...entry, agent }))) continue;
-    const at = new Date().toISOString();
     await env.DB.prepare(
       `INSERT OR IGNORE INTO journal_entries (id, note_id, agent_id, at, title, block_ref, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(entry.id, noteId, agent, at, entry.title, `^${entry.id}`, entry.idempotency)
+      .bind(entry.id, noteId, agent, journalAt(entry.id, now), entry.title, `^${entry.id}`, entry.idempotency)
       .run();
-    if (entry.idempotency) {
-      const data = { entry_id: entry.id, block_ref: `^${entry.id}`, path, ...rerouteFields(sensitive ? sensitiveSegment(path) : null) };
-      await env.DB.prepare(`INSERT OR IGNORE INTO idempotency (agent_id, key, response, at) VALUES (?, ?, ?, ?)`).bind(agent, entry.idempotency, stored(sensitive ? 201 : 200, data), at).run();
+    const restored = await journalIdempotencyRow(env, entry, agent, path);
+    if (restored) {
+      await env.DB.prepare(`INSERT OR IGNORE INTO idempotency (agent_id, key, response, at, payload_hash) VALUES (?, ?, ?, ?, ?)`)
+        .bind(restored.agent, restored.key, restored.response, restored.at, restored.hash)
+        .run();
     }
   }
+}
+
+// When a journal entry was written: the time in its ULID, or the fallback.
+function journalAt(entryId: string, fallback: string): string {
+  const time = ulidTime(entryId);
+  return time === null ? fallback : new Date(time).toISOString();
 }
 
 function errorText(err: unknown): string {

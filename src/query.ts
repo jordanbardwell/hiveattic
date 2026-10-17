@@ -245,12 +245,20 @@ function domainTagSql(access: Access): { sql: string; binds: string[] } {
 }
 
 // A SQL prefilter that is broader than canRead, which still checks every row. No branch reaches
-// sensitive/restricted/ for a non-admin token.
+// sensitive/restricted/ or another bot's bots/<a>/journal-sensitive/ for a non-admin token, and a
+// bot always reaches its own journal-sensitive/ files.
 function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (access.admin) return { sql: "1 = 1", binds: [] };
-  const fenced = (inner: { sql: string; binds: string[] }) => ({ sql: `n.path NOT LIKE ? AND (${inner.sql})`, binds: [RESTRICTED_LIKE, ...inner.binds] });
+  const ownPii = `bots/${access.agentId}/journal-sensitive/%`;
+  const fenced = (inner: { sql: string; binds: string[] }) => ({
+    sql: `n.path NOT LIKE ? AND (n.path NOT LIKE 'bots/%/journal-sensitive/%' OR n.path LIKE ?) AND (${inner.sql})`,
+    binds: [RESTRICTED_LIKE, ownPii, ...inner.binds],
+  });
   if (hasScope(access, "read:all")) return fenced({ sql: "1 = 1", binds: [] });
-  const parts: { sql: string; binds: string[] }[] = [{ sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] }];
+  const parts: { sql: string; binds: string[] }[] = [
+    { sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] },
+    { sql: "n.path LIKE ?", binds: [ownPii] },
+  ];
   if (hasScope(access, "read:own") || hasScope(access, "write:own")) {
     parts.push({ sql: "n.path LIKE ?", binds: [`bots/${access.agentId}/%`] });
   }

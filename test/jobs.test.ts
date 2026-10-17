@@ -210,13 +210,16 @@ describe("write timeouts and idempotency keys", () => {
     expect(frontmatter).toContain(`vault_idempotency: ${key}`);
     const differ = await rest("/v1/notes", writer, { method: "PUT", headers: { "idempotency-key": "one" }, body: JSON.stringify({ path, body: "x", type: "note", idempotency_key: "two" }) });
     expect(differ.status).toBe(400);
-    expect(differ.json.error?.reasons).toContain("idempotency_key");
+    expect(differ.json.error).toMatchObject({ code: "idempotency_key_conflict", reasons: ["idempotency_key"] });
     expect((await rest("/v1/notes", writer, { method: "PUT", headers: { "idempotency-key": "bad key!" }, body: JSON.stringify({ path, body: "x", type: "note" }) })).status).toBe(400);
     const factKey = `fact-${nid()}`;
     const fact = { key: `idem-${nid()}`, statement: "Likes rain", observed_at: "2099-01-01T00:00:00Z", scope: "own" };
     const factFirst = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": factKey }, body: JSON.stringify(fact) });
-    const factRetry = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": factKey }, body: JSON.stringify({ ...fact, statement: "Likes snow" }) });
+    const factRetry = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": factKey }, body: JSON.stringify(fact) });
     expect(factRetry.json.data).toEqual(factFirst.json.data);
+    const factReused = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": factKey }, body: JSON.stringify({ ...fact, statement: "Likes snow" }) });
+    expect(factReused.status).toBe(422);
+    expect(factReused.json.error?.code).toBe("idempotency_key_reused");
     const forgetKey = `forget-${nid()}`;
     const forgotten = await rest("/v1/forget", writer, { method: "POST", body: JSON.stringify({ path, reason: "done", idempotency_key: forgetKey }) });
     expect(forgotten.status).toBe(200);

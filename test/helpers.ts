@@ -33,11 +33,17 @@ export async function rest(path: string, token: string | null, init: RequestInit
   return { status: response.status, json, text, headers: response.headers };
 }
 
-export async function mcp(token: string, name: string, args: Record<string, unknown>): Promise<{ status: number; json: Envelope; text: string }> {
-  const headers = {
+export async function mcp(
+  token: string,
+  name: string,
+  args: Record<string, unknown>,
+  extraHeaders: Record<string, string> = {},
+): Promise<{ status: number; json: Envelope; text: string }> {
+  const headers: Record<string, string> = {
     authorization: `Bearer ${token}`,
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
+    ...extraHeaders,
   };
   const init = await SELF.fetch("https://hiveattic.test/mcp", {
     method: "POST",

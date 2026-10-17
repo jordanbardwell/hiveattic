@@ -1,5 +1,6 @@
 import { isSensitiveDomain, RESTRICTED } from "./config";
 import { parseMarkdown, type Frontmatter } from "./markdown";
+import { PII_ROUTE } from "./paths";
 
 // Content classification. It never rejects anything: a hit only decides that a write lands in a
 // sensitive folder instead of the path the caller named. The word lists are deliberately narrow
@@ -139,6 +140,15 @@ export function routeFor(classification: Classification, flagged: boolean, decla
   return null;
 }
 
+// Journal entries route the same way with one difference: PII alone goes to the writer's own
+// bots/<writer>/journal-sensitive/ day file, even for a shared or decisions target, instead of
+// restricted. A bare sensitive flag, or health and finance together, still go to restricted.
+export function journalRouteFor(classification: Classification, flagged: boolean, declared: string | null): string | null {
+  const route = routeFor(classification, flagged, declared);
+  const piiOnly = classification.pii && !flagged && !classification.health && !classification.finance && !(declared && isSensitiveDomain(declared));
+  return route === RESTRICTED && piiOnly ? PII_ROUTE : route;
+}
+
 // Frontmatter keys the server writes. Their values are ids, agent names, and timestamps, and
 // are left out of classification so an agent id cannot reroute every file it touches.
 const SERVER_KEYS = new Set([
@@ -162,7 +172,7 @@ const SERVER_KEYS = new Set([
 export function frontmatterText(frontmatter: Frontmatter): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(frontmatter)) {
-    if (SERVER_KEYS.has(key)) continue;
+    if (SERVER_KEYS.has(key) || key.startsWith("vault_")) continue;
     parts.push(typeof value === "string" ? value : JSON.stringify(value) ?? "");
   }
   return parts.join("\n");

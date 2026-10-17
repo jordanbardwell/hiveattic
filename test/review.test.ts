@@ -168,7 +168,7 @@ describe("architect review regressions", () => {
 
   it("P16 a sensitive journal entry is rerouted, not refused, and other bots cannot read it", async () => {
     await resetVault();
-    const owner = await mint("owner-a", ["read:own", "write:own", "read:shared", "write:shared"], "owner-a");
+    const owner = await mint("owner-a", ["read:own", "write:own", "read:shared", "write:shared", "write:decisions"], "owner-a");
     const bots = await mint("bots-reader", ["read:shared", "read:bots/*", "read:sensitive/*"], "bots-reader");
     // A sensitive flag with no domain goes to sensitive/restricted/, which only the admin token reads.
     const appended = await rest("/v1/journal", owner, {
@@ -191,13 +191,40 @@ describe("architect review regressions", () => {
     expect(shared.json.data?.path).toBe("sensitive/restricted/journal/owner-a/2026-05-01.md");
     expect((await rest("/v1/notes?path=journal/2026/05/2026-05-01.md", owner)).status).toBe(404);
     expect(results((await rest("/v1/search?q=qxprivateshared", owner)).json)).toEqual([]);
-    // A phone number is PII. It reroutes to restricted too.
-    const phone = await rest("/v1/journal", owner, {
-      method: "POST",
-      body: JSON.stringify({ target: "own", title: "call", body: "Reached me at 206-555-0142", at: "2026-05-02T16:00:00.000Z" }),
-    });
-    expect(phone.status).toBe(201);
-    expect(String(phone.json.data?.path)).toBe("sensitive/restricted/journal/owner-a/2026-05-02.md");
+    // PII alone in a journal entry goes to the writer's own journal-sensitive day file (flat date in
+    // VAULT_TZ), for own, shared, and decisions targets alike. Nothing goes to restricted.
+    const pii = "Reached me at 206-555-0142";
+    for (const [target, at] of [["own", "2026-05-02T16:00:00.000Z"], ["shared", "2026-05-02T17:00:00.000Z"], ["decisions", "2026-05-02T18:00:00.000Z"]] as const) {
+      const phone = await rest("/v1/journal", owner, { method: "POST", body: JSON.stringify({ target, title: `call ${target}`, body: `${pii} ${target}`, at }) });
+      expect(phone.status, phone.text).toBe(201);
+      expect(phone.json.data).toMatchObject({ path: "bots/owner-a/journal-sensitive/2026-05-02.md", rerouted: true, sensitive_domain: "pii" });
+    }
+    const piiPath = "bots/owner-a/journal-sensitive/2026-05-02.md";
+    expect((await rest("/v1/notes?path=journal/2026/05/2026-05-02.md", ADMIN)).status).toBe(404);
+    expect((await rest("/v1/notes?path=shared/decisions.md", ADMIN)).status).toBe(404);
+    // The writer reads it back with no read:sensitive scope: by path, id, search, list, and history.
+    const ownRead = await rest(`/v1/notes?path=${encodeURIComponent(piiPath)}`, owner);
+    expect(ownRead.status).toBe(200);
+    expect(ownRead.json.data?.markdown).toContain(pii);
+    const piiId = String(ownRead.json.data?.id);
+    expect((await rest(`/v1/notes?id=${piiId}`, owner)).status).toBe(200);
+    expect(results((await rest("/v1/search?q=206-555-0142", owner)).json).map((hit) => hit.path)).toContain(piiPath);
+    expect(JSON.stringify((await rest("/v1/list?prefix=bots/owner-a/", owner)).json.data)).toContain(piiPath);
+    expect((await rest(`/v1/history?path=${encodeURIComponent(piiPath)}`, owner)).status).toBe(200);
+    // Another bot gets 404 whatever it holds, read:bots/<writer>, read:bots/*, and read:sensitive/* included.
+    const peer = await mint("peer-b", ["read:shared", "read:bots/owner-a", "read:sensitive/health", "read:sensitive/finance", "read:sensitive/pii", "read:all"], "peer-b");
+    for (const token of [bots, peer]) {
+      expect((await rest(`/v1/notes?path=${encodeURIComponent(piiPath)}`, token)).status).toBe(404);
+      expect((await rest(`/v1/notes?id=${piiId}`, token)).status).toBe(404);
+      expect((await rest(`/v1/history?path=${encodeURIComponent(piiPath)}`, token)).status).toBe(404);
+      expect(results((await rest("/v1/search?q=206-555-0142", token)).json)).toEqual([]);
+      expect(JSON.stringify((await rest("/v1/list?prefix=bots/", token)).json.data)).not.toContain("journal-sensitive");
+    }
+    const viaMcp = await mcp(peer, "vault_read", { path: piiPath });
+    expect(viaMcp.json.error?.code).toBe("not_found");
+    expect((await mcp(owner, "vault_read", { path: piiPath })).json.ok).toBe(true);
+    // The admin token reads it.
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(piiPath)}`, ADMIN)).status).toBe(200);
   });
 
   it("P17 revoke drops the cached token and is audited", async () => {

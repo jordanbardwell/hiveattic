@@ -11,10 +11,20 @@ export function journalPath(agentId: string, target: "own" | "shared" | "decisio
   return `bots/${agentId}/journal/${year}/${month}/${date}.md`;
 }
 
-// A rerouted journal entry goes to the writer's day file in the sensitive folder, whatever the
-// requested target was.
-export function sensitiveJournalPath(domain: string, agentId: string, date: string): string {
-  return `sensitive/${domain}/journal/${agentId}/${date}.md`;
+// The journal route for PII alone. It is not a domain: it names the writer's own PII day file.
+export const PII_ROUTE = "pii";
+
+// A rerouted journal entry goes to a day file of the writer's, whatever the requested target was:
+// PII alone to bots/<writer>/journal-sensitive/<date>.md, anything else to
+// sensitive/<d>/journal/<writer>/<date>.md (restricted included). Dates are flat, in VAULT_TZ.
+export function sensitiveJournalPath(route: string, agentId: string, date: string): string {
+  if (route === PII_ROUTE) return `bots/${agentId}/journal-sensitive/${date}.md`;
+  return `sensitive/${route}/journal/${agentId}/${date}.md`;
+}
+
+// The bot that owns a bots/<a>/journal-sensitive/ file, or null for any other path.
+export function piiJournalOwner(path: string): string | null {
+  return /^bots\/([^/]+)\/journal-sensitive\//.exec(path)?.[1] ?? null;
 }
 
 export function reroutedPath(domain: string, path: string): string {
