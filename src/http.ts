@@ -52,7 +52,17 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const url = new URL(request.url);
   const requestId = ulid();
   const clientRequestId = request.headers.get("x-request-id")?.slice(0, 80) || null;
-  if (url.pathname === "/v1/health" && request.method === "GET") return json(200, envelope(await health(env), requestId, clientRequestId));
+  if (url.pathname === "/v1/health" && request.method === "GET") {
+    // A bad or missing token still gets the plain health answer, never a 401.
+    let authenticated = false;
+    if (request.headers.get("authorization")) {
+      authenticated = await authenticate(request, env, ctx).then(
+        () => true,
+        () => false,
+      );
+    }
+    return json(200, envelope(await health(env, authenticated), requestId, clientRequestId));
+  }
   try {
     configure(env);
     // The request cap comes first: bytes are counted off the stream before anything authenticates,

@@ -45,11 +45,16 @@ export const RESERVED_AGENT_IDS = new Set([
 
 const REROUTE_ACTIONS = new Set(["reroute", "journal_reroute", "reroute_move", "reroute_tombstone"]);
 
+const REVIEWER_TTL_DAYS = 30;
+
 export function toolRateKind(name: string | undefined): "read" | "write" {
   return name && WRITE_TOOLS.has(name) ? "write" : "read";
 }
 
-export async function health(env: Env): Promise<Record<string, unknown>> {
+// Anyone may ask whether the service is up. The build (version, git_sha) and the time zone are
+// shown only to a caller with a valid token, so an anonymous probe learns nothing about the deploy.
+export async function health(env: Env, authenticated: boolean): Promise<Record<string, unknown>> {
+  if (!authenticated) return { status: "ok", service: "hiveattic" };
   const gitSha = env.GIT_SHA?.trim() || null;
   let zone: string | null = null;
   try {
@@ -343,10 +348,14 @@ export async function mintToken(
     scopes?: string[];
     preset?: "reviewer";
     label?: string;
+    ttl_days?: number;
   },
 ): Promise<Record<string, unknown>> {
   assertAdmin(session.access);
   const reviewer = input.preset === "reviewer";
+  // A reviewer token lives 30 days unless the mint says otherwise. Other tokens live until revoked,
+  // or for ttl_days when it is given.
+  const ttlDays = input.ttl_days ?? (reviewer ? REVIEWER_TTL_DAYS : null);
   const agentId = input.agent_id ?? (reviewer ? "reviewer" : "");
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(agentId)) throw new VaultError("invalid", "agent_id is required");
   if (RESERVED_AGENT_IDS.has(agentId)) throw new VaultError("invalid", "agent_id is reserved", ["agent_id"]);
@@ -367,13 +376,14 @@ export async function mintToken(
   }
   const token = randomToken(agentId);
   const tokenId = ulid();
+  const expiresAt = ttlDays ? new Date(Date.parse(now) + ttlDays * 86_400_000).toISOString() : null;
   await env.DB.prepare(
-    "INSERT INTO tokens (id, agent_id, token_hash, scopes_override, label, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    "INSERT INTO tokens (id, agent_id, token_hash, scopes_override, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   )
-    .bind(tokenId, agentId, await hashToken(env.TOKEN_PEPPER, token), JSON.stringify(scopes), input.label ?? null, now)
+    .bind(tokenId, agentId, await hashToken(env.TOKEN_PEPPER, token), JSON.stringify(scopes), input.label ?? null, now, expiresAt)
     .run();
   await audit(env, session, "mint_token", null, tokenId, "ok", [], null, 0);
-  return { token, token_id: tokenId, agent_id: agentId, scopes, label: input.label ?? null };
+  return { token, token_id: tokenId, agent_id: agentId, scopes, label: input.label ?? null, expires_at: expiresAt };
 }
 
 export async function revokeToken(env: Env, session: Session, input: { token_id?: string; label?: string }): Promise<Record<string, unknown>> {

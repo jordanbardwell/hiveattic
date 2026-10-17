@@ -857,7 +857,7 @@ export class VaultWriter extends DurableObject<Env> {
     // The stub carries no caller text. The reason stays in the tombstone row, which only the admin
     // reads. A keyed forget leaves its key and payload hash in the stub, so a rebuild restores it.
     const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date, idem.key ? { by: op.actor.agentId, at: now, idem } : null);
-    await this.snapshotBytes(note, note.body, op.actor.agentId, "forgotten");
+    await this.snapshotIfUnversioned(note, op.actor.agentId);
     const hash = await sha256Hex(stub);
     const intentId = ulid();
     this.ctx.storage.sql.exec(
@@ -886,8 +886,8 @@ export class VaultWriter extends DurableObject<Env> {
          ON CONFLICT(note_id) DO UPDATE SET at = excluded.at, reason = excluded.reason, content_hash = excluded.content_hash`,
       ).bind(note.id, now, op.actor.agentId, op.reason, (await this.auditHash(note.body)) ?? note.content_hash, note.path),
       this.env.DB.prepare(
-        `INSERT INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, 'forgotten')`,
-      ).bind(note.id, etag.versionTs, r2KeyFor(this.prefix(), note.path), hash, op.actor.agentId),
+        `INSERT OR IGNORE INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, 'forgotten')`,
+      ).bind(note.id, etag.versionTs, await this.historyCopy(note.id, etag.versionTs, hash, stub), hash, op.actor.agentId),
       ...this.vectorDeletes(chunkIds, note.id, now),
       ...this.rememberStatements(op.actor.agentId, idem, data, 200),
     ]);
@@ -907,6 +907,9 @@ export class VaultWriter extends DurableObject<Env> {
       .bind(note.id, op.versionTs)
       .first<{ r2_key: string; content_hash: string; version_ts: string }>();
     if (!version) throw new VaultError("not_found", "Version not found");
+    // A version row from before F15 can point at the live object, which holds the current text, not
+    // that version's. Restoring it would change nothing, so it is refused.
+    if (!version.r2_key.startsWith("sys/history/")) throw new VaultError("invalid", "That version has no stored copy to restore", ["not_a_snapshot"]);
     const object = await this.env.VAULT.get(version.r2_key);
     if (!object) throw new VaultError("not_found", "Version object not found");
     const markdown = await object.text();
@@ -1004,7 +1007,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (note.status === "quarantined") return { ok: true, data: { skipped: true, reason: "quarantined" } };
     const chunkIds = await this.chunkIds(note.id);
     const now = new Date().toISOString();
-    await this.snapshotBytes(note, note.body, actor.agentId, "external_delete");
+    await this.snapshotIfUnversioned(note, actor.agentId);
     const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
     await this.env.DB.batch([
       this.env.DB.prepare(
@@ -1103,7 +1106,7 @@ export class VaultWriter extends DurableObject<Env> {
   private async retireMoved(note: NoteRow, target: string, actor: Actor, keepStub: boolean): Promise<void> {
     const now = new Date().toISOString();
     const chunkIds = await this.chunkIds(note.id);
-    if (note.status === "active") await this.snapshotBytes(note, note.body, actor.agentId, "moved");
+    if (note.status === "active") await this.snapshotIfUnversioned(note, actor.agentId);
     const stub = forgottenStub(note, etStamp(now, vaultTimeZone(this.env)).date);
     let etag: string | null = null;
     if (keepStub) {
@@ -1224,7 +1227,7 @@ export class VaultWriter extends DurableObject<Env> {
     const existing = input.create ? null : await this.noteByPath(input.path);
     const appending = input.reason === "appended" || input.reason === "conflict";
     if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
-      await this.snapshotBytes(existing, existing.body, input.actor.agentId, input.reason);
+      await this.snapshotIfUnversioned(existing, input.actor.agentId);
     }
     const hash = await sha256Hex(input.markdown);
     const intentId = ulid();
@@ -1319,11 +1322,16 @@ export class VaultWriter extends DurableObject<Env> {
         statements.push(this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(input.id));
       }
     }
-    if (!appending) {
+    // F15: every version is an immutable copy under sys/history/<id>/, labelled with the write that
+    // produced it, so history shows each version's own text and restoring one restores it.
+    // A journal day file is append-only and never restored, so it keeps no copies.
+    let historyKey: string | null = null;
+    if (!appending && !input.journal) {
+      historyKey = await this.historyCopy(input.id, versionTs, hash, input.markdown);
       statements.push(
         this.env.DB.prepare(
-          `INSERT INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, ?)`,
-        ).bind(input.id, versionTs, r2Key, hash, input.actor.agentId, input.reason),
+          `INSERT OR IGNORE INTO note_versions (note_id, version_ts, r2_key, content_hash, writer, reason) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).bind(input.id, versionTs, historyKey, hash, input.actor.agentId, input.reason),
       );
     }
     if (status === "active") {
@@ -1389,6 +1397,7 @@ export class VaultWriter extends DurableObject<Env> {
       await this.env.DB.batch(statements);
       if (!input.skipPut) this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
     } catch (err) {
+      if (historyKey) await this.env.VAULT.delete(historyKey).catch(() => undefined);
       if (!input.skipPut) {
         let reverted = false;
         try {
@@ -1580,6 +1589,26 @@ export class VaultWriter extends DurableObject<Env> {
       action: "conflict",
       journal: null,
     });
+  }
+
+  // Writes one immutable version copy and returns its key. The key carries the version stamp and
+  // the first 8 hex of the content hash, which is how a rebuild restores the version row.
+  private async historyCopy(id: string, versionTs: string, hash: string, bytes: string): Promise<string> {
+    const key = `sys/history/${id}/${versionTs}-${hash8(hash)}.md`;
+    await this.env.VAULT.put(key, bytes, {
+      httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+      customMetadata: { "vault-writer": "do", "vault-id": id },
+    });
+    return key;
+  }
+
+  // Notes written before F15, or indexed from an outside edit by an older build, may have no
+  // immutable copy of their current text. One is made before that text is replaced.
+  private async snapshotIfUnversioned(note: { id: string; body: string; content_hash: string }, writer: string): Promise<void> {
+    const held = await this.env.DB.prepare("SELECT 1 AS hit FROM note_versions WHERE note_id = ? AND content_hash = ? AND r2_key LIKE 'sys/history/%' LIMIT 1")
+      .bind(note.id, note.content_hash)
+      .first<{ hit: number }>();
+    if (!held) await this.snapshotBytes(note, note.body, writer, "earlier");
   }
 
   private async snapshotBytes(note: { id: string }, bytes: string, writer: string, reason: string): Promise<string> {

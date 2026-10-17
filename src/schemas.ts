@@ -59,6 +59,7 @@ export const tokenSchema = z.object({
   scopes: z.array(z.string().min(1).max(80)).max(40).optional(),
   preset: z.enum(["reviewer"]).optional(),
   label: z.string().min(1).max(80).optional(),
+  ttl_days: z.number().int().min(1).max(365).optional(),
 });
 
 export const revokeSchema = z.object({

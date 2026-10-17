@@ -107,6 +107,67 @@ describe("review fixes", () => {
     expect((await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM journal_entries WHERE title = 'escaped'").first<{ n: number }>())?.n).toBe(1);
   });
 
+  it("F15: each version is its own immutable copy, labelled with the write that made it, and restoring one restores it", async () => {
+    await resetVault();
+    const path = `shared/versions-${nid()}.md`;
+    let etag: unknown = null;
+    for (const text of ["qxver one", "qxver two", "qxver three"]) {
+      const written = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path, body: text, type: "note", ...(etag ? { if_match: etag } : {}) }) });
+      expect(written.status, written.text).toBe(200);
+      etag = written.json.data?.etag;
+    }
+    const history = (await rest(`/v1/history?path=${encodeURIComponent(path)}`, ADMIN)).json.data?.versions as { version_ts: string; body: string; reason: string }[];
+    expect(history.map((version) => version.reason)).toEqual(["created", "updated", "updated"]);
+    expect(history.map((version) => version.body.includes("qxver one"))).toEqual([true, false, false]);
+    expect(history.map((version) => version.body.includes("qxver three"))).toEqual([false, false, true]);
+    const restored = await rest("/v1/admin/restore", ADMIN, { method: "POST", body: JSON.stringify({ path, version_ts: history[0]!.version_ts }) });
+    expect(restored.status, restored.text).toBe(200);
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(path)}`, reader)).json.data?.markdown).toContain("qxver one");
+    const after = (await rest(`/v1/history?path=${encodeURIComponent(path)}`, ADMIN)).json.data?.versions as { reason: string }[];
+    expect(after.map((version) => version.reason)).toEqual(["created", "updated", "updated", "restore"]);
+  });
+
+  it("F17: a search page fills past matches the caller cannot read", async () => {
+    await resetVault();
+    const marker = `qxfill${nid()}`;
+    // Many hidden matches rank first (the marker repeated), a few visible ones after them.
+    for (let i = 0; i < 12; i++) {
+      await rest("/v1/notes", ADMIN, { method: "PUT", body: JSON.stringify({ path: `bots/hidden-${i}/${marker}.md`, body: `${marker} ${marker} ${marker} hidden ${i}`, type: "note" }) });
+    }
+    for (let i = 0; i < 3; i++) {
+      await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path: `shared/${marker}-${i}.md`, body: `${marker} visible ${i} with more words to lower its rank`, type: "note" }) });
+    }
+    // Legacy in-place sensitive rows under other bots' folders: the read:sensitive/pii SQL clause lets
+    // them through, and canRead then drops them (no read:bots/<x>).
+    await testEnv().DB.prepare("UPDATE notes SET sensitivity = 'sensitive' WHERE path LIKE 'bots/hidden-%'").run();
+    const piiReader = await mint(`fix-pii-${nid()}`, ["read:shared", "read:sensitive/pii"], "fix-pii");
+    const sql = await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM notes WHERE path LIKE 'bots/hidden-%' AND sensitivity = 'sensitive'").first<{ n: number }>();
+    expect(sql?.n).toBe(12);
+    const found = results((await rest(`/v1/search?q=${marker}&limit=3`, piiReader)).json);
+    expect(found.map((hit) => hit.path).sort()).toEqual([0, 1, 2].map((i) => `shared/${marker}-${i}.md`));
+  });
+
+  it("F25: reviewer tokens expire after 30 days by default, any token can be minted with ttl_days, and an expired one is refused", async () => {
+    await resetVault();
+    const reviewerMint = await rest("/v1/admin/tokens", ADMIN, { method: "POST", body: JSON.stringify({ agent_id: `rev-${nid()}`, preset: "reviewer", label: "rev" }) });
+    expect(reviewerMint.status).toBe(200);
+    const days = (Date.parse(String(reviewerMint.json.data?.expires_at)) - Date.now()) / 86_400_000;
+    expect(days).toBeGreaterThan(29.9);
+    expect(days).toBeLessThan(30.1);
+    const short = await rest("/v1/admin/tokens", ADMIN, { method: "POST", body: JSON.stringify({ agent_id: `ttl-${nid()}`, scopes: ["read:shared"], ttl_days: 1, label: "ttl" }) });
+    expect(short.status).toBe(200);
+    const token = String(short.json.data?.token);
+    expect((await rest("/v1/whoami", token)).status).toBe(200);
+    await testEnv().DB.prepare("UPDATE tokens SET expires_at = ? WHERE id = ?").bind(new Date(Date.now() - 1000).toISOString(), short.json.data?.token_id).run();
+    const { clearAuthCache } = await import("../src/auth");
+    clearAuthCache();
+    expect((await rest("/v1/whoami", token)).status).toBe(401);
+    expect((await rest("/v1/admin/tokens", ADMIN, { method: "POST", body: JSON.stringify({ agent_id: `ttl-${nid()}`, scopes: ["read:shared"], ttl_days: 0 }) })).status).toBe(400);
+    // A plain token without ttl_days does not expire.
+    const plain = await rest("/v1/admin/tokens", ADMIN, { method: "POST", body: JSON.stringify({ agent_id: `plain-${nid()}`, scopes: ["read:shared"] }) });
+    expect(plain.json.data?.expires_at).toBeNull();
+  });
+
   it("F11: a late delete event for a key that exists again does not forget the live note", async () => {
     await resetVault();
     const path = `shared/late-${nid()}.md`;

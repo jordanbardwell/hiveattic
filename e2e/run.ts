@@ -13,7 +13,10 @@ type Case = { id: string; status: Status; details: string; duration_ms: number; 
 // Staging only, and fail-closed. The harness reads HIVEATTIC_STAGING_* names and nothing else for
 // its target and tokens. It never falls back to an unprefixed name, and it refuses to start when
 // one of the production names is set at all, so a stray prod token in the shell cannot be used.
-const PROD_NAMED = ["HIVEATTIC_BASE_URL", "HIVEATTIC_ADMIN_TOKEN", "HIVEATTIC_REVIEWER_TOKEN", "HIVEATTIC_E2E_READ_ONLY", "HIVEATTIC_E2E_MODE"];
+// The one exception is the run plan's own mapping: HIVEATTIC_REVIEWER_TOKEN may be set when it is
+// the same value as HIVEATTIC_STAGING_REVIEWER_TOKEN (compared here, never printed). It is still
+// never read.
+const PROD_NAMED = ["HIVEATTIC_BASE_URL", "HIVEATTIC_ADMIN_TOKEN", "HIVEATTIC_REVIEWER_TOKEN", "HIVEATTIC_E2E_READ_ONLY", "HIVEATTIC_E2E_MODE", "HIVEATTIC_CF_API"];
 const PROD_HOSTS = new Set(["hiveattic.example.workers.dev", "hiveattic.com", "vault.hiveattic.com"]);
 const stagingBase = (process.env.HIVEATTIC_STAGING_BASE_URL ?? "").trim().replace(/\/$/, "");
 const stagingAdmin = process.env.HIVEATTIC_STAGING_ADMIN_TOKEN ?? "";
@@ -73,7 +76,9 @@ function stagingBucketProblem(bucket: string | undefined): string | null {
 }
 
 function refuseIfMisconfigured(): void {
-  const prodSet = PROD_NAMED.filter((name) => (process.env[name] ?? "").trim() !== "");
+  const mappedReviewer = (name: string) =>
+    name === "HIVEATTIC_REVIEWER_TOKEN" && suppliedReviewer !== "" && process.env.HIVEATTIC_REVIEWER_TOKEN === suppliedReviewer;
+  const prodSet = PROD_NAMED.filter((name) => (process.env[name] ?? "").trim() !== "" && !mappedReviewer(name));
   if (prodSet.length) {
     throw new StopRun(2, `Refusing to run: ${prodSet.join(", ")} ${prodSet.length === 1 ? "is" : "are"} set. This harness reads only HIVEATTIC_STAGING_* names. Unset them first.`);
   }
@@ -948,9 +953,11 @@ function sanitize(text: string, fragments: string[]): string {
   return out.slice(0, 240);
 }
 
+// The Cloudflare API token only ever goes to the real API origin, over https. There is no override.
+const CF_API_ROOT = "https://api.cloudflare.com/client/v4";
+
 function cfApi(path: string): string {
-  const root = (process.env.HIVEATTIC_CF_API ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
-  return `${root}${path.startsWith("/") ? path : `/${path}`}`;
+  return `${CF_API_ROOT}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 // Only the staging dead-letter queue is ever read.

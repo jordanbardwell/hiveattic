@@ -118,6 +118,13 @@ const refusals: { label: string; args: string[]; env: Record<string, string>; sa
   { label: "prod base url set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_BASE_URL: mockUrl }, says: "HIVEATTIC_BASE_URL" },
   { label: "prod admin token set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_ADMIN_TOKEN: "prod-admin" }, says: "HIVEATTIC_ADMIN_TOKEN" },
   { label: "prod reviewer token set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_REVIEWER_TOKEN: "prod-reviewer" }, says: "HIVEATTIC_REVIEWER_TOKEN" },
+  {
+    label: "reviewer token that is not the staging one",
+    args: ["--dry-run"],
+    env: { ...dryStaging, HIVEATTIC_STAGING_REVIEWER_TOKEN: "staging-reviewer", HIVEATTIC_REVIEWER_TOKEN: "prod-reviewer" },
+    says: "HIVEATTIC_REVIEWER_TOKEN",
+  },
+  { label: "cloudflare api override", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_CF_API: "https://collector.invalid" }, says: "HIVEATTIC_CF_API" },
   { label: "read-only prod mode", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_E2E_READ_ONLY: "1" }, says: "HIVEATTIC_E2E_READ_ONLY" },
   { label: "live run against a local url", args: [], env: dryStaging, says: "hiveattic-staging workers.dev" },
   { label: "live run against the prod host", args: [], env: { HIVEATTIC_STAGING_BASE_URL: "https://hiveattic.example.workers.dev", HIVEATTIC_STAGING_ADMIN_TOKEN: "x" }, says: "production host" },
@@ -223,16 +230,54 @@ for (const file of ["wrangler.jsonc", "wrangler.example.jsonc", "wrangler.stagin
   if ([...sensitive, ...ordinary].includes("restricted")) throw new Error(`${file} uses restricted as a domain name`);
   for (const name of [...sensitive, ...ordinary]) classified.add(name);
 }
-const UNCLASSIFIED_FIXTURES = new Set(["legal", "medical"]);
+// Test fixtures that name an unclassified or mixed-case domain on purpose, to prove it fails closed.
+const UNCLASSIFIED_FIXTURES = new Set(["legal", "medical", "Finance", "HEALTH"]);
 const SPECIAL = new Set(["pii", "restricted"]);
+// Case-insensitive: `domains/Finance/` is a different, unclassified name, and is reported.
 const domainPatterns = [
-  /domains\/([a-z0-9-]+)\//g,
-  /sensitive\/([a-z0-9-]+)\//g,
-  /(?:read|write):domain\/([a-z0-9-]+)/g,
-  /(?:read|write):sensitive\/([a-z0-9-]+)/g,
-  /read:sensitive:summary\/([a-z0-9-]+)/g,
-  /domain["']?\s*[:=]\s*["']([a-z0-9-]+)["']/g,
+  /domains\/([a-z0-9-]+)\//gi,
+  /sensitive\/([a-z0-9-]+)\//gi,
+  /(?:read|write):domain\/([a-z0-9-]+)/gi,
+  /(?:read|write):sensitive\/([a-z0-9-]+)/gi,
+  /read:sensitive:summary\/([a-z0-9-]+)/gi,
+  /domain["']?\s*[:=]\s*["']([a-z0-9-]+)["']/gi,
 ];
+
+// Every domain name the given files mention that is not classified, as "name (file)".
+function unclassifiedDomains(files: { path: string; text: string }[], known: Set<string>): string[] {
+  const missing = new Set<string>();
+  for (const file of files) {
+    const isTest = file.path.replaceAll("\\", "/").startsWith("test/");
+    for (const pattern of domainPatterns) {
+      pattern.lastIndex = 0;
+      for (const match of file.text.matchAll(pattern)) {
+        const name = match[1] ?? "";
+        if (!name || SPECIAL.has(name) || known.has(name)) continue;
+        if (isTest && UNCLASSIFIED_FIXTURES.has(name)) continue;
+        missing.add(`${name} (${file.path})`);
+      }
+    }
+  }
+  return [...missing].sort();
+}
+
+// The check itself must fail on an unclassified or mixed-case name outside the test fixtures, and
+// pass on classified ones (PR #3 review, A5/A6).
+{
+  const known = new Set(["health", "finance", "deals"]);
+  const caught = unclassifiedDomains(
+    [
+      { path: "src/example.ts", text: "const path = `domains/qxunlisted/x.md`; const scope = 'read:domain/qxother';" },
+      { path: "README.md", text: "A note under domains/Finance/x.md." },
+      { path: "wrangler.jsonc", text: '"domain": "qxconfig"' },
+      { path: "test/fixture.test.ts", text: "domains/medical/x.md and domains/Finance/y.md" },
+      { path: "content/ok.md", text: "domains/deals/a.md, sensitive/health/x.md, read:sensitive/pii" },
+    ],
+    known,
+  );
+  const expected = ["Finance (README.md)", "qxconfig (wrangler.jsonc)", "qxother (src/example.ts)", "qxunlisted (src/example.ts)"];
+  if (JSON.stringify(caught) !== JSON.stringify(expected)) throw new Error(`the T-20 domain check does not fail as it should: ${JSON.stringify(caught)}`);
+}
 const skipDir = new Set(["node_modules", ".git", "e2e-results", "dist", ".wrangler"]);
 function sourceFiles(dir: string): string[] {
   const info = statSync(dir);
@@ -247,22 +292,16 @@ function sourceFiles(dir: string): string[] {
   }
   return found;
 }
-const missing = new Set<string>();
-for (const file of ["src", "e2e", "test", "examples", "content", "README.md", "AGENTS.md"].flatMap((item) => sourceFiles(item))) {
-  const text = readFileSync(file, "utf8");
-  const isTest = file.replaceAll("\\", "/").startsWith("test/");
-  for (const pattern of domainPatterns) {
-    pattern.lastIndex = 0;
-    for (const match of text.matchAll(pattern)) {
-      const name = match[1] ?? "";
-      if (!name || SPECIAL.has(name) || classified.has(name)) continue;
-      if (isTest && UNCLASSIFIED_FIXTURES.has(name)) continue;
-      missing.add(`${name} (${file})`);
-    }
-  }
-}
-if (missing.size > 0) {
-  throw new Error(`Unclassified domains:\n${[...missing].sort().join("\n")}`);
+const scanned = [
+  ...["src", "e2e", "test", "scripts", "examples", "content", "README.md", "AGENTS.md"].flatMap((item) => sourceFiles(item)),
+  ...readdirSync(".").filter((name) => /^wrangler.*\.jsonc?$/.test(name)),
+]
+  // This file holds the check's own failing fixtures above.
+  .filter((path) => !path.replaceAll("\\", "/").endsWith("e2e/dry-run.check.ts"))
+  .map((path) => ({ path, text: readFileSync(path, "utf8") }));
+const missing = unclassifiedDomains(scanned, classified);
+if (missing.length > 0) {
+  throw new Error(`Unclassified domains:\n${missing.join("\n")}`);
 }
 
 console.log("e2e dry-run check passed");

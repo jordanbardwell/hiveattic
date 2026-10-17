@@ -67,8 +67,14 @@ describe("architect review regressions", () => {
     expect(row).toBeNull();
   });
 
-  it("health reports the git sha injected at deploy", async () => {
-    const response = await rest("/v1/health", null);
+  it("health reports the git sha injected at deploy to authenticated callers only (F33)", async () => {
+    const anonymous = await rest("/v1/health", null);
+    expect(anonymous.status).toBe(200);
+    expect(anonymous.json.data).toEqual({ status: "ok", service: "hiveattic" });
+    const badToken = await rest("/v1/health", "vlt_not_a_token");
+    expect(badToken.status).toBe(200);
+    expect(badToken.json.data?.git_sha).toBeUndefined();
+    const response = await rest("/v1/health", ADMIN);
     expect(response.status).toBe(200);
     expect(response.json.data?.status).toBe("ok");
     expect(response.json.data?.git_sha).toBe("abc123deploy");

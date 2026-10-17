@@ -45,32 +45,38 @@ export async function searchVault(env: Env, access: Access, query: string, mode:
   const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
   const scope = scopeSql(access);
   const filters = extraFilters(options);
-  let rows: NoteHit[] = [];
-  try {
-    const selected = await env.DB.prepare(
-      `SELECT n.id, n.path, n.title, n.owner, n.type, n.domain, n.sensitivity, n.updated_at, n.frontmatter,
-              c.text AS chunk_text, bm25(chunks_fts) AS rank
-       FROM chunks_fts
-       JOIN chunks c ON c.rowid = chunks_fts.rowid
-       JOIN notes n ON n.id = c.note_id
-       WHERE chunks_fts MATCH ? AND n.status = 'active' AND (${scope.sql}) ${filters.sql}
-         AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
-       ORDER BY bm25(chunks_fts)
-       LIMIT ?`,
-    )
-      .bind(match, ...scope.binds, ...filters.binds, limit)
-      .all<NoteHit>();
-    rows = selected.results ?? [];
-  } catch {
-    throw new VaultError("invalid", "Search query is not valid");
-  }
+  // The SQL prefilter is broader than canRead, so rows the caller cannot read are dropped after it.
+  // Reading goes on, a batch at a time, until the page has `limit` notes or the matches run out.
   const best = new Map<string, { hit: NoteHit; score: number; boosts: string[] }>();
-  for (const hit of rows) {
-    const view = noteView(hit);
-    if (!canRead(access, view)) continue;
-    const scored = scoreHit(hit, access);
-    const prior = best.get(hit.id);
-    if (!prior || scored.score > prior.score) best.set(hit.id, { hit, ...scored });
+  const batch = Math.min(limit * 2, 100);
+  for (let round = 0, offset = 0; round < 5 && best.size < limit; round++, offset += batch) {
+    let rows: NoteHit[] = [];
+    try {
+      const selected = await env.DB.prepare(
+        `SELECT n.id, n.path, n.title, n.owner, n.type, n.domain, n.sensitivity, n.updated_at, n.frontmatter,
+                c.text AS chunk_text, bm25(chunks_fts) AS rank
+         FROM chunks_fts
+         JOIN chunks c ON c.rowid = chunks_fts.rowid
+         JOIN notes n ON n.id = c.note_id
+         WHERE chunks_fts MATCH ? AND n.status = 'active' AND (${scope.sql}) ${filters.sql}
+           AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
+         ORDER BY bm25(chunks_fts)
+         LIMIT ? OFFSET ?`,
+      )
+        .bind(match, ...scope.binds, ...filters.binds, batch, offset)
+        .all<NoteHit>();
+      rows = selected.results ?? [];
+    } catch {
+      throw new VaultError("invalid", "Search query is not valid");
+    }
+    for (const hit of rows) {
+      const view = noteView(hit);
+      if (!canRead(access, view)) continue;
+      const scored = scoreHit(hit, access);
+      const prior = best.get(hit.id);
+      if (!prior || scored.score > prior.score) best.set(hit.id, { hit, ...scored });
+    }
+    if (rows.length < batch) break;
   }
   const results = [...best.values()]
     .sort((a, b) => b.score - a.score)
@@ -185,16 +191,22 @@ export async function noteHistory(env: Env, access: Access, path?: string, id?: 
   const hiddenBody = note.status === "forgotten";
   const includeBody = access.admin || (!hiddenBody && note.owner === access.agentId);
   const listed = [];
-  for (const version of (versions.results ?? []).slice(-50)) {
+  const all = versions.results ?? [];
+  const latest = all.at(-1)?.version_ts;
+  for (const version of all.slice(-50)) {
     const entry: Record<string, unknown> = {
       version_ts: version.version_ts,
       content_hash: version.content_hash,
       writer: version.writer,
       reason: version.reason,
     };
-    if (includeBody) {
+    // A version is read from its immutable copy. An older row that points at the live object only
+    // shows a body if it is the latest version, since the live object holds the current text.
+    if (includeBody && (version.r2_key.startsWith("sys/history/") || version.version_ts === latest)) {
       const object = await env.VAULT.get(version.r2_key);
       entry.body = object ? await object.text() : null;
+    } else if (includeBody) {
+      entry.body = null;
     }
     listed.push(entry);
   }
