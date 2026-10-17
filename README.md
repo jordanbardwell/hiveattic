@@ -157,7 +157,11 @@ Mint a read-only token for someone who should run the read checks and nothing el
 HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm mint-reviewer architect-reviewer
 ```
 
-The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, `read:inbox`, `audit:read`, `read:sensitive:summary/health`, and `read:sensitive:summary/finance`. Put it in `HIVEATTIC_REVIEWER_TOKEN`. The suite uses it for the read checks and does not revoke a token you supplied. A run with only that token, and no admin token, executes the read checks and skips the write cases.
+The token is printed once. Its scopes are `read:shared`, `read:decisions`, `read:domain/*`, and `read:inbox`. It does not include `audit:read`, `read:sensitive:summary/finance`, or `read:sensitive:summary/health`. Summary reads belong to the chief-of-staff role. `GET /v1/admin/audit` returns 403. Finance and health notes, including summaries, raw notes, reads by id, history, and shared notes tagged with those domains, return 404 and stay out of search. Put the token in `HIVEATTIC_REVIEWER_TOKEN`. The suite uses it for the read checks and does not revoke a token you supplied. A run with only that token, and no admin token, executes the read checks and skips the write cases.
+
+Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before this change can still read finance and health summaries and the audit log. Revoke it and mint a new one.
+
+Domains are classified in `src/access.ts`. `health` and `finance` are sensitive. `deals` and `x` are not. A domain that is in neither set is rejected on write and treated as sensitive on read.
 
 Rebuild the D1 index from R2 at any time:
 

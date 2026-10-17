@@ -1,3 +1,4 @@
+import { SENSITIVE_DOMAINS } from "./access";
 import { VaultError } from "./errors";
 
 export type PolicyTerm = { term: string; kind: string };
@@ -71,7 +72,7 @@ export function scanEmployer(input: string, terms: PolicyTerm[]): string[] {
 }
 
 export function classifySensitive(input: string, domain: string | null): boolean {
-  if (domain === "health" || domain === "finance") return true;
+  if (domain && SENSITIVE_DOMAINS.has(domain)) return true;
   const text = normalizeText(input);
   if (/\b(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]\d{3}[-.\s]\d{4}\b/.test(text)) return true;
   if (/\b\d{1,5}\s+[A-Za-z0-9.]+\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln)\b/i.test(text)) return true;
