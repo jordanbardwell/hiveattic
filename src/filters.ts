@@ -1,0 +1,238 @@
+import { VaultError } from "./errors";
+
+export type PolicyTerm = { term: string; kind: string };
+
+export type FilterHit = {
+  code: "rejected_secret" | "rejected_financial" | "rejected_government_id" | "rejected_employer";
+  reasons: string[];
+};
+
+const SECRET_RULES: { reason: string; pattern: RegExp }[] = [
+  { reason: "secret_pem", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { reason: "secret_openai", pattern: /\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}\b/ },
+  { reason: "secret_aws", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
+  { reason: "secret_github", pattern: /\b(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{16,}\b/ },
+  { reason: "secret_slack", pattern: /\bxox[abpr]-[A-Za-z0-9-]{10,}\b/ },
+  { reason: "secret_google", pattern: /\bAIza[0-9A-Za-z_\-]{20,}\b/ },
+  { reason: "secret_jwt", pattern: /\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b/ },
+  { reason: "secret_password", pattern: /password\s*[:=]\s*\S+/i },
+  { reason: "secret_bearer", pattern: /bearer\s+[A-Za-z0-9._~+\-/]{20,}/i },
+];
+
+export function normalizeText(input: string): string {
+  return input.normalize("NFKC").replace(/[\u200B-\u200D\uFEFF\u2060\u180E]/g, "");
+}
+
+export function scanSecrets(input: string): string[] {
+  const text = normalizeText(input);
+  const reasons: string[] = [];
+  for (const rule of SECRET_RULES) {
+    if (rule.pattern.test(text)) reasons.push(rule.reason);
+  }
+  for (const match of text.matchAll(/[A-Za-z0-9+/_=-]{24,}/g)) {
+    const token = match[0];
+    if (/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(token)) continue;
+    if (token.includes("/") && !/[+=]/.test(token) && token.split("/").every((part) => /^[A-Za-z0-9_.-]*$/.test(part))) continue;
+    if (shannon(token) > 4) reasons.push("secret_entropy");
+  }
+  return unique(reasons);
+}
+
+export function scanFinancial(input: string): string[] {
+  const text = normalizeText(input);
+  const reasons: string[] = [];
+  if (findCard(text)) reasons.push("financial_card");
+  if (findRouting(text)) reasons.push("financial_routing");
+  if (findAccount(text)) reasons.push("financial_account");
+  if (findIban(text)) reasons.push("financial_iban");
+  if (findSsn(text)) reasons.push("pii_ssn");
+  if (findGovId(text)) reasons.push("pii_gov_id");
+  return unique(reasons);
+}
+
+export function scanEmployer(input: string, terms: PolicyTerm[]): string[] {
+  const text = normalizeText(input);
+  const reasons: string[] = [];
+  const denies = terms.filter((term) => term.kind === "employer" || term.kind === "deny");
+  if (denies.some((term) => termMatches(text, term.term))) reasons.push("employer_denylist");
+  const allowed = terms.some((term) => term.kind === "allow" && termMatches(text, term.term));
+  if (!allowed) {
+    const subjects = terms.filter((term) => term.kind === "context_subject");
+    const qualifiers = terms.filter((term) => term.kind === "context_qualifier");
+    if (subjects.some((term) => termMatches(text, term.term)) && qualifiers.some((term) => termMatches(text, term.term))) {
+      reasons.push("employer_context");
+    }
+  }
+  return unique(reasons);
+}
+
+export function classifySensitive(input: string, domain: string | null): boolean {
+  if (domain === "health" || domain === "finance") return true;
+  const text = normalizeText(input);
+  if (/\b(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]\d{3}[-.\s]\d{4}\b/.test(text)) return true;
+  if (/\b\d{1,5}\s+[A-Za-z0-9.]+\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln)\b/i.test(text)) return true;
+  if (/\b(?:dob|date of birth|born on)\b/i.test(text)) return true;
+  return false;
+}
+
+export function inspectWrite(input: string, terms: PolicyTerm[]): FilterHit | null {
+  const secrets = scanSecrets(input);
+  if (secrets.length) return { code: "rejected_secret", reasons: secrets };
+  const financial = scanFinancial(input);
+  if (financial.length) {
+    const government = financial.filter((reason) => reason === "pii_ssn" || reason === "pii_gov_id");
+    const money = financial.filter((reason) => reason !== "pii_ssn" && reason !== "pii_gov_id");
+    if (money.length) return { code: "rejected_financial", reasons: money };
+    return { code: "rejected_government_id", reasons: government };
+  }
+  const employer = scanEmployer(input, terms);
+  if (employer.length) return { code: "rejected_employer", reasons: employer };
+  return null;
+}
+
+export function rejectIfNeeded(input: string, terms: PolicyTerm[]): void {
+  const hit = inspectWrite(input, terms);
+  if (!hit) return;
+  const message =
+    hit.code === "rejected_secret"
+      ? "Write rejected by the secret filter"
+      : hit.code === "rejected_employer"
+        ? "Write rejected by the employer filter"
+        : hit.code === "rejected_government_id"
+          ? "Write rejected by the government-id filter"
+          : "Write rejected by the financial filter";
+  throw new VaultError(hit.code, message, hit.reasons);
+}
+
+function findCard(text: string): boolean {
+  const runs = text.match(/(?:\d[ .\-]?){13,}/g) ?? [];
+  for (const run of runs) {
+    const digits = run.replace(/\D/g, "");
+    const max = Math.min(19, digits.length);
+    for (let length = 13; length <= max; length++) {
+      for (let index = 0; index + length <= digits.length; index++) {
+        if (luhn(digits.slice(index, index + length))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function findRouting(text: string): boolean {
+  const keyword = /\b(?:routing|aba)\b/gi;
+  for (const match of text.matchAll(keyword)) {
+    const start = Math.max(0, (match.index ?? 0) - 40);
+    const end = Math.min(text.length, (match.index ?? 0) + match[0].length + 40);
+    const window = text.slice(start, end);
+    const runs = window.match(/\d{9}/g) ?? [];
+    if (runs.some((run) => aba(run))) return true;
+  }
+  return false;
+}
+
+function findAccount(text: string): boolean {
+  const keyword = /\b(?:accounts?|acct|a\/c|acc(?:t|ount)?(?:\s*(?:no\.?|#))?|brokerage|iban)\b/gi;
+  for (const match of text.matchAll(keyword)) {
+    const start = Math.max(0, (match.index ?? 0) - 40);
+    const end = Math.min(text.length, (match.index ?? 0) + match[0].length + 48);
+    const window = text.slice(start, end);
+    if (/\b(?:dollars?|usd|eur|gbp|cents?)\b/i.test(window)) continue;
+    const explicit = /(?:#|\bno\.?\b)/i.test(window);
+    const runs = window.match(/\d[\d \-]{4,22}\d/g) ?? [];
+    for (const run of runs) {
+      if (/\d{4}-\d{2}-\d{2}/.test(window) && run.replace(/\D/g, "").length <= 8) continue;
+      if (/[.,]/.test(run)) continue;
+      const digits = run.replace(/\D/g, "");
+      const min = explicit ? 6 : 8;
+      if (digits.length >= min && digits.length <= 17) return true;
+    }
+  }
+  return false;
+}
+
+function findIban(text: string): boolean {
+  const runs = text.toUpperCase().match(/\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/g) ?? [];
+  return runs.some((run) => iban(run));
+}
+
+function findSsn(text: string): boolean {
+  const dashed = text.match(/\b(\d{3})-(\d{2})-(\d{4})\b/g) ?? [];
+  if (dashed.some((value) => ssn(value.replaceAll("-", "")))) return true;
+  if (!/\b(?:ssn|social security)\b/i.test(text)) return false;
+  const spaced = text.match(/\b\d{3}[-\s]\d{2}[-\s]\d{4}\b/g) ?? [];
+  if (spaced.some((value) => ssn(value.replace(/\D/g, "")))) return true;
+  const bare = text.match(/\b\d{9}\b/g) ?? [];
+  return bare.some((value) => ssn(value));
+}
+
+function findGovId(text: string): boolean {
+  return /\b(?:passport|driver'?s license|drivers license)\b.{0,40}?\b(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,12}\b/i.test(text);
+}
+
+export function luhn(digits: string): boolean {
+  let sum = 0;
+  let alt = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let n = digits.charCodeAt(i) - 48;
+    if (n < 0 || n > 9) return false;
+    if (alt) {
+      n *= 2;
+      if (n > 9) n -= 9;
+    }
+    sum += n;
+    alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+
+function aba(digits: string): boolean {
+  if (!/^\d{9}$/.test(digits)) return false;
+  const n = [...digits].map((ch) => ch.charCodeAt(0) - 48);
+  const sum = 3 * (n[0]! + n[3]! + n[6]!) + 7 * (n[1]! + n[4]! + n[7]!) + (n[2]! + n[5]! + n[8]!);
+  return sum !== 0 && sum % 10 === 0;
+}
+
+function ssn(digits: string): boolean {
+  if (!/^\d{9}$/.test(digits)) return false;
+  const area = Number(digits.slice(0, 3));
+  const group = Number(digits.slice(3, 5));
+  const serial = Number(digits.slice(5));
+  if (area === 0 || area === 666 || area >= 900) return false;
+  if (group === 0 || serial === 0) return false;
+  return true;
+}
+
+function iban(value: string): boolean {
+  const rearranged = `${value.slice(4)}${value.slice(0, 4)}`;
+  let expanded = "";
+  for (const ch of rearranged) expanded += ch >= "A" && ch <= "Z" ? String(ch.charCodeAt(0) - 55) : ch;
+  let remainder = 0;
+  for (const ch of expanded) remainder = (remainder * 10 + Number(ch)) % 97;
+  return remainder === 1;
+}
+
+function termMatches(text: string, term: string): boolean {
+  const needle = term.toLowerCase();
+  if (!needle) return false;
+  if (/[^a-z0-9\s]/i.test(needle) || needle.includes(" ")) return text.toLowerCase().includes(needle);
+  return new RegExp(`\\b${escapeRegExp(needle)}\\b`, "i").test(text);
+}
+
+function shannon(value: string): number {
+  const freq = new Map<string, number>();
+  for (const ch of value) freq.set(ch, (freq.get(ch) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of freq.values()) {
+    const p = count / value.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

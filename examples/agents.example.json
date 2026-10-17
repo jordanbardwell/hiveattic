@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "id": "pilot-alpha",
+      "display_name": "Pilot Alpha",
+      "kind": "agent",
+      "scopes": ["read:shared", "read:own", "write:own", "write:shared", "read:decisions"]
+    },
+    {
+      "id": "pilot-beta",
+      "display_name": "Pilot Beta",
+      "kind": "agent",
+      "scopes": ["read:shared", "read:own", "write:own"]
+    }
+  ]
+}
