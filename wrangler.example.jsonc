@@ -12,8 +12,7 @@
       "head_sampling_rate": 0.1
     }
   },
-  "workers_dev": false,
-  "routes": [{ "pattern": "hiveattic.com", "custom_domain": true }],
+  "workers_dev": true,
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "vars": {
     "VAULT_PREFIX": "vault/",

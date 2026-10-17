@@ -19,19 +19,8 @@ const outPath = process.env.HIVEATTIC_E2E_OUT ?? "e2e-results/results.json";
 const writeRoot = stagingBase;
 const admin = stagingAdmin;
 
-if (!readOnly && (!stagingBase || !stagingAdmin)) {
-  console.error("Refusing to run: write tests target only HIVEATTIC_STAGING_BASE_URL with HIVEATTIC_STAGING_ADMIN_TOKEN. Set HIVEATTIC_E2E_READ_ONLY=1 for a read-only smoke against HIVEATTIC_BASE_URL.");
-  process.exit(2);
-}
-if (!readOnly && prodBase && prodBase === stagingBase) {
-  console.error("Refusing to run: HIVEATTIC_STAGING_BASE_URL is the same as HIVEATTIC_BASE_URL.");
-  process.exit(2);
-}
-if (readOnly && (!(prodBase || stagingBase) || !suppliedReviewer)) {
-  console.error("Read-only smoke needs HIVEATTIC_BASE_URL (or the staging URL) and HIVEATTIC_REVIEWER_TOKEN. It does not mint tokens or send writes.");
-  process.exit(2);
-}
 
+const dryRun = process.argv.includes("--dry-run") || process.env.HIVEATTIC_E2E_DRY_RUN === "1";
 const runId = `e2e${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`;
 const policySubject = `Qxsubject${runId}`;
 const policyQualifier = `qxqual${runId}`;
@@ -47,65 +36,22 @@ let sharedWriter = "";
 let prodPolicyBefore = "";
 let dlqDepth: number | null = null;
 let stagingOk = false;
+let tailChild: ChildProcess | null = null;
+let tailText = "";
+let exitCode = 0;
 
-try {
-  if (readOnly) {
-    cases.push(await record("T-01", () => readOnlyReviewer()));
-    for (const id of ["T-02", "T-03", "T-04", "T-05", "T-06", "T-07", "T-08", "T-09", "T-11", "T-12"]) {
-      cases.push(skipped(id, "Read-only smoke does not write"));
-    }
-  } else {
-    await assertStaging();
-    stagingOk = true;
-    if (prodBase && prodAdmin) prodPolicyBefore = JSON.stringify((await rest("/v1/admin/policy", prodAdmin, "GET", undefined, prodBase)).json.data ?? {});
-    await prepare();
-    cases.push(await record("T-01", () => scopeCase()));
-    await ensureTail();
-    cases.push(await record("T-02", () => secretCase()));
-    cases.push(await record("T-03", () => financialCase()));
-    await stopTail();
-    cases.push(await record("T-04", () => employerCase()));
-    cases.push(await record("T-05", () => newestCase()));
-    cases.push(await record("T-06", () => concurrencyCase()));
-    cases.push(await record("T-07", () => appendOnlyCase()));
-    cases.push(await record("T-08", () => idempotencyCase()));
-    cases.push(await record("T-09", () => forgetCase()));
-    cases.push(await record("T-11", () => humanEditCase()));
-    cases.push(await record("T-12", () => rebuildCase()));
-    cases.push(await record("T-CLEANUP", () => cleanupCase()));
-  }
-  cases.push(skipped("T-10", "deferred to a later milestone"));
-  cases.push(skipped("T-13", "deferred to a later milestone"));
-  cases.push(skipped("T-14", "deferred to a later milestone"));
-} finally {
-  await stopTail();
-  for (const item of minted) {
-    await rest("/v1/admin/tokens/revoke", admin, "POST", { token_id: item.id }, writeRoot).catch(() => undefined);
-  }
-  for (const term of addedTerms) {
-    await rest("/v1/admin/policy", admin, "DELETE", { term }, writeRoot).catch(() => undefined);
-  }
-  if (stagingOk && stagingBase && stagingAdmin) {
-    await rest("/v1/admin/cleanup", stagingAdmin, "POST", { run_id: runId }, stagingBase).catch(() => undefined);
+class StopRun extends Error {
+  exitStatus: number;
+  constructor(exitStatus: number, message: string) {
+    super(message);
+    this.exitStatus = exitStatus;
   }
 }
-
-const failed = cases.filter((item) => item.status === "failed").length;
-dlqDepth = await readDlqDepth();
-const summary = render(cases);
-mkdirSync(dirname(outPath), { recursive: true });
-const artifact = scrub(JSON.stringify({ run_id: runId, target: readOnly ? "read-only" : "staging", failed, dlq_depth: dlqDepth, cases }, null, 2));
-writeFileSync(outPath, artifact);
-writeFileSync(outPath.replace(/\.json$/, "") + ".summary.md", scrub(summary));
-writeFileSync(outPath.replace(/results\.json$/, "dlq.json"), JSON.stringify({ dlq_depth: dlqDepth, queue: dlqName() }, null, 2));
-console.log(scrub(summary));
-process.exit(failed > 0 ? 1 : 0);
 
 async function assertStaging(): Promise<void> {
   const who = await rest("/v1/whoami", stagingAdmin, "GET", undefined, stagingBase);
   if (who.status !== 200 || who.json.data?.deploy_env !== "staging" || who.json.data?.staging_resources !== true) {
-    console.error("Refusing writes: target is not flagged as staging.");
-    process.exit(2);
+    throw new StopRun(2, "Refusing writes: target is not flagged as staging.");
   }
 }
 
@@ -696,25 +642,35 @@ async function sha256Hex(value: string): Promise<string> {
 const LOG_OPERATOR =
   "The log check uses Workers Logs when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set, and otherwise `wrangler tail`. Set HIVEATTIC_LOG_MODE=tail to force tail, or HIVEATTIC_LOG_MODE=api to use only the API. HIVEATTIC_WORKER_NAME defaults to hiveattic-staging.";
 
-let tailChild: ChildProcess | null = null;
-let tailText = "";
-
 function workerName(): string {
   return process.env.HIVEATTIC_WORKER_NAME?.trim() || "hiveattic-staging";
+}
+
+function startTail(): ChildProcess {
+  const script = process.env.HIVEATTIC_TAIL_SCRIPT?.trim();
+  if (script) return spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  const override = process.env.HIVEATTIC_TAIL_COMMAND?.trim();
+  if (override) return spawn(override, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+  return spawn("pnpm", ["exec", "wrangler", "tail", workerName(), "--format", "json"], { stdio: ["ignore", "pipe", "pipe"] });
 }
 
 async function ensureTail(): Promise<void> {
   if (tailChild || process.env.HIVEATTIC_LOG_MODE === "api") return;
   tailText = "";
-  const child = spawn("pnpm", ["exec", "wrangler", "tail", workerName(), "--format", "json"], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = startTail();
   tailChild = child;
+  child.on("error", (err) => {
+    tailText += `\n${err.name}`;
+  });
   child.stdout?.on("data", (chunk: Buffer) => {
     tailText += chunk.toString();
   });
   child.stderr?.on("data", (chunk: Buffer) => {
     tailText += chunk.toString();
   });
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const attachRaw = Number(process.env.HIVEATTIC_TAIL_ATTACH_MS ?? "1500");
+  const attachMs = Number.isFinite(attachRaw) && attachRaw >= 0 ? attachRaw : 1500;
+  await new Promise((resolve) => setTimeout(resolve, attachMs));
 }
 
 async function stopTail(): Promise<void> {
@@ -794,42 +750,84 @@ function dlqName(): string {
 async function readDlqDepth(): Promise<number | null> {
   const token = process.env.CLOUDFLARE_API_TOKEN?.trim() ?? "";
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ?? "";
-  if (token && accountId) {
-    const listed = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
-    if (listed?.ok) {
-      const body = (await listed.json()) as { result?: { queue_id?: string; queue_name?: string }[] };
-      const queue = (body.result ?? []).find((item) => item.queue_name === dlqName());
-      if (queue?.queue_id) {
-        const info = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues/${queue.queue_id}`, {
-          headers: { authorization: `Bearer ${token}` },
-        }).catch(() => null);
-        if (info?.ok) {
-          const detail = (await info.json()) as { result?: { producers_total_count?: number; consumers_total_count?: number } };
-          const depth = detail.result?.producers_total_count;
-          if (typeof depth === "number") return depth;
-        }
-      }
-    }
+  if (!token || !accountId) return null;
+  const queueId = await queueIdByName(token, accountId, dlqName());
+  if (!queueId) return null;
+  const sampled = await backlogFromGraphQL(token, accountId, queueId);
+  if (typeof sampled === "number") return sampled;
+  return backlogFromMetrics(token, accountId, queueId);
+}
+
+async function queueIdByName(token: string, accountId: string, name: string): Promise<string | null> {
+  const listed = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues`, {
+    headers: { authorization: `Bearer ${token}` },
+  }).catch(() => null);
+  if (!listed?.ok) return null;
+  const body = (await listed.json()) as { result?: { queue_id?: string; queue_name?: string }[] };
+  return (body.result ?? []).find((item) => item.queue_name === name)?.queue_id ?? null;
+}
+
+async function backlogFromGraphQL(token: string, accountId: string, queueId: string): Promise<number | null> {
+  const end = new Date();
+  const start = new Date(end.getTime() - 15 * 60 * 1000);
+  for (const field of ["queueBacklogAdaptiveGroups", "queuesBacklogAdaptiveGroups"]) {
+    const sampled = await graphqlBacklog(token, accountId, queueId, field, start, end);
+    if (sampled === "error") continue;
+    if (typeof sampled === "number") return sampled;
   }
-  return await new Promise((resolve) => {
-    const child = spawn("pnpm", ["exec", "wrangler", "queues", "info", dlqName()], { stdio: ["ignore", "pipe", "pipe"] });
-    let text = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      text += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      text += chunk.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve(null);
-    }, 15000);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      const match = /backlog[^0-9]*(\d+)/i.exec(text) || /"depth"\s*:\s*(\d+)/i.exec(text) || /messages?\s*[:=]\s*(\d+)/i.exec(text);
-      resolve(match ? Number(match[1]) : text.toLowerCase().includes("0") && /empty|depth|backlog/i.test(text) ? 0 : null);
-    });
-  });
+  return null;
+}
+
+async function graphqlBacklog(
+  token: string,
+  accountId: string,
+  queueId: string,
+  field: string,
+  start: Date,
+  end: Date,
+): Promise<number | "empty" | "error"> {
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      query: `query QueueBacklog($accountTag: string!, $queueId: string!, $datetimeStart: Time!, $datetimeEnd: Time!) {
+        viewer {
+          accounts(filter: { accountTag: $accountTag }) {
+            ${field}(
+              limit: 20
+              filter: { queueId: $queueId, datetime_geq: $datetimeStart, datetime_leq: $datetimeEnd }
+              orderBy: [datetime_DESC]
+            ) {
+              avg { messages }
+              dimensions { datetime }
+            }
+          }
+        }
+      }`,
+      variables: { accountTag: accountId, queueId, datetimeStart: start.toISOString(), datetimeEnd: end.toISOString() },
+    }),
+  }).catch(() => null);
+  if (!response?.ok) return "error";
+  const body = (await response.json()) as {
+    errors?: unknown[];
+    data?: { viewer?: { accounts?: Record<string, { avg?: { messages?: number | null }; dimensions?: { datetime?: string } }[] | undefined>[] } };
+  };
+  if (body.errors?.length) return "error";
+  const groups = body.data?.viewer?.accounts?.[0]?.[field] ?? [];
+  if (!groups.length) return "empty";
+  const newest = [...groups].sort((left, right) => String(right.dimensions?.datetime ?? "").localeCompare(String(left.dimensions?.datetime ?? "")))[0];
+  const messages = newest?.avg?.messages;
+  return typeof messages === "number" && Number.isFinite(messages) ? messages : "empty";
+}
+
+async function backlogFromMetrics(token: string, accountId: string, queueId: string): Promise<number | null> {
+  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues/${queueId}/metrics`, {
+    headers: { authorization: `Bearer ${token}` },
+  }).catch(() => null);
+  if (!response?.ok) return null;
+  const body = (await response.json()) as { result?: { backlog_count?: number } };
+  const count = body.result?.backlog_count;
+  return typeof count === "number" && Number.isFinite(count) ? count : null;
 }
 
 function scrub(text: string): string {
@@ -927,3 +925,137 @@ function render(items: Case[]): string {
   lines.push("", `DLQ depth: ${dlqDepth === null ? "unknown" : String(dlqDepth)}`);
   return lines.join("\n");
 }
+
+function quiet(work: Promise<unknown>): Promise<void> {
+  return work.then(
+    () => undefined,
+    () => undefined,
+  );
+}
+
+function writeArtifacts(): void {
+  const failed = cases.filter((item) => item.status === "failed").length;
+  const summary = render(cases);
+  mkdirSync(dirname(outPath), { recursive: true });
+  const target = dryRun ? "dry-run" : readOnly ? "read-only" : "staging";
+  const artifact = scrub(JSON.stringify({ run_id: runId, target, failed, dlq_depth: dlqDepth, cases }, null, 2));
+  writeFileSync(outPath, artifact);
+  const summaryPath = outPath.endsWith(".json") ? `${outPath.slice(0, -".json".length)}.summary.md` : `${outPath}.summary.md`;
+  writeFileSync(summaryPath, scrub(summary));
+  writeFileSync(`${dirname(outPath)}/dlq.json`, JSON.stringify({ dlq_depth: dlqDepth, queue: dlqName() }, null, 2));
+  console.log(scrub(summary));
+}
+
+function refuseIfMisconfigured(): void {
+  if (dryRun) {
+    if (!stagingBase || !stagingAdmin) {
+      throw new StopRun(2, "Dry-run needs HIVEATTIC_STAGING_BASE_URL and HIVEATTIC_STAGING_ADMIN_TOKEN. A local mock is enough.");
+    }
+    return;
+  }
+  if (!readOnly && (!stagingBase || !stagingAdmin)) {
+    throw new StopRun(
+      2,
+      "Refusing to run: write tests target only HIVEATTIC_STAGING_BASE_URL with HIVEATTIC_STAGING_ADMIN_TOKEN. Set HIVEATTIC_E2E_READ_ONLY=1 for a read-only smoke against HIVEATTIC_BASE_URL.",
+    );
+  }
+  if (!readOnly && prodBase && prodBase === stagingBase) {
+    throw new StopRun(2, "Refusing to run: HIVEATTIC_STAGING_BASE_URL is the same as HIVEATTIC_BASE_URL.");
+  }
+  if (readOnly && (!(prodBase || stagingBase) || !suppliedReviewer)) {
+    throw new StopRun(2, "Read-only smoke needs HIVEATTIC_BASE_URL (or the staging URL) and HIVEATTIC_REVIEWER_TOKEN. It does not mint tokens or send writes.");
+  }
+}
+
+async function runCases(): Promise<void> {
+  if (dryRun) {
+    await assertStaging();
+    stagingOk = true;
+    await prepare();
+    await ensureTail();
+    cases.push({
+      id: "DRY-RUN",
+      status: "passed",
+      details: "setup, log capture, and cleanup",
+      duration_ms: 0,
+      checks: [{ name: "dry-run", status: "passed" }],
+    });
+    return;
+  }
+  if (readOnly) {
+    cases.push(await record("T-01", () => readOnlyReviewer()));
+    for (const id of ["T-02", "T-03", "T-04", "T-05", "T-06", "T-07", "T-08", "T-09", "T-11", "T-12"]) {
+      cases.push(skipped(id, "Read-only smoke does not write"));
+    }
+  } else {
+    await assertStaging();
+    stagingOk = true;
+    if (prodBase && prodAdmin) prodPolicyBefore = JSON.stringify((await rest("/v1/admin/policy", prodAdmin, "GET", undefined, prodBase)).json.data ?? {});
+    await prepare();
+    cases.push(await record("T-01", () => scopeCase()));
+    await ensureTail();
+    cases.push(await record("T-02", () => secretCase()));
+    cases.push(await record("T-03", () => financialCase()));
+    await stopTail();
+    cases.push(await record("T-04", () => employerCase()));
+    cases.push(await record("T-05", () => newestCase()));
+    cases.push(await record("T-06", () => concurrencyCase()));
+    cases.push(await record("T-07", () => appendOnlyCase()));
+    cases.push(await record("T-08", () => idempotencyCase()));
+    cases.push(await record("T-09", () => forgetCase()));
+    cases.push(await record("T-11", () => humanEditCase()));
+    cases.push(await record("T-12", () => rebuildCase()));
+    cases.push(await record("T-CLEANUP", () => cleanupCase()));
+  }
+  cases.push(skipped("T-10", "deferred to a later milestone"));
+  cases.push(skipped("T-13", "deferred to a later milestone"));
+  cases.push(skipped("T-14", "deferred to a later milestone"));
+}
+
+async function finish(): Promise<void> {
+  await quiet(stopTail());
+  for (const item of minted) {
+    await quiet(rest("/v1/admin/tokens/revoke", admin, "POST", { token_id: item.id }, writeRoot));
+  }
+  for (const term of addedTerms) {
+    await quiet(rest("/v1/admin/policy", admin, "DELETE", { term }, writeRoot));
+  }
+  if (stagingOk && stagingBase && stagingAdmin) {
+    await quiet(rest("/v1/admin/cleanup", stagingAdmin, "POST", { run_id: runId }, stagingBase));
+  }
+  if (!dryRun) dlqDepth = await readDlqDepth().catch(() => null);
+  writeArtifacts();
+}
+
+async function main(): Promise<number> {
+  try {
+    refuseIfMisconfigured();
+    await runCases();
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "aborted";
+    if (err instanceof StopRun) {
+      console.error(err.message);
+      exitCode = err.exitStatus;
+    } else {
+      console.error(detail);
+      exitCode = 1;
+    }
+    cases.push({ id: "ABORT", status: "failed", details: detail, duration_ms: 0, checks: [{ name: "abort", status: "failed", detail }] });
+  } finally {
+    try {
+      await finish();
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : "cleanup failed");
+      if (exitCode === 0) exitCode = 1;
+      try {
+        writeArtifacts();
+      } catch {
+        console.error("results artifact was not written");
+      }
+    }
+  }
+  if (exitCode === 0 && cases.some((item) => item.status === "failed")) exitCode = 1;
+  return exitCode;
+}
+
+process.exit(await main());
