@@ -16,10 +16,14 @@
     "TZ_DISPLAY": "UTC",
     "RATE_LIMIT_WRITES_PER_MIN": "60",
     "RATE_LIMIT_READS_PER_MIN": "300",
-    "E2E_CLEANUP_ENABLED": "true"
+    "E2E_CLEANUP_ENABLED": "true",
+    "DEPLOY_ENV": "staging",
+    "VAULT_BUCKET": "hiveattic-staging-vault",
+    "DB_NAME": "hiveattic-staging-index",
+    "WORKER_NAME": "hiveattic-staging"
   },
   "triggers": { "crons": ["15 7 * * *"] },
-  "secrets": { "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY"] },
+  "secrets": { "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"] },
   "r2_buckets": [{ "binding": "VAULT", "bucket_name": "hiveattic-staging-vault" }],
   "d1_databases": [
     {

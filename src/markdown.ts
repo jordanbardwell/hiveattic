@@ -70,10 +70,19 @@ export function chunkMarkdown(path: string, title: string, body: string): { n: n
   });
 }
 
-export function journalEntries(markdown: string): { id: string; agent: string; title: string; idempotency: string | null; mac: string | null }[] {
+export type JournalEntry = {
+  id: string;
+  agent: string;
+  title: string;
+  body: string;
+  idempotency: string | null;
+  mac: string | null;
+};
+
+export function journalEntries(markdown: string): JournalEntry[] {
   const { body } = parseMarkdown(markdown);
   const blocks = body.split(/\n(?=## )/);
-  const entries: { id: string; agent: string; title: string; idempotency: string | null; mac: string | null }[] = [];
+  const entries: JournalEntry[] = [];
   for (const block of blocks) {
     const heading = /^## .+ · ([^·\n]+) · (.+?) \^([0-9A-HJKMNP-TV-Z]{26})/m.exec(block);
     if (!heading) continue;
@@ -83,11 +92,34 @@ export function journalEntries(markdown: string): { id: string; agent: string; t
       id: heading[3]!,
       agent: heading[1]!.trim(),
       title: heading[2]!.trim(),
+      body: journalBlockBody(block),
       idempotency: idem?.[1] ?? null,
       mac: mac && mac[1] === heading[3] ? mac[3]! : null,
     });
   }
   return entries;
+}
+
+function journalBlockBody(block: string): string {
+  const lines = block.split("\n").slice(1);
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (/hiveattic:/i.test(line)) break;
+    if (/^Tags: /.test(line)) continue;
+    kept.push(line);
+  }
+  return kept.join("\n").trim();
+}
+
+export function textForFilter(markdown: string): string {
+  const parsed = parseMarkdown(markdown);
+  const frontmatter: Frontmatter = {};
+  for (const [key, value] of Object.entries(parsed.frontmatter)) {
+    if (key.startsWith("vault_") || key === "source" || key === "supersedes") continue;
+    frontmatter[key] = value;
+  }
+  const body = parsed.body.replace(/<!--\s*hiveattic:[\s\S]*?-->/g, "");
+  return buildMarkdown(frontmatter, body);
 }
 
 export function guardJournalBody(body: string): string {

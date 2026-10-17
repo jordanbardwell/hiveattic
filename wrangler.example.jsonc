@@ -12,17 +12,22 @@
       "head_sampling_rate": 0.1
     }
   },
-  "workers_dev": true,
+  "workers_dev": false,
+  "routes": [{ "pattern": "hiveattic.com", "custom_domain": true }],
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "vars": {
     "VAULT_PREFIX": "vault/",
     "TZ_DISPLAY": "UTC",
     "RATE_LIMIT_WRITES_PER_MIN": "60",
     "RATE_LIMIT_READS_PER_MIN": "300",
-    "E2E_CLEANUP_ENABLED": ""
+    "E2E_CLEANUP_ENABLED": "",
+    "DEPLOY_ENV": "",
+    "VAULT_BUCKET": "hiveattic-vault",
+    "DB_NAME": "hiveattic-index",
+    "WORKER_NAME": "hiveattic"
   },
   "triggers": { "crons": ["15 7 * * *"] },
-  "secrets": { "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY"] },
+  "secrets": { "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"] },
   "r2_buckets": [{ "binding": "VAULT", "bucket_name": "hiveattic-vault" }],
   "d1_databases": [
     {

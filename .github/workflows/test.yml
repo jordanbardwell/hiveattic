@@ -20,3 +20,6 @@ jobs:
       - run: pnpm test
       - run: pnpm typecheck
       - run: grep -q '00000000-0000-0000-0000-000000000001' wrangler.jsonc
+      - run: grep -q '"E2E_CLEANUP_ENABLED": ""' wrangler.jsonc
+      - run: grep -q '"DEPLOY_ENV": ""' wrangler.jsonc
+      - run: grep -q '"workers_dev": false' wrangler.jsonc

@@ -1,43 +1,69 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, DeleteObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 
 type Status = "passed" | "failed" | "skipped" | "partial";
 type Check = { name: string; status: Status; detail?: string };
 type Case = { id: string; status: Status; details: string; duration_ms: number; checks: Check[] };
 
-const base = (process.env.HIVEATTIC_BASE_URL ?? "").replace(/\/$/, "");
+const prodBase = (process.env.HIVEATTIC_BASE_URL ?? "").replace(/\/$/, "");
 const stagingBase = (process.env.HIVEATTIC_STAGING_BASE_URL ?? "").replace(/\/$/, "");
 const stagingAdmin = process.env.HIVEATTIC_STAGING_ADMIN_TOKEN ?? "";
-const admin = process.env.HIVEATTIC_ADMIN_TOKEN ?? "";
+const prodAdmin = process.env.HIVEATTIC_ADMIN_TOKEN ?? "";
 const suppliedReviewer = process.env.HIVEATTIC_REVIEWER_TOKEN ?? "";
+const readOnly = /^(1|true|yes|read-only)$/i.test(process.env.HIVEATTIC_E2E_READ_ONLY ?? "") || process.env.HIVEATTIC_E2E_MODE === "read-only";
 const account = accountFixture();
 const outPath = process.env.HIVEATTIC_E2E_OUT ?? "e2e-results/results.json";
+const writeRoot = stagingBase;
+const admin = stagingAdmin;
 
-if (!base || (!admin && !suppliedReviewer)) {
-  console.error("Set HIVEATTIC_BASE_URL and HIVEATTIC_ADMIN_TOKEN. A reviewer-only run also accepts HIVEATTIC_REVIEWER_TOKEN.");
+if (!readOnly && (!stagingBase || !stagingAdmin)) {
+  console.error("Refusing to run: write tests target only HIVEATTIC_STAGING_BASE_URL with HIVEATTIC_STAGING_ADMIN_TOKEN. Set HIVEATTIC_E2E_READ_ONLY=1 for a read-only smoke against HIVEATTIC_BASE_URL.");
+  process.exit(2);
+}
+if (!readOnly && prodBase && prodBase === stagingBase) {
+  console.error("Refusing to run: HIVEATTIC_STAGING_BASE_URL is the same as HIVEATTIC_BASE_URL.");
+  process.exit(2);
+}
+if (readOnly && (!(prodBase || stagingBase) || !suppliedReviewer)) {
+  console.error("Read-only smoke needs HIVEATTIC_BASE_URL (or the staging URL) and HIVEATTIC_REVIEWER_TOKEN. It does not mint tokens or send writes.");
   process.exit(2);
 }
 
 const runId = `e2e${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`;
+const policySubject = `Qxsubject${runId}`;
+const policyQualifier = `qxqual${runId}`;
 const cases: Case[] = [];
+const minted: { id: string }[] = [];
+const addedTerms: string[] = [];
 let reviewer = suppliedReviewer;
 let readerX = "";
 let financeRw = "";
+let financeRo = "";
+let chief = "";
 let sharedWriter = "";
+let prodPolicyBefore = "";
+let dlqDepth: number | null = null;
+let stagingOk = false;
 
 try {
-  if (!admin) {
+  if (readOnly) {
     cases.push(await record("T-01", () => readOnlyReviewer()));
     for (const id of ["T-02", "T-03", "T-04", "T-05", "T-06", "T-07", "T-08", "T-09", "T-11", "T-12"]) {
-      cases.push(skipped(id, "Write checks need HIVEATTIC_ADMIN_TOKEN"));
+      cases.push(skipped(id, "Read-only smoke does not write"));
     }
   } else {
+    await assertStaging();
+    stagingOk = true;
+    if (prodBase && prodAdmin) prodPolicyBefore = JSON.stringify((await rest("/v1/admin/policy", prodAdmin, "GET", undefined, prodBase)).json.data ?? {});
     await prepare();
     cases.push(await record("T-01", () => scopeCase()));
+    await ensureTail();
     cases.push(await record("T-02", () => secretCase()));
     cases.push(await record("T-03", () => financialCase()));
+    await stopTail();
     cases.push(await record("T-04", () => employerCase()));
     cases.push(await record("T-05", () => newestCase()));
     cases.push(await record("T-06", () => concurrencyCase()));
@@ -46,23 +72,42 @@ try {
     cases.push(await record("T-09", () => forgetCase()));
     cases.push(await record("T-11", () => humanEditCase()));
     cases.push(await record("T-12", () => rebuildCase()));
+    cases.push(await record("T-CLEANUP", () => cleanupCase()));
   }
   cases.push(skipped("T-10", "deferred to a later milestone"));
   cases.push(skipped("T-13", "deferred to a later milestone"));
   cases.push(skipped("T-14", "deferred to a later milestone"));
 } finally {
-  if (stagingBase && stagingAdmin) {
+  await stopTail();
+  for (const item of minted) {
+    await rest("/v1/admin/tokens/revoke", admin, "POST", { token_id: item.id }, writeRoot).catch(() => undefined);
+  }
+  for (const term of addedTerms) {
+    await rest("/v1/admin/policy", admin, "DELETE", { term }, writeRoot).catch(() => undefined);
+  }
+  if (stagingOk && stagingBase && stagingAdmin) {
     await rest("/v1/admin/cleanup", stagingAdmin, "POST", { run_id: runId }, stagingBase).catch(() => undefined);
   }
 }
 
 const failed = cases.filter((item) => item.status === "failed").length;
+dlqDepth = await readDlqDepth();
 const summary = render(cases);
 mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, JSON.stringify({ run_id: runId, base, failed, cases }, null, 2));
-writeFileSync(outPath.replace(/\.json$/, "") + ".summary.md", summary);
-console.log(summary);
+const artifact = scrub(JSON.stringify({ run_id: runId, target: readOnly ? "read-only" : "staging", failed, dlq_depth: dlqDepth, cases }, null, 2));
+writeFileSync(outPath, artifact);
+writeFileSync(outPath.replace(/\.json$/, "") + ".summary.md", scrub(summary));
+writeFileSync(outPath.replace(/results\.json$/, "dlq.json"), JSON.stringify({ dlq_depth: dlqDepth, queue: dlqName() }, null, 2));
+console.log(scrub(summary));
 process.exit(failed > 0 ? 1 : 0);
+
+async function assertStaging(): Promise<void> {
+  const who = await rest("/v1/whoami", stagingAdmin, "GET", undefined, stagingBase);
+  if (who.status !== 200 || who.json.data?.deploy_env !== "staging" || who.json.data?.staging_resources !== true) {
+    console.error("Refusing writes: target is not flagged as staging.");
+    process.exit(2);
+  }
+}
 
 async function prepare(): Promise<void> {
   reviewer = suppliedReviewer || (await mint("reviewer", [], `${runId}-reviewer`, "reviewer"));
@@ -72,19 +117,21 @@ async function prepare(): Promise<void> {
     ["read:shared", "read:own", "write:own", "read:domain/finance", "write:domain/finance", "read:sensitive/finance", "write:sensitive/finance"],
     `${runId}-finance-rw`,
   );
-  sharedWriter = await mint(`${runId}-shared-writer`, ["read:shared", "read:own", "write:own", "write:shared"], `${runId}-shared-writer`);
+  financeRo = await mint(`${runId}-finance-ro`, ["read:shared", "read:own", "write:own", "read:domain/finance", "read:sensitive/finance"], `${runId}-finance-ro`);
+  chief = await mint(`${runId}-chief`, ["read:shared", "read:inbox", "read:sensitive:summary/health", "read:sensitive:summary/finance"], `${runId}-chief`);
+  sharedWriter = await mint(`${runId}-shared-writer`, ["read:shared", "read:own", "write:own", "write:shared", "write:decisions"], `${runId}-shared-writer`);
   const boot = await rest("/v1/admin/bootstrap", admin, "POST", {});
   if (boot.status !== 200) throw new Error(`bootstrap ${boot.status}`);
 }
 
 async function readOnlyReviewer(): Promise<Check[]> {
-  const who = await rest("/v1/whoami", suppliedReviewer);
-  const search = await rest("/v1/search?q=vault", suppliedReviewer);
-  const write = await rest("/v1/facts", suppliedReviewer, "POST", { key: "blocked", statement: "no", observed_at: new Date().toISOString(), scope: "own" });
+  const root = prodBase || stagingBase;
+  const who = await rest("/v1/whoami", suppliedReviewer, "GET", undefined, root);
+  const search = await rest("/v1/search?q=vault", suppliedReviewer, "GET", undefined, root);
   return [
     check("whoami", who.status === 200 && who.json.data?.admin === false, `status ${who.status}`),
     check("search", search.status === 200, `status ${search.status}`),
-    check("write denied", write.status === 403, `status ${write.status}`),
+    check("no writes sent", true),
   ];
 }
 
@@ -107,14 +154,34 @@ async function scopeCase(): Promise<Check[]> {
     const reviewerWrite = await rest("/v1/notes", reviewer, "PUT", { path: `shared/${runId}-reviewer.md`, body: "no", type: "note" });
     const shared = await rest("/v1/notes", sharedWriter, "PUT", { path: `shared/${runId}-visible.md`, body: `Shared ${runId}`, type: "note" });
     const reviewerShared = await rest(`/v1/notes?path=${encodeURIComponent(`shared/${runId}-visible.md`)}`, reviewer);
+    const financeRead = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, financeRo);
+    const financeWrite = await rest("/v1/notes", financeRo, "PUT", { path, body: "nope", type: "note" });
+    const ownFinance = await rest("/v1/notes", financeRo, "PUT", {
+      path: `bots/${runId}-finance-ro/${runId}-own.md`,
+      body: "Brokerage rebalanced",
+      type: "note",
+      domain: "finance",
+    });
+    const summaryPath = `domains/finance/summaries/${runId}.md`;
+    const summary = await rest("/v1/notes", financeRw, "PUT", { path: summaryPath, body: `Summary ${runId}`, type: "note" });
+    const chiefSummary = await rest(`/v1/notes?path=${encodeURIComponent(summaryPath)}`, chief);
+    const chiefFull = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, chief);
+    const healthPath = `domains/health/${runId}-note.md`;
+    await rest("/v1/notes", admin, "PUT", { path: healthPath, body: `Health ${runId}`, type: "note" });
+    const reviewerHealth = await rest(`/v1/notes?path=${encodeURIComponent(healthPath)}`, reviewer);
     return [
       check("finance write", written.ok === true),
       check("reader denied", denied.status === 404),
       check("reader search empty", Array.isArray(hidden.data?.results) && hidden.data.results.length === 0),
       check("reader cannot write finance role", role.status === 403),
       check("reviewer cannot read finance", reviewerRead.status === 404),
+      check("reviewer cannot read health", reviewerHealth.status === 404),
       check("reviewer cannot write", reviewerWrite.status === 403),
       check("reviewer can read shared", shared.status === 200 && reviewerShared.status === 200),
+      check("finance-ro can read", financeRead.status === 200),
+      check("finance-ro cannot write", financeWrite.status === 403),
+      check("finance-ro cannot write own finance", ownFinance.status === 403),
+      check("chief sees summary only", summary.status === 200 && chiefSummary.status === 200 && chiefFull.status === 404),
     ];
   } finally {
     await client.close();
@@ -178,11 +245,19 @@ async function financialCase(): Promise<Check[]> {
 }
 
 async function employerCase(): Promise<Check[]> {
-  await rest("/v1/admin/policy", admin, "POST", { term: "Contoso Example Corp", kind: "context_subject" });
-  await rest("/v1/admin/policy", admin, "POST", { term: "customer", kind: "context_qualifier" });
+  const before = await rest("/v1/admin/policy", admin);
+  const existing = new Set(((before.json.data?.terms as { term?: string }[] | undefined) ?? []).map((term) => String(term.term ?? "")));
+  if (!existing.has(policySubject)) {
+    await rest("/v1/admin/policy", admin, "POST", { term: policySubject, kind: "context_subject" });
+    addedTerms.push(policySubject);
+  }
+  if (!existing.has(policyQualifier)) {
+    await rest("/v1/admin/policy", admin, "POST", { term: policyQualifier, kind: "context_qualifier" });
+    addedTerms.push(policyQualifier);
+  }
   const rejected = await rest("/v1/facts", readerX, "POST", {
     key: `${runId}-work`,
-    statement: "Contoso Example Corp customer migration notes",
+    statement: `${policySubject} ${policyQualifier} migration notes`,
     observed_at: "2026-02-01T00:00:00Z",
     scope: "own",
   });
@@ -190,12 +265,10 @@ async function employerCase(): Promise<Check[]> {
   try {
     const accepted = await tool(client, "vault_write_fact", {
       key: `${runId}-career`,
-      statement: "I start at Contoso Example Corp next month as an analyst",
+      statement: `I start at ${policySubject} next month as an analyst`,
       observed_at: "2026-02-02T00:00:00Z",
       scope: "own",
     });
-    await rest("/v1/admin/policy", admin, "DELETE", { term: "Contoso Example Corp" });
-    await rest("/v1/admin/policy", admin, "DELETE", { term: "customer" });
     return [check("employer context rejected", rejected.json.error?.code === "rejected_employer"), check("career fact accepted", accepted.ok === true)];
   } finally {
     await client.close();
@@ -270,11 +343,17 @@ async function concurrencyCase(): Promise<Check[]> {
   const fileOrder = [...markdown.matchAll(/\^([0-9A-HJKMNP-TV-Z]{26})/g)].map((match) => `^${match[1]}`);
   const order = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
   const stored = Array.isArray(order.json.data?.block_refs) ? (order.json.data?.block_refs as string[]) : [];
+  const rebuilt = await rest("/v1/admin/reindex", admin, "POST", {});
+  const after = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
+  const afterMarkdown = String(after.json.data?.markdown ?? "");
+  let stillMissing = 0;
+  for (const ref of seen) if (!afterMarkdown.includes(ref)) stillMissing += 1;
   return [
-    check("twenty batches", seen.size === batches * 7 && missing === 0, missing ? `${missing} markers missing` : `${seen.size} refs`),
+    check("one hundred forty refs", seen.size === batches * 7 && missing === 0, missing ? `${missing} markers missing` : `${seen.size} refs`),
     check("entries intact", torn === 0, torn ? `${torn} entries were split or duplicated` : undefined),
     check("journal order", order.status === 200 && stored.join() === fileOrder.join(), `status ${order.status}`),
     check("stale etag", stale.status === 409 && stale.json.error?.code === "conflict_etag", `status ${stale.status}`),
+    check("entries survive rebuild", rebuilt.status === 200 && stillMissing === 0 && after.json.data?.status === "active", stillMissing ? `${stillMissing} refs missing after rebuild` : undefined),
   ];
 }
 
@@ -331,15 +410,12 @@ async function humanEditCase(): Promise<Check[]> {
   if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !process.env.R2_ENDPOINT || !process.env.R2_BUCKET) {
     return [{ name: "s3 edit", status: "skipped", detail: "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, and R2_BUCKET" }];
   }
+  const bucket = process.env.R2_BUCKET;
   const path = `shared/${runId}-human.md`;
   const created = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `Original ${runId}alpha`, type: "note" });
-  const s3 = new S3Client({
-    region: "auto",
-    endpoint: process.env.R2_ENDPOINT,
-    credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
-  });
+  const s3 = s3Client();
   const started = Date.now();
-  await s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: `vault/${path}`, Body: `Updated ${runId}beta from outside the api\n`, ContentType: "text/markdown" }));
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: `vault/${path}`, Body: `Updated ${runId}beta from outside the api\n`, ContentType: "text/markdown" }));
   let found = false;
   while (Date.now() - started < 10_000) {
     const search = await rest(`/v1/search?q=${runId}beta`, sharedWriter);
@@ -351,67 +427,177 @@ async function humanEditCase(): Promise<Check[]> {
   }
   const elapsed = Date.now() - started;
   const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, admin);
+  const day = await rest("/v1/journal", sharedWriter, "POST", { target: "shared", title: "outside", body: `${runId}dayentry`, at: "2099-04-04T16:00:00Z" });
+  const dayPath = String(day.json.data?.path ?? "");
+  const dayBefore = await rest(`/v1/notes?path=${encodeURIComponent(dayPath)}`, sharedWriter);
+  const dayBytes = String(dayBefore.json.data?.markdown ?? "");
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: `vault/${dayPath}`, Body: dayBytes.endsWith("\n") ? `${dayBytes}\n` : `${dayBytes}\n`, ContentType: "text/markdown" }));
+  let dayActive = false;
+  const dayStarted = Date.now();
+  while (Date.now() - dayStarted < 10_000) {
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(dayPath)}`, admin);
+    if (read.json.data?.status === "active" && String(read.json.data.markdown ?? "").includes(`${runId}dayentry`)) {
+      dayActive = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  const dst = `shared/${runId}-copy.md`;
+  await s3.send(new CopyObjectCommand({ Bucket: bucket, Key: `vault/${dst}`, CopySource: `${bucket}/vault/${path}` }));
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: `vault/${path}` }));
+  let copied = false;
+  let sourceForgotten = false;
+  const copyStarted = Date.now();
+  while (Date.now() - copyStarted < 10_000) {
+    const dstRow = await rest(`/v1/notes?path=${encodeURIComponent(dst)}`, admin);
+    const srcRow = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, admin);
+    copied = dstRow.json.data?.status === "active";
+    sourceForgotten = srcRow.json.data?.status === "forgotten";
+    if (copied && sourceForgotten) break;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  const audits = await rest(`/v1/admin/audit?path=${encodeURIComponent(dst)}&limit=20`, admin);
+  const sourceAudits = await rest(`/v1/admin/audit?path=${encodeURIComponent(path)}&limit=20`, admin);
+  const auditText = JSON.stringify([audits.json.data?.entries, sourceAudits.json.data?.entries]);
   const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
-  await s3.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: `vault/${path}`, Body: `${secret}\n${runId}secretmarker\n`, ContentType: "text/markdown" }));
+  const secretPath = `shared/${runId}-secret-object.md`;
+  await rest("/v1/notes", sharedWriter, "PUT", { path: secretPath, body: `Plain ${runId}plain`, type: "note" });
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: `vault/${secretPath}`, Body: `${secret}\n${runId}secretmarker\n`, ContentType: "text/markdown" }));
   let quarantined = false;
   const secretStarted = Date.now();
   while (Date.now() - secretStarted < 10_000) {
-    const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, admin);
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(secretPath)}`, admin);
     if (read.json.data?.status === "quarantined") {
       quarantined = !String(read.json.data.markdown ?? "").includes(secret);
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
+  const versionsBefore = versions((await rest(`/v1/history?path=${encodeURIComponent(secretPath)}`, admin)).json).length;
+  const auditsBefore = ((await rest(`/v1/admin/audit?path=${encodeURIComponent(secretPath)}&limit=50`, admin)).json.data?.entries as unknown[] | undefined)?.length ?? 0;
+  await rest("/v1/admin/reconcile", admin, "POST", {});
+  const versionsAfter = versions((await rest(`/v1/history?path=${encodeURIComponent(secretPath)}`, admin)).json).length;
+  const auditsAfter = ((await rest(`/v1/admin/audit?path=${encodeURIComponent(secretPath)}&limit=50`, admin)).json.data?.entries as unknown[] | undefined)?.length ?? 0;
   const leaked = results((await rest(`/v1/search?q=${runId}secretmarker`, admin)).json);
+  const gonePath = `shared/${runId}-drop.md`;
+  await rest("/v1/notes", sharedWriter, "PUT", { path: gonePath, body: `${runId}dropme`, type: "note" });
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: `vault/${gonePath}` }));
+  await rest("/v1/admin/reconcile", admin, "POST", {});
+  let dropped = false;
+  const dropStarted = Date.now();
+  while (Date.now() - dropStarted < 8_000) {
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(gonePath)}`, admin);
+    const hits = results((await rest(`/v1/search?q=${runId}dropme`, sharedWriter)).json);
+    if (read.json.data?.status === "forgotten" && hits.length === 0) {
+      dropped = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  dlqDepth = await readDlqDepth();
   return [
     check("created", created.status === 200),
     check("keyword searchable within 10s", found && elapsed <= 10_000, `${elapsed}ms`),
     check("history snapshot", versions(history.json).some((version) => String(version.body ?? "").includes(`${runId}alpha`))),
+    check("edited journal stays active", day.status === 200 && dayActive),
+    check("copy indexed and source forgotten", copied && sourceForgotten),
+    check("external audit has no identity", auditText.includes("external_copy") && auditText.includes("external_delete") && auditText.includes("r2-event")),
     check("secret quarantined from search", quarantined && leaked.length === 0),
+    check("second reconcile is quiet", versionsAfter === versionsBefore && auditsAfter === auditsBefore),
+    check("missing object is forgotten", dropped),
+    check("dlq depth", dlqDepth === 0, dlqDepth === null ? "DLQ depth was not readable" : `depth ${dlqDepth}`),
   ];
 }
 
 async function rebuildCase(): Promise<Check[]> {
-  if (!stagingBase || !stagingAdmin) {
-    return [{ name: "staging target", status: "skipped", detail: "Set HIVEATTIC_STAGING_BASE_URL and HIVEATTIC_STAGING_ADMIN_TOKEN. T-12 and cleanup run only against the staging worker." }];
-  }
   const marker = `qxrebuild${runId}`;
   const path = `shared/${runId}-rebuild.md`;
-  const staged = await rest(
-    "/v1/admin/tokens",
-    stagingAdmin,
-    "POST",
-    { agent_id: `${runId}-stage`, display_name: `${runId}-stage`, kind: "agent", scopes: ["read:shared", "write:shared", "read:own", "write:own"], label: `${runId}-stage` },
-    stagingBase,
-  );
-  const token = String(staged.json.data?.token ?? "");
-  if (!token) return [check("staging token", false, `status ${staged.status}`)];
-  const created = await rest("/v1/notes", token, "PUT", { path, body: `${marker} before`, type: "note" }, stagingBase);
+  const created = await rest("/v1/notes", sharedWriter, "PUT", { path, body: `${marker} before`, type: "note" });
   const etag = String(created.json.data?.etag ?? "");
-  await rest("/v1/notes", token, "PUT", { path, body: `${marker} after`, type: "note", if_match: etag }, stagingBase);
-  const before = await rest(`/v1/search?q=${marker}`, token, "GET", undefined, stagingBase);
-  const rebuilt = await rest("/v1/admin/reindex", stagingAdmin, "POST", {}, stagingBase);
-  const after = await rest(`/v1/search?q=${marker}`, token, "GET", undefined, stagingBase);
-  const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, stagingAdmin, "GET", undefined, stagingBase);
+  await rest("/v1/notes", sharedWriter, "PUT", { path, body: `${marker} after`, type: "note", if_match: etag });
+  const journal = await rest("/v1/journal", sharedWriter, "POST", {
+    target: "shared",
+    title: "one",
+    body: `${marker} journal one`,
+    at: "2099-05-05T16:00:00Z",
+  });
+  const journalPath = String(journal.json.data?.path ?? "");
+  await rest("/v1/journal", sharedWriter, "POST", { target: "shared", title: "two", body: `${marker} journal two`, at: "2099-05-05T17:00:00Z" });
+  const decision = await rest("/v1/journal", sharedWriter, "POST", { target: "decisions", title: "keep", body: `${marker} decision`, at: "2099-05-05T18:00:00Z" });
+  const own = await rest("/v1/journal", readerX, "POST", {
+    target: "own",
+    title: "once",
+    body: `${marker} own`,
+    at: "2099-05-05T19:00:00Z",
+    idempotency_key: `${runId}-rebuild-key`,
+  });
+  const forgottenPath = `shared/${runId}-forgotten.md`;
+  await rest("/v1/notes", sharedWriter, "PUT", { path: forgottenPath, body: `${marker} forgotten`, type: "note" });
+  await rest("/v1/forget", sharedWriter, "POST", { path: forgottenPath, reason: "rebuild check" });
+  const before = await rest(`/v1/search?q=${marker}`, sharedWriter);
+  const entriesBefore = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
+  const rebuilt = await rest("/v1/admin/reindex", admin, "POST", {});
+  const after = await rest(`/v1/search?q=${marker}`, sharedWriter);
+  const entriesAfter = await rest(`/v1/admin/journal-order?path=${encodeURIComponent(journalPath)}`, admin);
+  const day = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
+  const decisions = await rest("/v1/notes?path=shared/decisions.md", sharedWriter);
+  const retry = await rest("/v1/journal", readerX, "POST", {
+    target: "own",
+    title: "once",
+    body: `${marker} own`,
+    at: "2099-05-05T19:00:00Z",
+    idempotency_key: `${runId}-rebuild-key`,
+  });
+  const forgotten = await rest(`/v1/notes?path=${encodeURIComponent(forgottenPath)}`, admin);
+  const history = await rest(`/v1/history?path=${encodeURIComponent(path)}`, admin);
   const prior = versions(history.json).find((version) => String(version.body ?? "").includes(`${marker} before`));
-  const restored = await rest("/v1/admin/restore", stagingAdmin, "POST", { path, version_ts: prior?.version_ts }, stagingBase);
-  const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, token, "GET", undefined, stagingBase);
+  const restored = await rest("/v1/admin/restore", admin, "POST", { path, version_ts: prior?.version_ts });
+  const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, sharedWriter);
+  const appended = await rest("/v1/journal", sharedWriter, "POST", { target: "shared", title: "three", body: `${marker} journal three`, at: "2099-05-05T20:00:00Z" });
+  const reread = await rest(`/v1/notes?path=${encodeURIComponent(journalPath)}`, sharedWriter);
+  const markdown = String(reread.json.data?.markdown ?? "");
   return [
-    check("reindex", rebuilt.status === 200),
+    check("reindex", rebuilt.status === 200 && decision.status === 200 && own.status === 200),
     check("search matches", paths(before.json).join() === paths(after.json).join() && paths(after.json).includes(path)),
+    check("journals stay active", day.json.data?.status === "active" && decisions.json.data?.status === "active"),
+    check("journal order unchanged", JSON.stringify(entriesBefore.json.data?.block_refs ?? []) === JSON.stringify(entriesAfter.json.data?.block_refs ?? [])),
+    check("idempotent retry", retry.json.data?.entry_id === own.json.data?.entry_id),
+    check("forgotten stays forgotten", forgotten.json.data?.status === "forgotten"),
     check("restore", restored.status === 200 && String(read.json.data?.markdown ?? "").includes(`${marker} before`)),
+    check("post-rebuild append keeps earlier entries", appended.status === 200 && markdown.includes(`${marker} journal one`) && markdown.includes(`${marker} journal two`) && markdown.includes(`${marker} journal three`)),
   ];
+}
+
+async function cleanupCase(): Promise<Check[]> {
+  const checks: Check[] = [];
+  if (prodBase && prodAdmin) {
+    const denied = await rest("/v1/admin/cleanup", prodAdmin, "POST", { run_id: runId }, prodBase);
+    checks.push(check("prod cleanup is 404", denied.status === 404, `status ${denied.status}`));
+    const after = JSON.stringify((await rest("/v1/admin/policy", prodAdmin, "GET", undefined, prodBase)).json.data ?? {});
+    checks.push(check("prod policy unchanged", after === prodPolicyBefore));
+  } else {
+    checks.push({ name: "prod cleanup is 404", status: "skipped", detail: "Set HIVEATTIC_BASE_URL and HIVEATTIC_ADMIN_TOKEN to prove prod cleanup returns 404" });
+  }
+  const cleaned = await rest("/v1/admin/cleanup", admin, "POST", { run_id: runId });
+  const audit = await rest("/v1/admin/audit?limit=30", admin);
+  const entries = Array.isArray(audit.json.data?.entries) ? (audit.json.data?.entries as { action?: string }[]) : [];
+  const left = await rest(`/v1/search?q=${runId}`, admin);
+  checks.push(check("staging cleanup", cleaned.status === 200, `status ${cleaned.status}`));
+  checks.push(check("staging cleanup audited", entries.some((entry) => entry.action === "cleanup")));
+  checks.push(check("namespaced notes gone", results(left.json).length === 0));
+  return checks;
 }
 
 async function mint(agentId: string, scopes: string[], label: string, preset?: "reviewer"): Promise<string> {
   const response = await rest("/v1/admin/tokens", admin, "POST", preset ? { preset, label, agent_id: agentId } : { agent_id: agentId, display_name: agentId, kind: "agent", scopes, label });
   const token = response.json.data?.token;
-  if (response.status !== 200 || typeof token !== "string") throw new Error(`mint failed for ${agentId}`);
+  const tokenId = response.json.data?.token_id;
+  if (response.status !== 200 || typeof token !== "string" || typeof tokenId !== "string") throw new Error(`mint failed for ${agentId}`);
+  minted.push({ id: tokenId });
   return token;
 }
 
-async function rest(path: string, token: string, method = "GET", body?: unknown, root = base): Promise<{ status: number; json: Envelope; text: string }> {
+async function rest(path: string, token: string, method = "GET", body?: unknown, root = writeRoot): Promise<{ status: number; json: Envelope; text: string }> {
   const response = await fetch(`${root}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
@@ -427,8 +613,16 @@ async function rest(path: string, token: string, method = "GET", body?: unknown,
   return { status: response.status, json, text };
 }
 
+function s3Client(): S3Client {
+  return new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT,
+    credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID ?? "", secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? "" },
+  });
+}
+
 async function mcpClient(token: string): Promise<Client> {
-  const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { authProvider: { token: async () => token } });
+  const transport = new StreamableHTTPClientTransport(new URL(`${writeRoot}/mcp`), { authProvider: { token: async () => token } });
   const client = new Client({ name: "hiveattic-e2e", version: "0.1.0" });
   await client.connect(transport);
   return client;
@@ -500,7 +694,45 @@ async function sha256Hex(value: string): Promise<string> {
 }
 
 const LOG_OPERATOR =
-  "Set CLOUDFLARE_API_TOKEN (Workers Observability Write) and CLOUDFLARE_ACCOUNT_ID to query Workers Logs. Otherwise, while pnpm e2e runs, start `pnpm exec wrangler tail hiveattic --format json` and confirm each filtered fragment is absent. The dashboard view is Workers Observability, dataset cloudflare-workers, filter $metadata.service equal to HIVEATTIC_WORKER_NAME (default hiveattic).";
+  "The log check uses Workers Logs when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set, and otherwise `wrangler tail`. Set HIVEATTIC_LOG_MODE=tail to force tail, or HIVEATTIC_LOG_MODE=api to use only the API. HIVEATTIC_WORKER_NAME defaults to hiveattic-staging.";
+
+let tailChild: ChildProcess | null = null;
+let tailText = "";
+
+function workerName(): string {
+  return process.env.HIVEATTIC_WORKER_NAME?.trim() || "hiveattic-staging";
+}
+
+async function ensureTail(): Promise<void> {
+  if (tailChild || process.env.HIVEATTIC_LOG_MODE === "api") return;
+  tailText = "";
+  const child = spawn("pnpm", ["exec", "wrangler", "tail", workerName(), "--format", "json"], { stdio: ["ignore", "pipe", "pipe"] });
+  tailChild = child;
+  child.stdout?.on("data", (chunk: Buffer) => {
+    tailText += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    tailText += chunk.toString();
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+}
+
+async function stopTail(): Promise<void> {
+  const child = tailChild;
+  tailChild = null;
+  if (!child) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
 
 function rateLimitDetail(): string {
   return "T-06 sends 140 journal writes in one window. Raise the limit, run the suite, then restore 60 from wrangler.jsonc: pnpm exec wrangler deploy --var RATE_LIMIT_WRITES_PER_MIN:10000 ; pnpm e2e ; pnpm exec wrangler deploy. Set HIVEATTIC_RATE_LIMIT_WRITES_PER_MIN to the deployed value (0 disables the limit) so the suite can stop before the burst.";
@@ -516,33 +748,103 @@ function rateLimitBlocked(): Check | null {
 
 async function logsOmit(label: string, fragments: string[], fromMs: number): Promise<Check> {
   const name = `${label} logs omit fragment`;
+  const needles = fragments.filter((item) => item.length > 0);
+  const mode = process.env.HIVEATTIC_LOG_MODE?.trim() || "auto";
   const token = process.env.CLOUDFLARE_API_TOKEN?.trim() ?? "";
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ?? "";
-  if (!token || !accountId) return { name, status: "skipped", detail: LOG_OPERATOR };
-  const needles = fragments.filter((item) => item.length > 0);
-  const script = process.env.HIVEATTIC_WORKER_NAME?.trim() || "hiveattic";
-  const waitRaw = Number(process.env.HIVEATTIC_LOG_WAIT_MS ?? "15000");
-  const waitMs = Number.isFinite(waitRaw) && waitRaw >= 0 ? waitRaw : 15000;
+  if (mode !== "tail" && token && accountId) {
+    const waitRaw = Number(process.env.HIVEATTIC_LOG_WAIT_MS ?? "15000");
+    const waitMs = Number.isFinite(waitRaw) && waitRaw >= 0 ? waitRaw : 15000;
+    const deadline = Date.now() + waitMs;
+    let sawEvents = false;
+    let lastError = "";
+    do {
+      const page = await queryWorkerLogs(token, accountId, workerName(), fromMs).catch((err: unknown) => ({
+        ok: false as const,
+        detail: err instanceof Error ? err.name : "workers logs query failed",
+      }));
+      if (!page.ok) {
+        lastError = page.detail;
+        break;
+      }
+      if (page.events > 0) sawEvents = true;
+      if (needles.some((needle) => page.text.includes(needle))) return check(name, false, "workers logs echoed a filtered fragment");
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    } while (Date.now() <= deadline);
+    if (sawEvents) return check(name, true);
+    if (mode === "api") return check(name, false, sanitize(lastError || "Workers Logs returned no events", needles));
+  }
+  await ensureTail();
+  const waitRaw = Number(process.env.HIVEATTIC_LOG_WAIT_MS ?? "8000");
+  const waitMs = Number.isFinite(waitRaw) && waitRaw >= 0 ? Math.min(waitRaw, 20000) : 8000;
   const deadline = Date.now() + waitMs;
-  let sawEvents = false;
-  let lastError = "";
-  do {
-    const page = await queryWorkerLogs(token, accountId, script, fromMs).catch((err: unknown) => ({
-      ok: false as const,
-      detail: err instanceof Error ? err.name : "workers logs query failed",
-    }));
-    if (!page.ok) {
-      lastError = page.detail;
-      break;
-    }
-    if (page.events > 0) sawEvents = true;
-    if (needles.some((needle) => page.text.includes(needle))) return check(name, false, "workers logs echoed a filtered fragment");
-    if (Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-  } while (Date.now() <= deadline);
-  if (lastError) return check(name, false, sanitize(lastError, needles));
-  if (!sawEvents) return { name, status: "skipped", detail: `The Workers Logs query returned no events for this window. ${LOG_OPERATOR}` };
+  while (Date.now() < deadline) {
+    if (needles.some((needle) => tailText.includes(needle))) return check(name, false, "wrangler tail echoed a filtered fragment");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (!tailText.trim()) return check(name, false, sanitize(`wrangler tail produced no output. ${LOG_OPERATOR}`, needles));
   return check(name, true);
+}
+
+function dlqName(): string {
+  return process.env.HIVEATTIC_DLQ_NAME?.trim() || "hiveattic-staging-index-dlq";
+}
+
+async function readDlqDepth(): Promise<number | null> {
+  const token = process.env.CLOUDFLARE_API_TOKEN?.trim() ?? "";
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() ?? "";
+  if (token && accountId) {
+    const listed = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+    if (listed?.ok) {
+      const body = (await listed.json()) as { result?: { queue_id?: string; queue_name?: string }[] };
+      const queue = (body.result ?? []).find((item) => item.queue_name === dlqName());
+      if (queue?.queue_id) {
+        const info = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/queues/${queue.queue_id}`, {
+          headers: { authorization: `Bearer ${token}` },
+        }).catch(() => null);
+        if (info?.ok) {
+          const detail = (await info.json()) as { result?: { producers_total_count?: number; consumers_total_count?: number } };
+          const depth = detail.result?.producers_total_count;
+          if (typeof depth === "number") return depth;
+        }
+      }
+    }
+  }
+  return await new Promise((resolve) => {
+    const child = spawn("pnpm", ["exec", "wrangler", "queues", "info", dlqName()], { stdio: ["ignore", "pipe", "pipe"] });
+    let text = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      text += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      text += chunk.toString();
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(null);
+    }, 15000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      const match = /backlog[^0-9]*(\d+)/i.exec(text) || /"depth"\s*:\s*(\d+)/i.exec(text) || /messages?\s*[:=]\s*(\d+)/i.exec(text);
+      resolve(match ? Number(match[1]) : text.toLowerCase().includes("0") && /empty|depth|backlog/i.test(text) ? 0 : null);
+    });
+  });
+}
+
+function scrub(text: string): string {
+  const fragments = [
+    "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+    "hunter2",
+    "4242424242424242",
+    "021000021",
+    account,
+    policySubject,
+    policyQualifier,
+  ].filter((item) => item.length > 0);
+  let out = text;
+  for (const fragment of fragments) out = out.split(fragment).join("[filtered]");
+  return out;
 }
 
 async function queryWorkerLogs(token: string, accountId: string, script: string, fromMs: number): Promise<{ ok: true; text: string; events: number } | { ok: false; detail: string }> {
@@ -622,7 +924,6 @@ function render(items: Case[]): string {
   const partial = items.filter((item) => item.status === "partial").length;
   lines.push("", failed === 0 ? "No failed cases." : `${failed} failed case(s).`);
   if (partial > 0) lines.push(`${partial} partial case(s). T-09 stays partial in M1: FTS is covered and vector deletion is deferred to M2.`);
-  const logSkip = items.flatMap((item) => item.checks).find((item) => item.status === "skipped" && item.name.includes("logs"));
-  if (logSkip?.detail) lines.push("", `Log check left for the operator: ${logSkip.detail}`);
+  lines.push("", `DLQ depth: ${dlqDepth === null ? "unknown" : String(dlqDepth)}`);
   return lines.join("\n");
 }

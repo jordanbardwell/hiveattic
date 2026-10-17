@@ -190,7 +190,18 @@ export async function whoami(env: Env, access: Access): Promise<Record<string, u
     scopes: access.scopes,
     admin: access.admin,
     agents_md_sha256: await sha256Hex(bytes),
+    deploy_env: env.DEPLOY_ENV === "staging" ? "staging" : "production",
+    staging_resources: stagingResources(env),
   };
+}
+
+export function stagingResources(env: Env): boolean {
+  const bucket = env.VAULT_BUCKET ?? "";
+  const db = env.DB_NAME ?? "";
+  const worker = env.WORKER_NAME ?? "";
+  // Names from wrangler.staging.example.jsonc put `-staging` in the middle
+  // (`hiveattic-staging-vault`) or at the end (`hiveattic-vault-staging`).
+  return env.DEPLOY_ENV === "staging" && bucket.includes("-staging") && db.includes("-staging") && worker.includes("staging");
 }
 
 function likePrefix(prefix: string): string {
@@ -217,6 +228,22 @@ function extraFilters(options: SearchOptions): { sql: string; binds: string[] } 
   return { sql: parts.length ? `AND ${parts.join(" AND ")}` : "", binds };
 }
 
+function domainTagSql(access: Access): { sql: string; binds: string[] } {
+  if (hasScope(access, "read:domain/*") || hasScope(access, "read:sensitive/*")) return { sql: "1 = 1", binds: [] };
+  const names = new Set<string>();
+  for (const scope of access.scopes) {
+    const domain = /^read:domain\/([a-z0-9-]+)$/.exec(scope);
+    if (domain) names.add(domain[1]!);
+    const sens = /^read:sensitive\/([a-z0-9-]+)$/.exec(scope);
+    if (sens && sens[1] !== "pii") names.add(sens[1]!);
+  }
+  if (names.size === 0) return { sql: "(n.domain IS NULL OR n.path LIKE 'domains/%')", binds: [] };
+  return {
+    sql: `(n.domain IS NULL OR n.path LIKE 'domains/%' OR n.domain IN (${[...names].map(() => "?").join(", ")}))`,
+    binds: [...names],
+  };
+}
+
 function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (access.admin || hasScope(access, "read:all")) return { sql: "1 = 1", binds: [] };
   const parts: { sql: string; binds: string[] }[] = [{ sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] }];
@@ -240,7 +267,7 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (hasScope(access, "read:decisions")) visible.push({ sql: "n.path = 'shared/decisions.md'", binds: [] });
   for (const scope of access.scopes) {
     const domain = /^read:domain\/([a-z0-9-]+)$/.exec(scope);
-    if (domain) visible.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [domain[1]!, `domains/${domain[1]}/`] });
+    if (domain) visible.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [domain[1]!, `domains/${domain[1]}/%`] });
     if (scope === "read:domain/*") visible.push({ sql: "(n.domain IS NOT NULL OR n.path LIKE 'domains/%')", binds: [] });
     const bot = /^read:bots\/([a-z0-9-]+)$/.exec(scope);
     if (bot) visible.push({ sql: "n.path LIKE ?", binds: [`bots/${bot[1]}/%`] });
@@ -249,15 +276,16 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
     if (prefix) visible.push({ sql: "n.path LIKE ?", binds: [likePrefix(prefix)] });
   }
   if (visible.length) {
+    const tag = domainTagSql(access);
     const notSensitive = "(n.sensitivity != 'sensitive' AND IFNULL(n.domain, '') NOT IN ('health', 'finance') AND n.path NOT LIKE 'domains/health/%' AND n.path NOT LIKE 'domains/finance/%')";
     parts.push({
-      sql: `(${notSensitive} AND (${visible.map((item) => item.sql).join(" OR ")}))`,
-      binds: visible.flatMap((item) => item.binds),
+      sql: `(${notSensitive} AND (${tag.sql}) AND (${visible.map((item) => item.sql).join(" OR ")}))`,
+      binds: [...tag.binds, ...visible.flatMap((item) => item.binds)],
     });
   }
   for (const scope of access.scopes) {
     const sens = /^read:sensitive\/([a-z0-9-]+)$/.exec(scope);
-    if (sens && sens[1] !== "pii") parts.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/`] });
+    if (sens && sens[1] !== "pii") parts.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/%`] });
     if (scope === "read:sensitive/*") parts.push({ sql: "(n.sensitivity = 'sensitive' OR n.domain IN ('health', 'finance') OR n.path LIKE 'domains/%')", binds: [] });
   }
   if (hasScope(access, "read:sensitive/pii")) {

@@ -21,7 +21,7 @@ export const factSchema = z.object({
 
 export const journalSchema = z.object({
   target: z.enum(["own", "shared", "decisions"]).default("own"),
-  title: z.string().min(1).max(120).refine((value) => !/[\r\n]/.test(value)),
+  title: z.string().min(1).max(120).refine((value) => !/[\r\n·^]/.test(value)),
   body: z.string().min(1).max(8000),
   at: instant.optional(),
   domain: slug.nullable().optional(),
@@ -35,7 +35,7 @@ export const noteSchema = z.object({
   extra: z.record(z.string(), z.unknown()).optional(),
   sensitivity: z.enum(["normal", "sensitive"]).optional(),
   domain: slug.nullable().optional(),
-  type: z.string().regex(/^[a-z0-9-]{1,40}$/).default("note"),
+  type: z.enum(["note", "role", "profile"]).default("note"),
   if_match: z.string().min(1).max(200).nullable().optional(),
 });
 

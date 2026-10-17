@@ -23,6 +23,7 @@ export default defineConfig({
           TOKEN_PEPPER: "hiveattic-test-pepper",
           ADMIN_TOKEN_HASH: "b9f983206b87828b3ebcd8b28e4e6e99c8e0c4c0c336c19f0a837f4c02672b08",
           AUDIT_KEY: "hiveattic-test-audit-key",
+          JOURNAL_MAC_KEY: "hiveattic-test-journal-mac",
           RATE_LIMIT_WRITES_PER_MIN: "0",
           RATE_LIMIT_READS_PER_MIN: "0",
           ACCOUNT_FIXTURE: accountFixture(),

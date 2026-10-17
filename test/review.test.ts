@@ -84,6 +84,15 @@ describe("architect review regressions", () => {
     expect(scanFinancial("Opened the brokerage account on 2026-10-17")).toEqual([]);
     expect(scanFinancial("My brokerage balance is 125000 dollars")).toEqual([]);
     expect(scanSecrets("key 7ZQ4K9M2X8P5R3T6V1W0Y8N4HJ")).toEqual([]);
+    expect(scanSecrets("aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").length).toBeGreaterThan(0);
+    expect(scanSecrets("use Zq8xP2mL9vR4tY7wK1n/B5cJ3hF6dS0aGq8xP2 now")).toContain("secret_entropy");
+    expect(scanSecrets("see src/components/settings/NotificationPreferences.tsx")).toEqual([]);
+    expect(scanFinancial("call 2065550142 2065550143 2065550144")).toEqual([]);
+    expect(scanFinancial("order number 20261017004512345678")).toEqual([]);
+    expect(scanFinancial("UPS tracking 1Z999AA10123456784 and USPS 9400111899223197428490")).toEqual([]);
+    expect(scanFinancial("brokerage account 5839201746 holds 500 dollars")).toContain("financial_account");
+    expect(scanFinancial("account 5839201746 (USD)")).toEqual([]);
+    expect(scanFinancial("account 5839.201.746")).toContain("financial_account");
     const policy = [
       { term: "Contoso Example Corp", kind: "context_subject" },
       { term: "deal", kind: "context_qualifier" },
@@ -110,7 +119,7 @@ describe("architect review regressions", () => {
 
   it("P9 forgotten history bodies stay admin-only", async () => {
     await resetVault();
-    const path = `bots/rev-reader/secret-history-${nid()}.md`;
+    const path = `bots/rev-reader/prior-${nid()}.md`;
     const marker = `qxbody${nid()}`;
     const written = await rest("/v1/notes", readerX, { method: "PUT", body: JSON.stringify({ path, body: marker, type: "note" }) });
     const id = String(written.json.data?.id);
@@ -119,7 +128,7 @@ describe("architect review regressions", () => {
     const admin = await rest(`/v1/history?id=${id}`, ADMIN);
     const ownerBodies = JSON.stringify(owner.json.data ?? {});
     expect(ownerBodies.includes(marker)).toBe(false);
-    expect(JSON.stringify(admin.json.data ?? {}).includes(marker)).toBe(true);
+    expect(JSON.stringify(admin.json)).toContain(marker);
   });
 
   it("P10 a spoofed writer tag does not skip a secret edit", async () => {
@@ -294,13 +303,23 @@ describe("architect review regressions", () => {
     await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path: namespaced, body: "temp", type: "note" }) });
     await rest("/v1/notes", sharedWriter, { method: "PUT", body: JSON.stringify({ path: kept, body: "stay", type: "note" }) });
     testEnv().E2E_CLEANUP_ENABLED = "true";
+    const flagOnly = await rest("/v1/admin/cleanup", ADMIN, { method: "POST", body: JSON.stringify({ run_id: runId }) });
+    expect(flagOnly.status).toBe(404);
+    testEnv().DEPLOY_ENV = "staging";
+    testEnv().VAULT_BUCKET = "hiveattic-staging-vault";
+    testEnv().DB_NAME = "hiveattic-staging-index";
+    testEnv().WORKER_NAME = "hiveattic-staging";
     try {
       const cleaned = await rest("/v1/admin/cleanup", ADMIN, { method: "POST", body: JSON.stringify({ run_id: runId }) });
-      expect(cleaned.status).toBe(200);
+      expect(cleaned.status, cleaned.text).toBe(200);
       expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(namespaced).first()).toBeNull();
       expect(await testEnv().DB.prepare("SELECT id FROM notes WHERE path = ?").bind(kept).first()).toBeTruthy();
     } finally {
       testEnv().E2E_CLEANUP_ENABLED = "";
+      testEnv().DEPLOY_ENV = "";
+      testEnv().VAULT_BUCKET = "hiveattic-vault";
+      testEnv().DB_NAME = "hiveattic-index";
+      testEnv().WORKER_NAME = "hiveattic";
     }
   });
 });

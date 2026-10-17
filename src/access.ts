@@ -110,7 +110,8 @@ export function canWrite(access: Access, path: string, sensitivity: "normal" | "
   const pathDomain = domainOf(path) ?? domain;
   const ownFolder = path.startsWith(`bots/${access.agentId}/`);
   const sensitive = sensitivity === "sensitive" || (pathDomain !== null && SENSITIVE_DOMAINS.has(pathDomain));
-  if (sensitive && !ownFolder) {
+  const ownPiiJournal = ownFolder && !pathDomain && path.includes("/journal-sensitive/");
+  if (sensitive && !ownPiiJournal) {
     if (pathDomain) {
       if (!hasScope(access, `write:sensitive/${pathDomain}`)) return false;
     } else if (!hasScope(access, "write:sensitive/pii")) return false;

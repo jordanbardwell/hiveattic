@@ -230,6 +230,7 @@ describe("HiveAttic acceptance", () => {
       method: "POST",
       body: JSON.stringify({ key, statement: older, observed_at: "2020-01-01T00:00:00Z", scope: "own" }),
     });
+    expect(first.status, first.text).toBe(200);
     expect(first.json.data?.outcome).toBe("created");
     const second = await mcp(readerX, "vault_write_fact", { key, statement: newer, observed_at: "2024-01-01T00:00:00Z", scope: "own" });
     expect(second.json.data?.outcome).toBe("updated");

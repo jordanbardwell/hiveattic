@@ -11,6 +11,7 @@ const SECRET_RULES: { reason: string; pattern: RegExp }[] = [
   { reason: "secret_pem", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { reason: "secret_openai", pattern: /\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}\b/ },
   { reason: "secret_aws", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
+  { reason: "secret_aws_secret", pattern: /aws[\w\s:=-]{0,40}[A-Za-z0-9/+]{40}/i },
   { reason: "secret_github", pattern: /\b(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{16,}\b/ },
   { reason: "secret_slack", pattern: /\bxox[abpr]-[A-Za-z0-9-]{10,}\b/ },
   { reason: "secret_google", pattern: /\bAIza[0-9A-Za-z_\-]{20,}\b/ },
@@ -32,7 +33,11 @@ export function scanSecrets(input: string): string[] {
   for (const match of text.matchAll(/[A-Za-z0-9+/_=-]{24,}/g)) {
     const token = match[0];
     if (/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(token)) continue;
-    if (token.includes("/") && !/[+=]/.test(token) && token.split("/").every((part) => /^[A-Za-z0-9_.-]*$/.test(part))) continue;
+    const index = match.index ?? 0;
+    const around = text.slice(Math.max(0, index - 40), index + token.length + 40);
+    const nearSecretWord = /\b(?:secret|key|token|password|credential)\b|aws_/i.test(around);
+    const span = pathSpan(text, index, token.length);
+    if (!nearSecretWord && (isPathLike(token) || (span !== null && isPathLike(span)))) continue;
     if (shannon(token) > 4) reasons.push("secret_entropy");
   }
   return unique(reasons);
@@ -105,16 +110,30 @@ export function rejectIfNeeded(input: string, terms: PolicyTerm[]): void {
 }
 
 function findCard(text: string): boolean {
-  const runs = text.match(/(?:\d[ .\-]?){13,}/g) ?? [];
-  for (const run of runs) {
-    const digits = run.replace(/\D/g, "");
-    const max = Math.min(19, digits.length);
-    for (let length = 13; length <= max; length++) {
-      for (let index = 0; index + length <= digits.length; index++) {
-        if (luhn(digits.slice(index, index + length))) return true;
-      }
-    }
+  for (const match of text.matchAll(/(?<!\d)(\d{13,19})(?!\d)/g)) {
+    if (cardNumber(match[1]!)) return true;
   }
+  const grouped = /(?<!\d)(\d{4})([ .\-])(\d{4})\2(\d{4})\2(\d{4})(?:\2(?:19|20)\d{2})?(?!\d)/g;
+  for (const match of text.matchAll(grouped)) {
+    if (cardNumber(`${match[1]}${match[3]}${match[4]}${match[5]}`)) return true;
+  }
+  const amex = /(?<!\d)(\d{4})([ .\-])(\d{6})\2(\d{5})(?!\d)/g;
+  for (const match of text.matchAll(amex)) {
+    if (cardNumber(`${match[1]}${match[3]}${match[4]}`)) return true;
+  }
+  return false;
+}
+
+function cardNumber(digits: string): boolean {
+  if (!/^\d{13,19}$/.test(digits) || !cardPrefix(digits)) return false;
+  return luhn(digits);
+}
+
+function cardPrefix(digits: string): boolean {
+  if (/^3[47]/.test(digits)) return digits.length === 15;
+  if (digits.startsWith("4")) return digits.length === 13 || digits.length === 16 || digits.length === 19;
+  if (/^5[1-5]/.test(digits) || /^2[2-7]/.test(digits)) return digits.length === 16;
+  if (digits.startsWith("6")) return digits.length === 16;
   return false;
 }
 
@@ -136,13 +155,13 @@ function findAccount(text: string): boolean {
     const start = Math.max(0, (match.index ?? 0) - 40);
     const end = Math.min(text.length, (match.index ?? 0) + match[0].length + 48);
     const window = text.slice(start, end);
-    if (/\b(?:dollars?|usd|eur|gbp|cents?)\b/i.test(window)) continue;
     const explicit = /(?:#|\bno\.?\b)/i.test(window);
-    const runs = window.match(/\d[\d \-]{4,22}\d/g) ?? [];
+    const runs = window.match(/\d[\d .\-]{2,30}\d/g) ?? [];
     for (const run of runs) {
-      if (/\d{4}-\d{2}-\d{2}/.test(window) && run.replace(/\D/g, "").length <= 8) continue;
-      if (/[.,]/.test(run)) continue;
-      const digits = run.replace(/\D/g, "");
+      if (currencyAdjacent(window, run)) continue;
+      const digits = accountDigits(run);
+      if (!digits) continue;
+      if (/\d{4}-\d{2}-\d{2}/.test(run) && digits.length <= 8) continue;
       const min = explicit ? 6 : 8;
       if (digits.length >= min && digits.length <= 17) return true;
     }
@@ -216,6 +235,63 @@ function termMatches(text: string, term: string): boolean {
   if (!needle) return false;
   if (/[^a-z0-9\s]/i.test(needle) || needle.includes(" ")) return text.toLowerCase().includes(needle);
   return new RegExp(`\\b${escapeRegExp(needle)}\\b`, "i").test(text);
+}
+
+function accountDigits(run: string): string | null {
+  const compact = run.replace(/\s/g, "");
+  if (/^\d+(?:\.\d+){2,}$/.test(compact)) return compact.replaceAll(".", "");
+  if (run.includes(".")) return null;
+  return run.replace(/\D/g, "");
+}
+
+function currencyAdjacent(window: string, run: string): boolean {
+  const currency = String.raw`(?:\$|\b(?:dollars?|usd|eur|gbp|cents?)\b)`;
+  let from = 0;
+  while (from < window.length) {
+    const at = window.indexOf(run, from);
+    if (at < 0) return false;
+    const before = window.slice(Math.max(0, at - 16), at);
+    const after = window.slice(at + run.length, at + run.length + 16);
+    if (new RegExp(`${currency}\\s*$`, "i").test(before)) return true;
+    if (new RegExp(`^\\s*[([/]*${currency}`, "i").test(after)) return true;
+    from = at + Math.max(1, run.length);
+  }
+  return false;
+}
+
+function pathSpan(text: string, index: number, length: number): string | null {
+  const segment = /[A-Za-z0-9_.-]/;
+  let start = index;
+  while (start > 0 && segment.test(text[start - 1] ?? "")) start -= 1;
+  while (start > 0 && text[start - 1] === "/") {
+    let seg = start - 1;
+    while (seg > 0 && segment.test(text[seg - 1] ?? "")) seg -= 1;
+    if (seg === start - 1) break;
+    start = seg;
+  }
+  let end = index + length;
+  while (end < text.length && segment.test(text[end] ?? "")) end += 1;
+  while (end < text.length && text[end] === "/") {
+    let seg = end + 1;
+    while (seg < text.length && segment.test(text[seg] ?? "")) seg += 1;
+    if (seg === end + 1) break;
+    end = seg;
+  }
+  const span = text.slice(start, end);
+  return span.includes("/") ? span : null;
+}
+
+function isPathLike(token: string): boolean {
+  if (!token.includes("/") || /[+=]/.test(token)) return false;
+  const parts = token.split("/");
+  if (parts.length < 2 || parts.some((part) => part.length === 0 || part.length >= 80)) return false;
+  return parts.every((part) => {
+    if (!/^[A-Za-z0-9_.-]+$/.test(part)) return false;
+    if (/\.[A-Za-z0-9]{1,8}$/.test(part)) return true;
+    if (part.length >= 20) return false;
+    if (part.length >= 8 && shannon(part) > 4) return false;
+    return true;
+  });
 }
 
 function shannon(value: string): number {

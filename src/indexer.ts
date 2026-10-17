@@ -9,7 +9,7 @@ type IndexMessage = {
   chunk_ids?: string[];
   action?: string;
   eventTime?: string;
-  copySource?: string;
+  copySource?: { bucket?: string; object?: string } | string;
   object?: { key?: string; eTag?: string; size?: number };
 };
 
@@ -42,11 +42,23 @@ async function handleMessage(body: unknown, env: Env): Promise<void> {
       action: message.action,
       eventTime: message.eventTime ?? null,
       eTag: message.object.eTag ?? null,
-      copySource: message.copySource ?? null,
+      copySource: normalizeCopySource(message.copySource),
     };
     const result = await stub.perform(op);
     if (!result.ok) throw new Error(result.error.code);
   }
+}
+
+function normalizeCopySource(value: IndexMessage["copySource"]): { bucket?: string; object?: string } | string | null {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    return {
+      bucket: typeof value.bucket === "string" ? value.bucket : undefined,
+      object: typeof value.object === "string" ? value.object : undefined,
+    };
+  }
+  return null;
 }
 
 function normalize(body: unknown): IndexMessage | null {

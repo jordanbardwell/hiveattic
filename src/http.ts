@@ -103,7 +103,13 @@ async function route(request: Request, env: Env, url: URL, session: Session): Pr
   if (request.method === "DELETE" && pathname === "/v1/admin/purge") return purgeNote(env, session, parseInput(purgeSchema, await readJson(request)));
   if (request.method === "POST" && pathname === "/v1/admin/cleanup") return cleanupRun(env, session, parseInput(cleanupSchema, await readJson(request)).run_id);
   if (request.method === "GET" && pathname === "/v1/admin/audit") {
-    return listAudit(env, session, Number(url.searchParams.get("limit") ?? "50"), url.searchParams.get("request_id") ?? undefined);
+    return listAudit(
+      env,
+      session,
+      Number(url.searchParams.get("limit") ?? "50"),
+      url.searchParams.get("request_id") ?? undefined,
+      url.searchParams.get("path") ?? undefined,
+    );
   }
   if (request.method === "POST" && pathname === "/v1/admin/audit/verify-append-only") return verifyAuditAppendOnly(env, session);
   if (request.method === "GET" && pathname === "/v1/admin/quarantine") return listQuarantine(env, session);

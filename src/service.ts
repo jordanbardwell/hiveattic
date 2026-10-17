@@ -6,8 +6,9 @@ import { VaultError, type ApiResult, type ErrorCode, type JsonValue } from "./er
 import { classifySensitive, inspectWrite, type PolicyTerm } from "./filters";
 import { logEvent } from "./log";
 import { assertVaultPath } from "./access";
-import { factPath } from "./paths";
-import { listNotes, noteHistory, readNote, searchVault, whoami } from "./query";
+import { factPath, journalPath } from "./paths";
+import { listNotes, noteHistory, readNote, searchVault, stagingResources, whoami } from "./query";
+import { etStamp } from "./time";
 import type { Actor, WriterOp } from "./writer-do";
 
 export type Session = {
@@ -115,6 +116,9 @@ export async function appendJournal(
   }
   const needed = input.target === "decisions" ? "write:decisions" : input.target === "shared" ? "write:shared" : "write:own";
   if (!hasScope(session.access, needed)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
+  const journalDate = etStamp(input.at ?? new Date().toISOString(), env.TZ_DISPLAY || "UTC").date;
+  const journalFile = journalPath(session.access.agentId, input.target, journalDate, sensitivity === "sensitive" && input.target === "own");
+  assertCanWrite(session.access, journalFile, sensitivity, domain);
   await rejectFiltered(env, session, input.target === "own" ? `bots/${session.access.agentId}/journal/own.md` : "journal/shared.md", text, "append_journal");
   return perform(env, {
     kind: "journal",
@@ -323,33 +327,36 @@ export async function purgeNote(env: Env, session: Session, input: { path?: stri
   });
 }
 
+export function cleanupEnabled(env: Env): boolean {
+  return env.E2E_CLEANUP_ENABLED === "true" && stagingResources(env);
+}
+
 export async function cleanupRun(env: Env, session: Session, runId: string): Promise<Record<string, unknown>> {
-  if (env.E2E_CLEANUP_ENABLED !== "true") throw new VaultError("not_found", "Route not found");
   assertAdmin(session.access);
+  if (!cleanupEnabled(env)) {
+    if (env.E2E_CLEANUP_ENABLED === "true") await audit(env, session, "cleanup_refused", null, null, "rejected", ["not_staging"], null, 0);
+    throw new VaultError("not_found", "Route not found");
+  }
   return perform(env, { kind: "cleanup", actor: actor(session), runId });
 }
 
-export async function listAudit(env: Env, session: Session, limit: number, requestId?: string): Promise<Record<string, unknown>> {
+export async function listAudit(env: Env, session: Session, limit: number, requestId?: string, path?: string): Promise<Record<string, unknown>> {
   if (!session.access.admin && !session.access.scopes.includes("audit:read")) {
     throw new VaultError("forbidden_scope", "Scope does not allow audit reads");
   }
   const cap = Math.min(Math.max(limit, 1), 200);
+  const columns = `seq, ts, request_id, agent_id, token_id, client, action, path, note_id, outcome, reason_codes, content_hash, bytes, ip_country, detail`;
   if (requestId) {
     if (requestId.length > 80) throw new VaultError("invalid", "request_id is too long");
-    const rows = await env.DB.prepare(
-      `SELECT seq, ts, request_id, agent_id, token_id, client, action, path, note_id, outcome, reason_codes, content_hash, bytes, ip_country
-       FROM audit_log WHERE request_id = ? ORDER BY seq DESC LIMIT ?`,
-    )
-      .bind(requestId, cap)
-      .all();
+    const rows = await env.DB.prepare(`SELECT ${columns} FROM audit_log WHERE request_id = ? ORDER BY seq DESC LIMIT ?`).bind(requestId, cap).all();
     return { entries: rows.results ?? [] };
   }
-  const rows = await env.DB.prepare(
-    `SELECT seq, ts, request_id, agent_id, token_id, client, action, path, note_id, outcome, reason_codes, content_hash, bytes, ip_country
-     FROM audit_log ORDER BY seq DESC LIMIT ?`,
-  )
-    .bind(cap)
-    .all();
+  if (path) {
+    if (path.length > 200) throw new VaultError("invalid", "path is too long");
+    const rows = await env.DB.prepare(`SELECT ${columns} FROM audit_log WHERE path = ? ORDER BY seq DESC LIMIT ?`).bind(path, cap).all();
+    return { entries: rows.results ?? [] };
+  }
+  const rows = await env.DB.prepare(`SELECT ${columns} FROM audit_log ORDER BY seq DESC LIMIT ?`).bind(cap).all();
   return { entries: rows.results ?? [] };
 }
 
