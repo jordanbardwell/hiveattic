@@ -155,11 +155,14 @@ describe("pr2 review regressions", () => {
     expect(reconciled.job.data?.status).toBe("done");
     const row = await testEnv().DB.prepare("SELECT status, body FROM notes WHERE path = ?").bind(path).first<{ status: string; body: string }>();
     expect(row?.status).toBe("forgotten");
-    // M1: a reader gets a stub, not the body the object had.
+    // M1: the row keeps a stub, not the body the object had. Non-admin readers get 404; the admin gets the stub.
     expect(row?.body).not.toContain(marker);
     const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, shared);
-    expect(read.json.data?.status).toBe("forgotten");
+    expect(read.status).toBe(404);
     expect(read.text).not.toContain(marker);
+    const admin = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, ADMIN);
+    expect(admin.json.data?.status).toBe("forgotten");
+    expect(admin.text).not.toContain(marker);
     expect(results((await rest(`/v1/search?q=${marker}`, shared)).json)).toEqual([]);
   });
 

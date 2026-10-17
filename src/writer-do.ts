@@ -510,7 +510,13 @@ export class VaultWriter extends DurableObject<Env> {
     // A neutral active fact that receives sensitive text moves: the shared path is tombstoned and the
     // fact continues under a new id in the sensitive folder.
     const moving = Boolean(route && active && !activeSegment);
-    const existing = moving ? await this.noteByPath(path) : active;
+    let existing = moving ? await this.noteByPath(path) : active;
+    // A forgotten fact's key and path can be used again: the new fact gets a new id (F24).
+    if (moving && existing?.status === "forgotten") existing = await this.releaseForgotten(existing);
+    if (!active) {
+      const parked = await this.noteByPath(path);
+      if (parked?.status === "forgotten") await this.releaseForgotten(parked);
+    }
     if (moving && existing && existing.status !== "active" && existing.status !== "superseded") {
       throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
     }
@@ -675,7 +681,9 @@ export class VaultWriter extends DurableObject<Env> {
     let attempt = 0;
     while (attempt < 3) {
       attempt += 1;
-      const current = await this.noteByPath(path);
+      let current = await this.noteByPath(path);
+      // A day file the admin forgot starts over as a new file under a new id.
+      if (current?.status === "forgotten") current = await this.releaseForgotten(current);
       if (current && current.status !== "active") {
         throw new VaultError("conflict_etag", `Cannot append to a ${current.status} note`, [current.status]);
       }
@@ -749,8 +757,12 @@ export class VaultWriter extends DurableObject<Env> {
     const route = op.reroute;
     const path = route ? reroutedPath(route, op.path) : op.path;
     await this.assertNotOversize(path);
-    const original = route ? await this.noteByPath(op.path) : null;
-    const existing = await this.noteByPath(path);
+    // A forgotten note's path can be written again under a new id (F24). A forgotten note at the
+    // requested path of a rerouted write is not moved: it is already gone.
+    let original = route ? await this.noteByPath(op.path) : null;
+    if (original?.status === "forgotten") original = null;
+    let existing = await this.noteByPath(path);
+    if (existing?.status === "forgotten") existing = await this.releaseForgotten(existing);
     if (original && original.status !== "active") {
       throw new VaultError("conflict_etag", `Cannot write to a ${original.status} note`, [original.status]);
     }
@@ -882,6 +894,7 @@ export class VaultWriter extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
     await this.audit(op.actor, "forget", note.path, note.id, "ok", [], await this.auditHash(stub), utf8Length(stub));
     await this.enqueue({ kind: "forget", note_id: note.id, chunk_ids: chunkIds });
+    await this.refreshSummaryAfter(note, op.actor);
     return { ok: true, data };
   }
 
@@ -1007,6 +1020,7 @@ export class VaultWriter extends DurableObject<Env> {
       ...this.vectorDeletes(chunkIds, note.id, now),
     ]);
     await this.audit(actor, "external_delete", path, note.id, "ok", [], await this.auditHash(note.body), 0, detail);
+    await this.refreshSummaryAfter(note, actor);
     return { ok: true, data: { id: note.id, path, status: "forgotten" } };
   }
 
@@ -1112,6 +1126,7 @@ export class VaultWriter extends DurableObject<Env> {
     ]);
     await this.audit(actor, "reroute_tombstone", note.path, note.id, "ok", [], await this.auditHash(stub), utf8Length(stub));
     await this.enqueue({ kind: "forget", note_id: note.id, chunk_ids: chunkIds });
+    await this.refreshSummaryAfter(note, actor);
   }
 
   private async cleanup(op: Extract<WriterOp, { kind: "cleanup" }>): Promise<ApiResult> {
@@ -1477,7 +1492,15 @@ export class VaultWriter extends DurableObject<Env> {
     return saved;
   }
 
-  // profile/summary.md lists active shared facts that are normal and carry no domain tag.
+  // A note that left the index (forgotten, moved, deleted outside) may have been a fact the
+  // summary quoted. The summary is regenerated so the statement is gone from it.
+  private async refreshSummaryAfter(note: { type: string; owner: string; path: string }, actor: Actor): Promise<void> {
+    if (feedsSummary(note)) await this.refreshSummary(actor);
+  }
+
+  // profile/summary.md lists active shared facts that are normal and carry no domain tag, so a
+  // read:shared caller sees nothing a scope would hide: no forgotten, purged, moved, sensitive, or
+  // domain-tagged fact.
   private async refreshSummary(actor: Actor): Promise<void> {
     const rows = await this.env.DB.prepare(
       `SELECT fact_key, body FROM notes WHERE owner = 'shared' AND type = 'fact' AND status = 'active' AND sensitivity = 'normal'
@@ -1615,6 +1638,20 @@ export class VaultWriter extends DurableObject<Env> {
     }
   }
 
+  // Frees a forgotten note's path for a new note. The forgotten row keeps its id, tombstone, and
+  // admin-only history under a parked path that no request can name, and its stub object makes way
+  // for the new note. An object someone put there since is left alone, so the create answers 409.
+  private async releaseForgotten(row: NoteRow): Promise<null> {
+    const parked = `.forgotten/${row.id}.md`;
+    await this.env.DB.prepare("UPDATE notes SET path = ?, r2_key = ?, fact_key = NULL WHERE id = ? AND status = 'forgotten'")
+      .bind(parked, r2KeyFor(this.prefix(), parked), row.id)
+      .run();
+    const key = r2KeyFor(this.prefix(), row.path);
+    const head = await this.env.VAULT.head(key);
+    if (head && (!row.r2_etag || normalizeEtag(head.etag) === normalizeEtag(row.r2_etag))) await this.env.VAULT.delete(key);
+    return null;
+  }
+
   // Indexes what R2 holds at a path now, so the next attempt of a write works from the stored file.
   private async refreshFromR2(path: string, actor: Actor): Promise<void> {
     const object = await this.env.VAULT.get(r2KeyFor(this.prefix(), path));
@@ -1667,6 +1704,17 @@ export class VaultWriter extends DurableObject<Env> {
       ...this.vectorDeletes(chunkIds, note.id, now),
       this.env.DB.prepare("DELETE FROM notes WHERE id = ?").bind(note.id),
     ]);
+    if (feedsSummary(note)) {
+      // The summary is regenerated without the erased statement. Its earlier versions quoted it, and
+      // the summary is derived, so their snapshots go too.
+      await this.refreshSummary(actor);
+      const summary = await this.noteByPath("profile/summary.md");
+      if (summary) {
+        const keys = await this.historyKeys(summary.id);
+        if (keys.length) await this.env.VAULT.delete(keys);
+        await this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key LIKE 'sys/history/%'").bind(summary.id).run();
+      }
+    }
   }
 
   private async historyKeys(id: string): Promise<string[]> {
@@ -2690,6 +2738,11 @@ function keepClass(access: Access, existing: NoteRow, next: string | null): { do
 function createdAtOf(note: { frontmatter: string; created_at: string }): string {
   const fm = parseFrontmatter(note.frontmatter);
   return stringField(fm.vault_created_at) ?? stringField(fm.created_at) ?? note.created_at;
+}
+
+// Facts that can appear in profile/summary.md, or did before they changed.
+function feedsSummary(note: { type: string; owner: string; path: string }): boolean {
+  return note.type === "fact" && note.owner === "shared" && note.path.startsWith("profile/facts/");
 }
 
 function fileTooLarge(): VaultError {

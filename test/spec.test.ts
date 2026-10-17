@@ -303,10 +303,14 @@ describe("HiveAttic acceptance", () => {
     expect(results(found.json).some((row) => row.path === path)).toBe(true);
     const forgotten = await mcp(readerX, "vault_forget", { path, reason: "no longer needed" });
     expect(forgotten.json.ok).toBe(true);
+    // A forgotten note is 404 for its owner and every other non-admin. The admin reads the stub.
     const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, readerX);
-    expect(read.json.data?.status).toBe("forgotten");
-    expect(String(read.json.data?.markdown)).toContain("Forgotten");
-    expect(String(read.json.data?.markdown)).not.toContain(marker);
+    expect(read.status).toBe(404);
+    expect(read.text).not.toContain(marker);
+    const stub = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, ADMIN);
+    expect(stub.json.data?.status).toBe("forgotten");
+    expect(String(stub.json.data?.markdown)).toContain("Forgotten");
+    expect(String(stub.json.data?.markdown)).not.toContain(marker);
     const search = await rest(`/v1/search?q=${marker}`, readerX);
     expect(results(search.json)).toEqual([]);
     const history = await rest(`/v1/history?id=${id}`, ADMIN);

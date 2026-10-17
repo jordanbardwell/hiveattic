@@ -95,11 +95,12 @@ export async function searchVault(env: Env, access: Access, query: string, mode:
 const NOTE_SELECT = `SELECT id, path, owner, domain, sensitivity, frontmatter, body, status, r2_etag, type, title,
   (SELECT moved_to FROM tombstones t WHERE t.note_id = notes.id) AS moved_to FROM notes`;
 
-// A note that moved to a sensitive folder reads as missing for everyone but the admin token, so the
-// old path gives no stub and no pointer to the new one.
+// Only active notes are served to non-admin callers. A forgotten, moved, or superseded note reads as
+// missing for everyone but the admin token, so the old path gives no stub and no pointer to where
+// a moved note went.
 function readable(access: Access, note: NoteRecord | null): note is NoteRecord {
   if (!note) return false;
-  if (note.moved_to && !access.admin) return false;
+  if (!access.admin && (note.status !== "active" || note.moved_to)) return false;
   return canRead(access, noteView(note));
 }
 

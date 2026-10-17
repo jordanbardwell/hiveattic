@@ -225,7 +225,7 @@ describe("T-15 rerouting", () => {
     expect(newHistory.some((body) => body.includes("qxv1") || body.includes("qxv2"))).toBe(false);
     // Updating the moved note needs write:sensitive/health. The etag from the 201 is not enough without it.
     const blocked = await put(writer, { path, body: `More synthetic diagnosis ${marker}`, type: "note", if_match: v3.json.data?.etag });
-    expect(blocked.status).toBe(409);
+    expect(blocked.status).toBe(403);
     const allowed = await put(healthWriter, { path: target, body: `Updated synthetic diagnosis ${marker}`, type: "note", if_match: v3.json.data?.etag });
     expect(allowed.status, allowed.text).toBe(200);
     expect(await auditText()).not.toContain(marker);

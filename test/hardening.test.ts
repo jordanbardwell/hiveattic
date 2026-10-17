@@ -164,12 +164,18 @@ describe("forget, tags, and outside edits", () => {
     const created = await rest("/v1/notes", writer, { method: "PUT", body: JSON.stringify({ path, body: `Body ${marker}`, type: "note" }) });
     await testEnv().VAULT.delete(`vault/${path}`);
     await deliverEvent("DeleteObject", `vault/${path}`);
+    // Non-admin readers get 404 by path, id, and history. The admin reads a stub without the body.
     for (const query of [`path=${encodeURIComponent(path)}`, `id=${created.json.data?.id}`]) {
       const read = await rest(`/v1/notes?${query}`, writer);
-      expect(read.json.data?.status).toBe("forgotten");
+      expect(read.status).toBe(404);
       expect(read.text).not.toContain(marker);
+      const admin = await rest(`/v1/notes?${query}`, ADMIN);
+      expect(admin.json.data?.status).toBe("forgotten");
+      expect(admin.text).not.toContain(marker);
     }
-    expect((await rest(`/v1/history?path=${encodeURIComponent(path)}`, reader)).text).not.toContain(marker);
+    const readerHistory = await rest(`/v1/history?path=${encodeURIComponent(path)}`, reader);
+    expect(readerHistory.status).toBe(404);
+    expect(readerHistory.text).not.toContain(marker);
     expect(JSON.stringify(versionsOf((await rest(`/v1/history?path=${encodeURIComponent(path)}`, ADMIN)).json))).toContain(marker);
     expect(await testEnv().VAULT.head(`vault/${path}`)).toBeNull();
   });
