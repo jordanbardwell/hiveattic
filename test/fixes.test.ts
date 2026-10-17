@@ -184,6 +184,33 @@ describe("review fixes", () => {
     expect((await rest("/v1/whoami", writer)).status).toBe(200);
   });
 
+  it("M5/B-1 and F7: high-entropy idempotency keys and plural employer-like terms stay active across a rebuild", async () => {
+    await resetVault();
+    const bytes = (n: number) => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    const facts: { body: Record<string, unknown>; key: string; id: string }[] = [];
+    for (const length of [18, 30]) {
+      const key = bytes(length).slice(0, length === 18 ? 24 : 40);
+      const body = { key: `entropy-${nid()}`, statement: `qxentropy fact ${length}`, observed_at: "2099-01-01T00:00:00Z", scope: "shared" };
+      const written = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(body) });
+      expect(written.status, written.text).toBe(200);
+      facts.push({ body, key, id: String(written.json.data?.id) });
+    }
+    const plural = await rest("/v1/notes", dealsWriter, {
+      method: "PUT",
+      body: JSON.stringify({ path: `shared/plural-${nid()}.md`, body: "Contosos and the Fabrikams accounts teams met about qxplural roadmaps", type: "note", domain: "deals" }),
+    });
+    expect(plural.status).toBe(200);
+    expect((await runJob("/v1/admin/rebuild")).job.data?.status).toBe("done");
+    expect(await testEnv().DB.prepare("SELECT 1 FROM notes WHERE status = 'quarantined'").first()).toBeNull();
+    for (const fact of facts) {
+      expect((await testEnv().DB.prepare("SELECT status FROM notes WHERE id = ?").bind(fact.id).first<{ status: string }>())?.status).toBe("active");
+      const replay = await rest("/v1/facts", writer, { method: "POST", headers: { "idempotency-key": fact.key }, body: JSON.stringify(fact.body) });
+      expect(replay.status).toBe(200);
+      expect(replay.json.data?.id).toBe(fact.id);
+    }
+    expect((await rest(`/v1/notes?path=${encodeURIComponent(String(plural.json.data?.path))}`, dealsWriter)).json.data?.status).toBe("active");
+  });
+
   it("F11: a late delete event for a key that exists again does not forget the live note", async () => {
     await resetVault();
     const path = `shared/late-${nid()}.md`;
