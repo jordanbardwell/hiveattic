@@ -546,7 +546,9 @@ export class VaultWriter extends DurableObject<Env> {
     // the Durable Object serializes writes, so this call is the later server write.
     const incomingNewer = !active?.observed_at || Date.parse(op.observedAt) >= Date.parse(active.observed_at);
     const crossBot = Boolean(active && active.last_writer !== op.actor.agentId);
-    const conflict = Boolean(active && crossBot && within24h(active.observed_at, op.observedAt) && active.statement_hash !== statementHash);
+    // The owner's own write (the admin token, e.g. a correction from the console) settles the fact.
+    // It is not a second opinion, so it never opens a conflict.
+    const conflict = Boolean(!op.access.admin && active && crossBot && within24h(active.observed_at, op.observedAt) && active.statement_hash !== statementHash);
     const now = new Date().toISOString();
     const facts = {
       key: op.key,

@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>HiveAttic Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style nonce="__CSP_NONCE__">
+:root {
+  --bg: #F6F7F9; --card: #FFFFFF; --line: #E4E6EB; --line-2: #EEF0F3; --line-3: #F1F2F4; --hover: #FAFAFB; --soft: #F8F9FB; --chip: #F3F4F6;
+  --text: #1A1D21; --text-2: #2B2F35; --text-3: #3C4149; --sec: #5B616B; --muted: #80868F; --faint: #A0A5AD; --mark: #C4C8CF;
+  --accent: #E8962E; --accent-hover: #DC8A22; --accent-soft: #FCE9CF; --link: #A35F0A; --link-hover: #7A4A0C;
+  --warm-bg: #FFF8EE; --warm-line: #F6DFBC; --warm-text: #5E3A08; --sens-bg: #FFF3E3; --sens-text: #7A4A0C;
+  --ok: #1F8A4C; --ok-text: #1F6E3E; --ok-bg: #E8F5EC; --bad: #C6362A; --bad-text: #A82E24; --bad-bg: #FDECEA; --bad-line: #F3C9C4;
+  --sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+html, body { margin: 0; height: 100%; background: var(--bg); font-family: var(--sans); -webkit-font-smoothing: antialiased; color: var(--text); }
+* { box-sizing: border-box; }
+button, input, select, textarea { font-family: inherit; }
+::selection { background: var(--accent-soft); }
+.mono { font-family: var(--mono); }
+.link { color: var(--link); cursor: pointer; }
+.link:hover { color: var(--link-hover); text-decoration: underline; }
+.muted { color: var(--muted); }
+.sec { color: var(--sec); }
+
+.shell { height: 100vh; min-width: 1100px; display: grid; grid-template-rows: 52px minmax(0, 1fr); font-size: 13px; background: var(--bg); }
+.top { background: var(--card); border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 16px; padding: 0 20px; }
+.brand { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.brand-mark { width: 14px; height: 14px; background: var(--accent); transform: rotate(45deg); border-radius: 3px; }
+.brand-name { font: 600 15px var(--sans); letter-spacing: -.01em; }
+.vault-pill { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; white-space: nowrap; }
+.search-trigger { margin-left: auto; width: 340px; height: 32px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); display: flex; align-items: center; justify-content: space-between; padding: 0 12px; color: var(--muted); cursor: text; }
+.search-trigger:hover { border-color: #D3D6DC; }
+.kbd { font: 400 11px var(--mono); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; background: #fff; }
+.toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: var(--sec); user-select: none; white-space: nowrap; }
+.toggle-track { width: 28px; height: 16px; border-radius: 999px; background: #D3D6DC; position: relative; transition: background .15s; display: block; }
+.toggle-knob { position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2); transition: left .15s; }
+.toggle.on .toggle-track { background: var(--accent); }
+.toggle.on .toggle-knob { left: 14px; }
+.health { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--sec); white-space: nowrap; }
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot.sm { width: 6px; height: 6px; }
+.signout { height: 30px; padding: 0 10px; border-radius: 999px; background: #F1E4CF; color: var(--sens-text); border: none; font-weight: 600; font-size: 12px; cursor: pointer; }
+
+.body { display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 0; }
+.side { background: var(--card); border-right: 1px solid var(--line); padding: 16px 12px; display: flex; flex-direction: column; gap: 20px; }
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+.nav-head { font-size: 11px; font-weight: 500; color: var(--muted); padding: 0 10px 6px; text-transform: uppercase; letter-spacing: .05em; }
+.nav { padding: 7px 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; color: var(--text-3); }
+.nav:hover { background: var(--bg); }
+.nav.on { background: var(--sens-bg); color: var(--text); font-weight: 500; }
+.nav-count { color: var(--muted); font-weight: 400; }
+.badge-bad { font-size: 11px; font-weight: 500; color: var(--bad); background: var(--bad-bg); padding: 1px 7px; border-radius: 999px; }
+.side-foot { margin-top: auto; padding: 12px 10px; border-top: 1px solid var(--line-2); display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--muted); }
+
+.main { min-height: 0; min-width: 0; overflow: hidden; display: flex; flex-direction: column; }
+.page { padding: 24px 28px; display: flex; flex-direction: column; gap: 18px; flex: 1; min-height: 0; }
+.page.scroll { overflow: auto; }
+.title-block { display: flex; flex-direction: column; gap: 4px; }
+h1 { margin: 0; font: 600 22px var(--sans); letter-spacing: -.02em; }
+.bits { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--sec); font-size: 12.5px; }
+.bit { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.bit:hover { color: var(--text); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+.card-head { padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--line-2); }
+.card-title { font-weight: 600; }
+.clip { overflow: hidden; }
+.col { display: flex; flex-direction: column; }
+.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.inbox { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; flex-shrink: 0; }
+.inbox-card { display: flex; gap: 14px; align-items: flex-start; padding: 14px 16px; border: 1px solid var(--warm-line); background: var(--warm-bg); border-radius: 10px; }
+.eyebrow { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.eyebrow.warm { color: var(--link); }
+
+.btn { height: 32px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--line); background: #fff; color: var(--text); font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--bg); }
+.btn.sm { height: 26px; padding: 0 9px; font-size: 12px; color: var(--text-3); }
+.btn.md { height: 28px; padding: 0 10px; font-size: 12px; }
+.btn.primary { border-color: var(--accent); background: var(--accent); color: var(--text); font-weight: 500; }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.good { color: var(--ok-text); }
+.btn.good:hover { background: var(--ok-bg); }
+.btn.danger { border-color: var(--bad-line); color: var(--bad-text); }
+.btn.danger:hover { background: var(--bad-bg); }
+.btn:disabled { opacity: .55; cursor: default; }
+
+.input { height: 32px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; font: 400 13px var(--sans); color: var(--text); outline: none; background: #fff; }
+.input:focus, textarea.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.input.sm { height: 30px; font-size: 12.5px; }
+select.input { padding: 0 8px; }
+textarea.input { height: auto; padding: 8px 10px; resize: none; }
+
+.seg { display: flex; gap: 2px; background: var(--chip); padding: 3px; border-radius: 7px; font-size: 12px; }
+.seg.lg { background: #ECEEF1; border-radius: 8px; font-size: 13px; }
+.seg-item { padding: 4px 10px; border-radius: 5px; cursor: pointer; color: var(--sec); }
+.seg.lg .seg-item { padding: 6px 14px; border-radius: 6px; }
+.seg-item.on { background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(16,24,40,.08); }
+
+.chip { height: 28px; display: flex; align-items: center; gap: 7px; padding: 0 11px; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--text-3); font-size: 12px; cursor: pointer; }
+.chip.on { border-color: var(--text); background: var(--text); color: #fff; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-3); background: var(--chip); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.sens { color: var(--sens-text); background: var(--sens-bg); }
+.ok-pill { font-size: 11.5px; color: var(--ok-text); background: var(--ok-bg); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.bad-pill { font-size: 11.5px; color: var(--bad-text); background: var(--bad-bg); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.tag { font: 400 11.5px var(--mono); background: var(--chip); color: var(--text-3); padding: 2px 8px; border-radius: 4px; }
+.tag.write { background: var(--sens-bg); color: var(--sens-text); }
+
+.hex { clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); }
+.hive-wrap { background: var(--card); border: 1px solid var(--line); border-radius: 10px; display: grid; grid-template-columns: minmax(0, 1fr) 320px; overflow: hidden; flex-shrink: 0; }
+.hive-stage { position: relative; height: 500px; overflow: hidden; background: #FCFCFD; }
+.cell { position: absolute; width: 40px; height: 46px; transition: transform .15s ease, opacity .2s ease; cursor: pointer; }
+.cell-in { position: absolute; display: flex; align-items: center; justify-content: center; font-weight: 600; }
+.empty-cell { position: absolute; width: 40px; height: 46px; transform: translate(-50%, -50%); background: #F1F2F4; }
+.wedge { position: absolute; transform: translate(-50%, -50%); font-size: 11px; font-weight: 600; color: var(--sec); text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; pointer-events: none; background: rgba(252,252,253,.9); padding: 2px 7px; border-radius: 4px; z-index: 6; }
+.hive-legend-key { position: absolute; left: 16px; bottom: 14px; font: 400 11px var(--mono); color: var(--muted); }
+.hive-reset { position: absolute; right: 16px; bottom: 12px; font-size: 12px; }
+.hive-svg { position: absolute; left: 50%; top: 50%; overflow: visible; pointer-events: none; z-index: 5; }
+.legend-hex { width: 10px; height: 11px; }
+.panel { padding: 18px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.mini-stat { background: var(--soft); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+.kv { display: grid; grid-template-columns: 64px 1fr; gap: 8px; font-size: 12px; }
+.kv.w92 { grid-template-columns: 92px 1fr; }
+.kv.w76 { grid-template-columns: 76px 1fr; font-size: 12.5px; }
+.kv > :first-child { color: var(--muted); }
+.kv > .v { font-family: var(--mono); word-break: break-all; color: var(--text-2); }
+.list-row { display: grid; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line-3); font-size: 12.5px; cursor: pointer; }
+.list-row:hover { color: var(--link-hover); }
+.callout { padding: 10px 12px; background: var(--warm-bg); border: 1px solid var(--warm-line); border-radius: 8px; font-size: 12.5px; color: var(--warm-text); }
+
+.grid-row { display: grid; align-items: center; }
+.th { padding: 8px 18px; font-size: 11.5px; font-weight: 500; color: var(--muted); background: var(--soft); border-bottom: 1px solid var(--line-2); }
+.tr { padding: 9px 18px; border-bottom: 1px solid var(--line-3); font-size: 12.5px; cursor: pointer; }
+.tr:hover { background: var(--hover); }
+.tr.sel { background: var(--sens-bg); }
+.cell-mono { font-family: var(--mono); font-size: 12px; color: var(--sec); }
+.bars { height: 110px; display: flex; align-items: flex-end; gap: 5px; border-bottom: 1px solid var(--line-2); }
+.bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; gap: 1px; cursor: default; }
+.bar-rej { background: #D9534A; border-radius: 2px; }
+.bar-ok { background: var(--accent); border-radius: 2px 2px 0 0; }
+.axis { display: flex; justify-content: space-between; font: 400 11px var(--mono); color: var(--muted); }
+
+.tree-row { display: flex; align-items: center; gap: 6px; padding: 5px 10px; cursor: pointer; border-radius: 6px; font: 400 12.5px var(--mono); user-select: none; color: var(--text-3); }
+.tree-row:hover { background: var(--bg); }
+.tree-row.dir { color: var(--muted); }
+.tree-row.on { background: var(--sens-bg); color: var(--text); }
+.tree-icon { width: 9px; color: var(--faint); font-size: 9px; }
+.prose { display: flex; flex-direction: column; gap: 10px; max-width: 680px; font-size: 14px; line-height: 1.6; color: var(--text-2); }
+.prose h3 { margin: 10px 0 0; font: 600 14px var(--sans); color: var(--text); }
+.prose .li { display: flex; gap: 10px; }
+.prose .li > :first-child { color: var(--accent); }
+.prose .quote { padding: 12px 14px; background: var(--warm-bg); border: 1px solid var(--warm-line); border-radius: 8px; font-size: 13px; color: var(--warm-text); }
+.prose .code { padding: 12px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; font: 400 12.5px var(--mono); color: var(--text-3); white-space: pre-wrap; }
+.prose .entry { display: grid; grid-template-columns: 60px 1fr; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line-2); }
+.raw { margin: 0; padding: 16px; background: var(--soft); border: 1px solid var(--line-2); border-radius: 8px; font: 400 12.5px/1.65 var(--mono); color: var(--text-3); white-space: pre-wrap; word-break: break-word; }
+.hist { display: grid; grid-template-columns: 12px 1fr auto; gap: 8px; align-items: start; }
+.hist-dot { width: 8px; height: 8px; border-radius: 50%; border: 2px solid var(--mark); margin-top: 4px; }
+.conf-bar { width: 44px; height: 4px; background: var(--line-2); border-radius: 2px; overflow: hidden; display: block; }
+.conf-fill { display: block; height: 100%; background: var(--accent); }
+
+.day { padding: 9px 10px; border-radius: 6px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.day:hover { background: var(--bg); }
+.day.on { background: var(--sens-bg); }
+.agent-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.agent-card:hover { border-color: #D3D6DC; box-shadow: 0 2px 6px rgba(16,24,40,.06); }
+.agent-card.off { opacity: .6; }
+.lvl { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid transparent; }
+.lvl.Edit { background: var(--sens-bg); color: var(--sens-text); border-color: var(--warm-line); }
+.lvl.Read { background: var(--chip); color: var(--text-3); border-color: var(--chip); }
+.lvl.Summary { background: #fff; color: var(--text-3); border-color: #D3D6DC; }
+.lvl.None { background: #fff; color: var(--faint); }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+.stat-v { font: 600 22px var(--sans); letter-spacing: -.02em; }
+
+.overlay { position: fixed; inset: 0; background: rgba(16,24,40,.32); display: flex; justify-content: center; z-index: 50; }
+.palette { width: 620px; align-self: flex-start; margin-top: 12vh; background: #fff; border-radius: 12px; box-shadow: 0 20px 50px rgba(16,24,40,.25); overflow: hidden; border: 1px solid var(--line); }
+.pal-input { width: 100%; height: 52px; border: none; border-bottom: 1px solid var(--line-2); padding: 0 18px; font: 400 15px var(--sans); outline: none; color: var(--text); }
+.pal-item { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 7px; cursor: pointer; }
+.pal-item.on { background: var(--bg); }
+.pal-foot { display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--line-2); font: 400 11px var(--mono); color: var(--muted); background: var(--soft); }
+.modal { width: 440px; align-self: center; background: #fff; border-radius: 12px; box-shadow: 0 20px 50px rgba(16,24,40,.25); padding: 22px; display: flex; flex-direction: column; gap: 14px; }
+.target { font: 400 12px var(--mono); color: var(--text-3); background: var(--bg); padding: 6px 8px; border-radius: 6px; word-break: break-all; }
+.toast { position: fixed; right: 24px; bottom: 24px; background: var(--text); color: #fff; padding: 11px 16px; border-radius: 8px; font-size: 13px; box-shadow: 0 8px 24px rgba(16,24,40,.25); z-index: 70; display: flex; align-items: center; gap: 10px; }
+.empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+
+.gate { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+.gate-card { width: 100%; max-width: 400px; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 28px; display: flex; flex-direction: column; gap: 16px; font-size: 13px; }
+.err { font-size: 12px; color: var(--bad); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script nonce="__CSP_NONCE__">
+"use strict";
+(() => {
+  // Every vault value reaches the page through textContent or a DOM property. Nothing is parsed
+  // as HTML, so a note cannot inject markup or script into the owner's console.
+  const TOKEN_KEY = "hiveattic-console-token";
+  const PREFS_KEY = "hiveattic-console-prefs";
+  const HS = 24, SQ3 = Math.sqrt(3), MAX_RING = 7;
+  const RECENCY = [["Today", 1, "#E08A1E"], ["Last 3 days", 3, "#EDA94F"], ["This week", 7, "#F4C987"], ["Older", Infinity, "#F6E0BA"]];
+  const AREAS = [["facts", "Facts", "oklch(0.74 0.13 70)"], ["journal", "Journal", "oklch(0.74 0.13 140)"], ["agents", "Agent notes", "oklch(0.74 0.13 250)"], ["shared", "Shared & rules", "oklch(0.74 0.13 320)"]];
+  const HUES = [70, 150, 25, 250, 200, 300, 110, 340, 180, 45];
+  const VIA = { mcp: "Agent (MCP)", rest: "Agent (API)", r2: "Edited by hand", cron: "Scheduled", queue: "Index" };
+  const ACTIONS = {
+    write_fact: "Wrote fact", append_journal: "Journal entry", write_note: "Wrote note", forget: "Forgot", restore: "Restored", purge: "Purged",
+    summary: "Summary rebuilt", bootstrap: "Set up vault", mint_token: "Token created", revoke: "Token revoked", conflict: "Conflict",
+    reroute: "Moved to private", reroute_move: "Moved to private", journal_reroute: "Moved to private", reconcile: "Reconciled", replay: "Replayed",
+  };
+  const PAGES = [["overview", "Overview"], ["browse", "Browse"], ["facts", "Facts & profile"], ["journal", "Journal"], ["agents", "Agents"], ["audit", "Audit log"]];
+
+  const S = {
+    token: readStore(sessionStorage, TOKEN_KEY) || "",
+    gateErr: "", gateBusy: false, loading: false, loadErr: "",
+    view: "overview", tech: false,
+    whoami: null, overview: null, agents: [], audit: [], paths: [], layout: null,
+    hive: { mode: "recency", filter: null, q: "", sel: null, hover: null },
+    hoverHour: -1,
+    browse: { q: "", open: {}, sel: null, note: null, history: null, raw: false, err: "" },
+    facts: { q: "", domain: "all", sel: null, tab: "facts", history: null, summary: null },
+    journal: { day: null, agent: "all", entries: null, files: [] },
+    agentSel: null,
+    auditF: { q: "", agent: "all", action: "all", outcome: "all", open: null, server: null },
+    pal: null, modal: null, toast: "", toastTimer: 0,
+  };
+  try { const prefs = JSON.parse(readStore(localStorage, PREFS_KEY) || "{}"); if (typeof prefs.tech === "boolean") S.tech = prefs.tech; if (PAGES.some((p) => p[0] === prefs.view)) S.view = prefs.view; } catch (e) { /* defaults */ }
+
+  function readStore(store, key) { try { return store.getItem(key); } catch (e) { return null; } }
+  function writeStore(store, key, value) { try { if (value == null) store.removeItem(key); else store.setItem(key, value); } catch (e) { /* private mode */ } }
+  function savePrefs() { writeStore(localStorage, PREFS_KEY, JSON.stringify({ tech: S.tech, view: S.view })); }
+
+  // ---- DOM helpers ----
+  function h(tag, props, ...kids) {
+    const el = document.createElement(tag);
+    let value;
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v == null || v === false) continue;
+      if (k === "class") el.className = v;
+      else if (k === "style") Object.assign(el.style, v);
+      else if (k === "value") value = v;
+      else if (k === "key") el.dataset.key = v;
+      else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2).toLowerCase(), v);
+      else el.setAttribute(k, v === true ? "" : String(v));
+    }
+    add(el, kids);
+    if (value !== undefined) el.value = value;
+    return el;
+  }
+  function add(el, kids) {
+    for (const kid of kids) {
+      if (kid == null || kid === false) continue;
+      if (Array.isArray(kid)) add(el, kid);
+      else el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    }
+  }
+  function svg(tag, attrs) {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, String(v));
+    return el;
+  }
+  const root = document.getElementById("app");
+  function render() {
+    const active = document.activeElement;
+    const key = active && active.dataset ? active.dataset.key : null;
+    let range = null;
+    if (key && typeof active.selectionStart === "number") range = [active.selectionStart, active.selectionEnd];
+    root.replaceChildren(S.token && S.whoami ? App() : Gate());
+    if (key) {
+      const el = root.querySelector('[data-key="' + key + '"]');
+      if (el) { el.focus(); if (range) { try { el.setSelectionRange(range[0], range[1]); } catch (e) { /* not a text input */ } } }
+    }
+  }
+  function set(patch) { Object.assign(S, patch); render(); }
+
+  // ---- formatting ----
+  function zone() { return (S.overview && S.overview.vault && S.overview.vault.vault_tz) || "UTC"; }
+  function parts(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    try { return new Intl.DateTimeFormat("sv-SE", { timeZone: zone(), year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(d); }
+    catch (e) { return d.toISOString().slice(0, 16).replace("T", " "); }
+  }
+  function fmtDateTime(iso) { return iso ? parts(iso) || String(iso) : ""; }
+  function fmtTime(iso) { const p = iso && parts(iso); return p ? p.slice(11, 16) : ""; }
+  function fmtDate(iso) { const p = iso && parts(iso); return p ? p.slice(0, 10) : ""; }
+  function ago(iso) {
+    if (!iso) return "never";
+    const s = (Date.now() - Date.parse(iso)) / 1000;
+    if (!Number.isFinite(s)) return "";
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    if (s < 86400) return Math.round(s / 3600) + "h ago";
+    return Math.round(s / 86400) + "d ago";
+  }
+  function plural(n, one, many) { return n + " " + (n === 1 ? one : many || one + "s"); }
+  function actionLabel(a) { return S.tech ? a : ACTIONS[a] || String(a || "").replace(/_/g, " "); }
+  function agentHue(id) { let x = 0; for (const c of String(id)) x = (x * 31 + c.charCodeAt(0)) >>> 0; return HUES[x % HUES.length]; }
+  function agentColor(id) { return id ? "oklch(0.74 0.12 " + agentHue(id) + ")" : "#C4C8CF"; }
+  function agentName(id) { if (id === "owner") return S.tech ? "owner" : "You"; const a = S.agents.find((x) => x.id === id); return a ? a.display_name : id || "unknown"; }
+  function idemKey() { return "console-" + (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)); }
+
+  // ---- API ----
+  class ApiError extends Error { constructor(message, code, status) { super(message); this.code = code; this.status = status; } }
+  async function api(path, init) {
+    const options = init || {};
+    const headers = { authorization: "Bearer " + S.token };
+    if (options.body) headers["content-type"] = "application/json";
+    const res = await fetch(path, { method: options.method || "GET", headers, body: options.body ? JSON.stringify(options.body) : undefined, cache: "no-store", credentials: "omit" });
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    if (res.status === 401) { signOut("That token was not accepted. Sign in again."); throw new ApiError("Signed out", "unauthorized", 401); }
+    if (!body || !body.ok) {
+      const err = body && body.error;
+      throw new ApiError(err && err.message ? err.message : "Request failed (" + res.status + ")", err && err.code, res.status);
+    }
+    return body.data;
+  }
+  function toast(text) {
+    clearTimeout(S.toastTimer);
+    S.toast = text;
+    S.toastTimer = setTimeout(() => set({ toast: "" }), 3200);
+    render();
+  }
+  function fail(err) { if (err && err.code !== "unauthorized") toast(err && err.message ? err.message : "Something went wrong"); }
+
+  async function signIn(token) {
+    S.token = token.trim();
+    S.gateBusy = true; S.gateErr = ""; render();
+    try {
+      const who = await api("/v1/whoami");
+      if (!who.admin) {
+        S.token = ""; S.gateBusy = false; S.gateErr = "This token works, but it is not the admin token. The console needs the admin token.";
+        render(); return;
+      }
+      writeStore(sessionStorage, TOKEN_KEY, S.token);
+      S.whoami = who; S.gateBusy = false;
+      await loadAll();
+    } catch (err) {
+      if (err.code !== "unauthorized") { S.token = ""; S.gateErr = err.message; }
+      S.gateBusy = false; render();
+    }
+  }
+  function signOut(message) {
+    writeStore(sessionStorage, TOKEN_KEY, null);
+    Object.assign(S, { token: "", whoami: null, overview: null, agents: [], audit: [], paths: [], layout: null, gateErr: message || "", pal: null, modal: null });
+    render();
+  }
+  async function listAll() {
+    const out = [];
+    let cursor = "";
+    for (let i = 0; i < 50; i++) {
+      const page = await api("/v1/list?prefix=&cursor=" + encodeURIComponent(cursor));
+      out.push(...page.notes);
+      if (!page.cursor) break;
+      cursor = page.cursor;
+    }
+    return out;
+  }
+  async function loadAll() {
+    S.loading = true; S.loadErr = ""; render();
+    try {
+      const [overview, agents, audit, paths] = await Promise.all([api("/v1/admin/overview"), api("/v1/admin/agents"), api("/v1/admin/audit?limit=200"), listAll()]);
+      S.overview = overview; S.agents = agents.agents; S.audit = audit.entries; S.paths = paths;
+      S.layout = buildLayout();
+      if (S.browse.sel && !paths.some((p) => p.path === S.browse.sel)) S.browse.sel = null;
+    } catch (err) {
+      S.loadErr = err.message;
+    }
+    S.loading = false; render();
+    if (S.view === "browse") ensureNote();
+    if (S.view === "journal") ensureJournal();
+  }
+
+  // ---- navigation ----
+  function go(view, patch) {
+    S.view = view; S.pal = null;
+    if (patch) for (const [k, v] of Object.entries(patch)) Object.assign(S[k], v);
+    savePrefs(); render();
+    const main = root.querySelector(".page"); if (main) main.scrollTop = 0;
+    if (view === "browse") ensureNote();
+    if (view === "journal") ensureJournal();
+    if (view === "facts" && S.facts.tab === "profile") ensureSummary();
+  }
+  function openNote(path) {
+    if (!path) return;
+    const open = Object.assign({}, S.browse.open);
+    const segs = path.split("/");
+    for (let i = 1; i < segs.length; i++) open[segs.slice(0, i).join("/") + "/"] = true;
+    S.browse = Object.assign({}, S.browse, { sel: path, note: null, history: null, err: "", open, q: "" });
+    go("browse");
+  }
+  function openAgent(id) { S.agentSel = id; go("agents"); }
+  async function ensureNote() {
+    const b = S.browse;
+    if (!b.sel) { const first = S.paths.find((p) => p.path === "profile/summary.md") || S.paths[0]; if (!first) return; b.sel = first.path; }
+    if (b.note && b.note.path === b.sel) return;
+    const path = b.sel;
+    try {
+      const [note, hist] = await Promise.all([api("/v1/notes?path=" + encodeURIComponent(path)), api("/v1/history?path=" + encodeURIComponent(path)).catch(() => null)]);
+      if (S.browse.sel !== path) return;
+      S.browse.note = note; S.browse.history = hist; S.browse.err = "";
+    } catch (err) {
+      if (S.browse.sel !== path) return;
+      S.browse.note = null; S.browse.err = err.message;
+    }
+    render();
+  }
+  async function ensureSummary() {
+    if (S.facts.summary) return;
+    try { S.facts.summary = await api("/v1/notes?path=profile/summary.md"); } catch (err) { S.facts.summary = { markdown: "", error: err.message }; }
+    render();
+  }
+
+  // ---- markdown, read as text only ----
+  function splitFrontmatter(md) {
+    const m = /^---\n([\s\S]*?)\n---\n?/.exec(md || "");
+    if (!m) return { fm: [], body: md || "" };
+    const fm = [];
+    for (const line of m[1].split("\n")) { const kv = /^([A-Za-z0-9_]+):\s?(.*)$/.exec(line); if (kv) fm.push([kv[1], kv[2]]); }
+    return { fm, body: md.slice(m[0].length) };
+  }
+  function linksOf(md) { const out = []; const re = /\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g; let m; while ((m = re.exec(md || ""))) if (!out.includes(m[1].trim())) out.push(m[1].trim()); return out; }
+  function inline(text) { return text.replace(/\[\[([^\]|#]+)(?:[#|]([^\]]*))?\]\]/g, (_, p, alias) => alias || p).replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1"); }
+  const ENTRY = /^## (.+?) · ([^·\n]+) · (.+?) \^([0-9A-HJKMNP-TV-Z]{26})\s*$/;
+  function blocks(md) {
+    const { body } = splitFrontmatter(md);
+    const out = [];
+    const lines = body.split("\n");
+    let para = [], code = null, entry = null;
+    const flush = () => { if (para.length) { out.push({ k: "p", text: inline(para.join(" ")) }); para = []; } };
+    for (const line of lines) {
+      if (code) { if (/^```/.test(line)) { out.push({ k: "code", text: code.join("\n") }); code = null; } else code.push(line); continue; }
+      if (/^```/.test(line)) { flush(); code = []; continue; }
+      if (/^<!--.*-->\s*$/.test(line) || /^Tags: /.test(line)) continue;
+      const e = ENTRY.exec(line);
+      if (e) { flush(); entry = { k: "entry", time: e[1].replace(/\s+[A-Z]{2,5}$/, ""), agent: e[2].trim(), title: e[3].trim(), text: [] }; out.push(entry); continue; }
+      if (entry && !/^#{1,6} /.test(line)) { if (line.trim()) entry.text.push(inline(line.replace(/^\\/, ""))); continue; }
+      entry = null;
+      const hd = /^#{1,6}\s+(.*)$/.exec(line);
+      if (hd) { flush(); out.push({ k: "h", text: inline(hd[1]) }); continue; }
+      const li = /^\s*(?:[-*]|\d+\.)\s+(.*)$/.exec(line);
+      if (li) { flush(); out.push({ k: "li", text: inline(li[1]) }); continue; }
+      const q = /^>\s?(.*)$/.exec(line);
+      if (q) { flush(); out.push({ k: "quote", text: inline(q[1]) }); continue; }
+      if (!line.trim()) { flush(); continue; }
+      if (/^\[\[[^\]]+\]\]$/.test(line.trim())) continue;
+      para.push(line.trim());
+    }
+    flush();
+    if (code) out.push({ k: "code", text: code.join("\n") });
+    for (const b of out) if (b.k === "entry") b.text = b.text.join(" ");
+    return out;
+  }
+  function Prose(md) {
+    const list = blocks(md);
+    if (!list.length) return h("div", { class: "muted" }, "This note is empty.");
+    return h("div", { class: "prose" }, list.map((b) => {
+      if (b.k === "h") return h("h3", null, b.text);
+      if (b.k === "li") return h("div", { class: "li" }, h("span", null, "•"), h("span", null, b.text));
+      if (b.k === "quote") return h("div", { class: "quote" }, b.text);
+      if (b.k === "code") return h("div", { class: "code" }, b.text);
+      if (b.k === "entry") return h("div", { class: "entry" }, h("span", { class: "mono muted", style: { fontSize: "12px", paddingTop: "2px" } }, b.time),
+        h("div", { class: "col", style: { gap: "3px" } }, h("span", { style: { fontWeight: 500, color: "var(--text)" } }, b.title, " ", h("span", { class: "mono muted", style: { fontSize: "11.5px", marginLeft: "4px" } }, b.agent)), h("span", null, b.text)));
+      return h("div", null, b.text);
+    }));
+  }
+
+  // ---- hive layout ----
+  function hexPositions(maxRing) {
+    const dirs = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
+    const out = [];
+    for (let k = 1; k <= maxRing; k++) {
+      let q = dirs[4][0] * k, r = dirs[4][1] * k;
+      for (let i = 0; i < 6; i++) for (let j = 0; j < k; j++) {
+        const x = HS * SQ3 * (q + r / 2), y = HS * 1.5 * r;
+        out.push({ ring: k, x, y, a: (Math.atan2(y, x) + Math.PI / 2 + 4 * Math.PI) % (2 * Math.PI) });
+        q += dirs[i][0]; r += dirs[i][1];
+      }
+    }
+    return out.sort((m, n) => m.ring - n.ring || m.a - n.a);
+  }
+  const HEX_POS = hexPositions(MAX_RING);
+  function clusterOf(n) {
+    if (n.type === "fact") return "facts";
+    if (n.type === "journal" || /(^|\/)shared\/decisions\.md$/.test(n.path)) return "journal";
+    if (/^(sensitive\/[^/]+\/)?bots\//.test(n.path)) return "agents";
+    return "shared";
+  }
+  function kindOf(n) {
+    if (n.type === "fact") return "Fact";
+    if (n.type === "journal") return "Journal day";
+    if (n.type === "role") return "Role card";
+    if (n.type === "profile") return "Profile";
+    if (/decisions\.md$/.test(n.path)) return "Decisions";
+    if (n.path === "AGENTS.md") return "Rules";
+    if (n.path.startsWith("inbox/")) return "Inbox";
+    return "Note";
+  }
+  function buildLayout() {
+    const now = Date.now();
+    const all = S.overview.notes.filter((n) => n.path !== "profile/summary.md").map((n) => {
+      const ts = (n.type === "fact" && n.observed_at) || n.updated_at;
+      const age = (now - Date.parse(ts)) / 864e5;
+      return { id: n.id, note: n, path: n.path, cluster: clusterOf(n), kind: kindOf(n), title: n.type === "fact" ? n.fact_key || n.title : n.title || n.path.split("/").pop(),
+        text: n.status === "forgotten" ? "Forgotten. History is kept." : n.snippet || "", agent: n.type === "fact" || n.owner === "shared" ? n.last_writer : n.owner, ts, age, rec: Math.max(0, RECENCY.findIndex((r) => age < r[1])) };
+    });
+    all.sort((a, b) => a.age - b.age);
+    const items = all.slice(0, HEX_POS.length);
+    const counts = AREAS.map(([k]) => items.filter((i) => i.cluster === k).length);
+    const total = counts.reduce((a, b) => a + b, 0) || 1;
+    const bounds = []; let acc = 0;
+    counts.forEach((c) => { bounds.push([acc, acc + (c / total) * 2 * Math.PI]); acc += (c / total) * 2 * Math.PI; });
+    const queues = AREAS.map(([k]) => items.filter((i) => i.cluster === k));
+    const used = new Set(); let maxRing = 1;
+    HEX_POS.forEach((pos, idx) => {
+      const ci = bounds.findIndex(([a, b]) => pos.a >= a && pos.a < b);
+      if (ci >= 0 && queues[ci].length) { const it = queues[ci].shift(); it.x = pos.x; it.y = pos.y; used.add(idx); maxRing = Math.max(maxRing, pos.ring); }
+    });
+    queues.forEach((q, ci) => {
+      const mid = (bounds[ci][0] + bounds[ci][1]) / 2;
+      while (q.length) {
+        let best = -1, bd = 1e9;
+        HEX_POS.forEach((pos, idx) => { if (used.has(idx)) return; const d = pos.ring * 10 + Math.abs(pos.a - mid); if (d < bd) { bd = d; best = idx; } });
+        const it = q.shift(); it.x = HEX_POS[best].x; it.y = HEX_POS[best].y; used.add(best); maxRing = Math.max(maxRing, HEX_POS[best].ring);
+      }
+    });
+    const byId = {}; items.forEach((i) => (byId[i.id] = i));
+    const summary = S.overview.notes.find((n) => n.path === "profile/summary.md");
+    const adj = {};
+    const link = (a, b) => { if (a === b) return; (adj[a] = adj[a] || new Set()).add(b); (adj[b] = adj[b] || new Set()).add(a); };
+    const cell = (id) => (summary && id === summary.id ? "you" : byId[id] ? id : null);
+    for (const [src, dst] of S.overview.links) { const a = cell(src), b = cell(dst); if (a && b) link(a, b); }
+    items.forEach((it) => { if (it.cluster === "facts" && it.note.owner === "shared" && it.note.status === "active") link("you", it.id); });
+    const empties = HEX_POS.filter((p, idx) => !used.has(idx) && p.ring <= maxRing);
+    const R = (maxRing + 1.2) * HS * SQ3;
+    const wedges = AREAS.map(([, l], i) => { const a = (bounds[i][0] + bounds[i][1]) / 2; return { label: l, count: counts[i], x: Math.sin(a) * R, y: -Math.cos(a) * R * 0.9 }; }).filter((w) => w.count > 0);
+    return { items, byId, adj, empties, wedges, total: all.length, counts };
+  }
+
+  // ---- views ----
+  function Gate() {
+    let input;
+    const submit = (e) => { e.preventDefault(); if (input.value.trim()) signIn(input.value); };
+    return h("div", { class: "gate" }, h("form", { class: "gate-card", onSubmit: submit },
+      h("div", { class: "brand" }, h("div", { class: "brand-mark" }), h("span", { class: "brand-name" }, "HiveAttic")),
+      h("div", { class: "col", style: { gap: "6px" } }, h("span", { style: { font: "600 18px var(--sans)" } }, "Sign in to your vault"),
+        h("span", { class: "sec", style: { lineHeight: 1.5 } }, "Paste the admin token you set when you deployed HiveAttic. It stays in this browser tab and is sent only to this worker.")),
+      input = h("input", { class: "input", type: "password", autocomplete: "current-password", placeholder: "Admin token", "aria-label": "Admin token", autofocus: true, disabled: S.gateBusy }),
+      S.gateErr ? h("span", { class: "err" }, S.gateErr) : null,
+      h("button", { class: "btn primary", type: "submit", disabled: S.gateBusy }, S.gateBusy ? "Checking…" : "Sign in"),
+      h("span", { class: "muted", style: { fontSize: "11.5px", lineHeight: 1.5 } }, "Closing the tab signs you out.")));
+  }
+  function App() {
+    const ov = S.overview;
+    const conflicts = ov ? ov.conflicts.length : 0;
+    const rejectedToday = ov ? ov.hourly.reduce((a, x) => a + x.rejected, 0) : 0;
+    const nav = (id, label, count) => h("div", { class: "nav" + (S.view === id ? " on" : ""), onClick: () => go(id, id === "agents" ? null : null) },
+      h("span", null, label), count != null ? h("span", { class: "nav-count" }, count) : null);
+    const factCount = ov ? ov.notes.filter((n) => n.type === "fact" && n.status === "active").length : null;
+    const shell = h("div", { class: "shell" },
+      h("header", { class: "top" },
+        h("div", { class: "brand", onClick: () => go("overview") }, h("div", { class: "brand-mark" }), h("span", { class: "brand-name" }, "HiveAttic")),
+        h("span", { style: { color: "var(--mark)" } }, "/"),
+        h("div", { class: "vault-pill" }, h("span", { style: { fontWeight: 500 } }, "Personal vault"), h("span", { class: "mono muted", style: { fontSize: "11px" } }, ov ? ov.vault.deploy_env : "")),
+        h("div", { class: "search-trigger", onClick: openPalette }, h("span", null, "Search notes, facts, agents"), h("span", { class: "kbd" }, "⌘K")),
+        h("div", { class: "toggle" + (S.tech ? " on" : ""), onClick: () => { S.tech = !S.tech; savePrefs(); render(); } }, h("span", { class: "toggle-track" }, h("span", { class: "toggle-knob" })), "Technical details"),
+        h("div", { class: "health" }, h("span", { class: "dot", style: { background: S.loadErr ? "var(--bad)" : conflicts ? "#B4620A" : "var(--ok)" } }),
+          S.loadErr ? "Could not load the vault" : conflicts ? plural(conflicts, "conflict") + (conflicts === 1 ? " needs you" : " need you") : "All systems normal"),
+        h("button", { class: "signout", title: "Sign out", onClick: () => signOut("") }, "Sign out")),
+      h("div", { class: "body" },
+        h("aside", { class: "side" },
+          h("div", { class: "nav-group" }, h("span", { class: "nav-head" }, "Memory"), nav("overview", "Overview"), nav("browse", "Browse", S.paths.length || null), nav("facts", "Facts & profile", factCount), nav("journal", "Journal")),
+          h("div", { class: "nav-group" }, h("span", { class: "nav-head" }, "Access"), nav("agents", "Agents", S.agents.length || null),
+            h("div", { class: "nav" + (S.view === "audit" ? " on" : ""), onClick: () => go("audit") }, h("span", null, "Audit log"), rejectedToday ? h("span", { class: "badge-bad" }, rejectedToday) : null)),
+          h("div", { class: "side-foot" }, S.tech && ov
+            ? [h("span", { class: "mono", style: { fontSize: "11px" } }, ov.vault.git_sha ? "build " + ov.vault.git_sha.slice(0, 7) : "build not stamped"), h("span", { class: "mono", style: { fontSize: "11px" } }, "bucket " + (ov.vault.bucket || "?")), h("span", { class: "mono", style: { fontSize: "11px" } }, "VAULT_TZ " + zone())]
+            : [h("span", null, S.loadErr ? "Vault unreachable" : "Vault healthy"), h("span", null, ov && ov.last_write_at ? "Last write " + ago(ov.last_write_at) : "No writes yet")])),
+        h("main", { class: "main" }, Main())),
+      S.pal ? Palette() : null,
+      S.modal ? Modal() : null,
+      S.toast ? h("div", { class: "toast", role: "status" }, h("span", { class: "dot", style: { background: "var(--accent)" } }), S.toast) : null);
+    return shell;
+  }
+  function Main() {
+    if (S.loadErr && !S.overview) return h("div", { class: "page" }, h("h1", null, "Could not load the vault"), h("span", { class: "sec" }, S.loadErr), h("div", null, h("button", { class: "btn primary", onClick: loadAll }, "Try again")));
+    if (!S.overview) return h("div", { class: "page" }, h("span", { class: "muted" }, "Loading your vault…"));
+    if (S.view === "browse") return Browse();
+    if (S.view === "facts") return Facts();
+    if (S.view === "journal") return Journal();
+    if (S.view === "agents") return S.agentSel ? AgentDetail() : Agents();
+    if (S.view === "audit") return Audit();
+    return Overview();
+  }
+
+  function Overview() {
+    const ov = S.overview;
+    const writes = ov.hourly.reduce((a, x) => a + x.ok, 0), rej = ov.hourly.reduce((a, x) => a + x.rejected, 0);
+    const active = ov.totals.filter((t) => t.status === "active").reduce((a, t) => a + t.count, 0);
+    const live = S.agents.filter((a) => !a.disabled_at && a.tokens.some((t) => !t.revoked_at)).length;
+    const auditGo = (outcome) => go("audit", { auditF: { outcome, agent: "all", action: "all", q: "", open: null, server: null } });
+    const bits = [
+      [plural(writes, "memory", "memories") + " written in the last 24 hours", "var(--accent)", () => auditGo("ok")],
+      [plural(rej, "write") + " rejected, nothing stored", rej ? "var(--bad)" : "var(--mark)", () => auditGo("rejected")],
+      [plural(live, "agent") + " with a live token", "var(--ok)", () => { S.agentSel = null; go("agents"); }],
+      [plural(active, "note") + " in the vault", "var(--mark)", () => go("browse")],
+    ];
+    const byId = {}; ov.notes.forEach((n) => (byId[n.id] = n));
+    const inbox = ov.conflicts.map((c) => {
+      const winner = byId[c.winner_id] || byId[c.loser_id];
+      return h("div", { class: "inbox-card" },
+        h("div", { class: "col", style: { gap: "4px", flex: 1, minWidth: 0 } },
+          h("span", { class: "eyebrow warm" }, "Conflict · needs you"),
+          h("span", { style: { fontWeight: 600, fontSize: "13.5px" } }, c.fact_key),
+          h("span", { class: "sec", style: { fontSize: "12.5px", lineHeight: 1.45 } }, "Two agents wrote different values for this fact within 24 hours. The newest observed value is active. Check that it is right.")),
+        winner ? h("button", { class: "btn md", onClick: () => openNote(winner.path) }, "Open note") : null);
+    });
+    const max = Math.max(1, ...ov.hourly.map((x) => x.ok + x.rejected));
+    const hh = S.hoverHour >= 0 ? ov.hourly[S.hoverHour] : null;
+    const chartLabel = hh ? fmtTime(hh.hour) + " · " + hh.ok + " stored, " + hh.rejected + " rejected" : writes + " stored, " + rej + " rejected";
+    const axis = [0, 6, 12, 18, 23].map((i) => h("span", null, fmtTime(ov.hourly[i].hour)));
+    const recent = S.audit.filter((r) => r.path).slice(0, 8);
+    const agentsByWrites = S.agents.slice().sort((a, b) => b.writes_24h - a.writes_24h || String(b.last_seen_at).localeCompare(String(a.last_seen_at)));
+    const cols = { gridTemplateColumns: "64px 110px 104px minmax(0,1fr) 120px" };
+    return h("div", { class: "page scroll" },
+      h("div", { class: "title-block" }, h("h1", null, "Overview"),
+        h("div", { class: "bits" }, bits.map(([text, dot, onClick]) => h("span", { class: "bit", onClick }, h("span", { class: "dot sm", style: { background: dot } }), text)))),
+      inbox.length ? h("div", { class: "inbox" }, inbox) : null,
+      HiveCard(),
+      h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) 340px", gap: "14px", alignItems: "start", flexShrink: 0 } },
+        h("div", { class: "col", style: { gap: "14px", minWidth: 0 } },
+          h("div", { class: "card col", style: { padding: "16px 18px", gap: "12px" } },
+            h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" } }, h("span", { class: "card-title" }, "Writes per hour"), h("span", { class: "mono sec", style: { fontSize: "12px" } }, chartLabel)),
+            h("div", { class: "bars", onMouseLeave: () => { S.hoverHour = -1; render(); } }, ov.hourly.map((x, i) => h("div", {
+              class: "bar", style: { opacity: S.hoverHour >= 0 && S.hoverHour !== i ? 0.45 : 1 }, title: fmtTime(x.hour),
+              onMouseEnter: () => { if (S.hoverHour !== i) { S.hoverHour = i; render(); } },
+            }, h("div", { class: "bar-rej", style: { height: (x.rejected / max) * 100 + "%" } }), h("div", { class: "bar-ok", style: { height: (x.ok / max) * 100 + "%" } })))),
+            h("div", { class: "axis" }, axis)),
+          h("div", { class: "card col clip" },
+            h("div", { class: "card-head" }, h("span", { class: "card-title" }, "Recent activity"), h("span", { class: "link", style: { fontSize: "12px" }, onClick: () => auditGo("all") }, "View audit log →")),
+            h("div", { class: "grid-row th", style: cols }, h("span", null, "Time"), h("span", null, "Agent"), h("span", null, "Action"), h("span", null, "Path"), h("span", null, "Outcome")),
+            recent.length ? recent.map((r) => h("div", { class: "grid-row tr", style: cols, onClick: () => go("audit", { auditF: { open: r.seq, q: "", agent: "all", action: "all", outcome: "all", server: null } }) },
+              h("span", { class: "cell-mono" }, fmtTime(r.ts)), h("span", { class: "ellip" }, agentName(r.agent_id)), h("span", { style: { color: "var(--text-3)" } }, actionLabel(r.action)),
+              h("span", { class: "cell-mono ellip", style: { paddingRight: "12px" } }, r.path), h("span", null, Outcome(r)))) : h("div", { class: "empty" }, "Nothing has been written yet."))),
+        h("div", { class: "card col clip" },
+          h("div", { class: "card-head", style: { padding: "14px 16px" } }, h("span", { class: "card-title" }, "Agents"), h("span", { class: "muted", style: { fontSize: "12px" } }, "writes · 24h")),
+          agentsByWrites.length ? agentsByWrites.map((a) => h("div", { class: "grid-row tr", style: { gridTemplateColumns: "1fr auto", gap: "10px", padding: "9px 16px" }, onClick: () => openAgent(a.id) },
+            h("div", { class: "col", style: { gap: "1px" } }, h("span", { style: { fontWeight: 500, display: "flex", alignItems: "center", gap: "7px" } }, h("span", { class: "dot sm", style: { background: agentDot(a) } }), a.display_name),
+              h("span", { class: "mono muted", style: { fontSize: "11px" } }, a.kind + " · " + ago(a.last_seen_at))),
+            h("span", { class: "mono", style: { fontSize: "12.5px" } }, a.writes_24h))) : h("div", { class: "empty" }, "No agents yet. Mint a token to add one."))));
+  }
+  function agentDot(a) {
+    if (a.disabled_at || !a.tokens.some((t) => !t.revoked_at)) return "var(--mark)";
+    return a.last_seen_at && Date.now() - Date.parse(a.last_seen_at) < 864e5 ? "var(--ok)" : "#E0B25A";
+  }
+  function Outcome(r) {
+    if (r.outcome === "ok") return h("span", { class: "ok-pill" }, "Stored");
+    const codes = parseCodes(r.reason_codes);
+    return h("span", { class: "bad-pill", title: codes.join(", ") }, codes.length ? "Rejected · " + codes[0].replace(/_/g, " ") : "Rejected");
+  }
+  function parseCodes(raw) { if (!raw) return []; try { const v = JSON.parse(raw); return Array.isArray(v) ? v.map(String) : [String(v)]; } catch (e) { return String(raw).split(",").filter(Boolean); } }
+
+  function HiveCard() {
+    const L = S.layout, hv = S.hive;
+    if (!L) return h("div", { id: "hive-card" });
+    const ql = hv.q.trim().toLowerCase();
+    const keyOf = (it) => (hv.mode === "recency" ? String(it.rec) : hv.mode === "area" ? it.cluster : it.agent);
+    const fillOf = (it) => (hv.mode === "recency" ? RECENCY[it.rec][2] : hv.mode === "area" ? AREAS.find((a) => a[0] === it.cluster)[2] : agentColor(it.agent));
+    const focus = hv.sel || hv.hover;
+    const linked = (a, b) => a === b || (L.adj[a] && L.adj[a].has(b));
+    const conflictIds = new Set(S.overview.conflicts.flatMap((c) => [c.winner_id, c.loser_id]));
+    const stage = h("div", { class: "hive-stage", onMouseLeave: () => { if (hv.hover) { hv.hover = null; renderHive(); } } });
+    for (const e of L.empties) stage.append(h("div", { class: "empty-cell hex", style: { left: "calc(50% + " + e.x.toFixed(1) + "px)", top: "calc(50% + " + e.y.toFixed(1) + "px)" } }));
+    const cell = (id, x, y, fill, ring, inset, opacity, scale, label, labelColor, labelSize, z, title) => h("div", {
+      class: "cell hex", title,
+      style: { left: "calc(50% + " + x.toFixed(1) + "px)", top: "calc(50% + " + y.toFixed(1) + "px)", transform: "translate(-50%,-50%) scale(" + scale + ")", opacity: String(opacity), zIndex: String(z), background: ring },
+      onClick: () => { hv.sel = hv.sel === id ? null : id; renderHive(); },
+      onMouseEnter: () => { if (hv.hover !== id) { hv.hover = id; renderHive(); } },
+    }, h("div", { class: "cell-in hex", style: { inset: inset + "px", background: fill, fontSize: labelSize, color: labelColor } }, label));
+    for (const it of L.items) {
+      const st = it.note.status, sel = hv.sel === it.id, hov = hv.hover === it.id;
+      const match = (!hv.filter || keyOf(it) === hv.filter) && (!ql || (it.title + " " + it.text + " " + it.path + " " + it.agent).toLowerCase().includes(ql));
+      let fill = fillOf(it), ring = fill, inset = 0;
+      if (st === "forgotten") { ring = "#C4C8CF"; fill = "#FFFFFF"; inset = 2; }
+      if (st === "quarantined") { ring = "#C6362A"; fill = "#FDECEA"; inset = 2.5; }
+      if (conflictIds.has(it.id)) { ring = "#B4620A"; inset = 3; }
+      if (sel) { ring = "#1A1D21"; inset = 3; }
+      const opacity = !match ? 0.14 : focus && !linked(focus, it.id) ? 0.4 : 1;
+      stage.append(cell(it.id, it.x, it.y, fill, ring, inset, opacity, hov ? 1.14 : sel ? 1.08 : 1, it.note.sensitivity === "sensitive" && st !== "quarantined" ? "●" : "", "rgba(26,29,33,.38)", "7px", hov || sel ? 3 : 1, it.title));
+    }
+    const youSel = hv.sel === "you";
+    stage.append(cell("you", 0, 0, "#1A1D21", youSel ? "#E8962E" : "#1A1D21", youSel ? 3 : 0, 1, hv.hover === "you" ? 1.14 : 1.1, "You", "#FFFFFF", "11px", 4, "You"));
+    if (focus && L.adj[focus]) {
+      const pos = (id) => (id === "you" ? { x: 0, y: 0 } : L.byId[id]);
+      const s = svg("svg", { width: 1, height: 1, class: "hive-svg" });
+      for (const t of L.adj[focus]) { const a = pos(focus), b = pos(t); if (a && b) s.append(svg("line", { x1: a.x.toFixed(1), y1: a.y.toFixed(1), x2: b.x.toFixed(1), y2: b.y.toFixed(1), stroke: "#1A1D21", "stroke-opacity": "0.45", "stroke-width": "1.25", "stroke-dasharray": "3 3" })); }
+      stage.append(s);
+    }
+    for (const w of L.wedges) stage.append(h("div", { class: "wedge", style: { left: "calc(50% + " + w.x.toFixed(1) + "px)", top: "calc(50% + " + w.y.toFixed(1) + "px)" } }, w.label + " ", h("span", { style: { fontWeight: 400, color: "var(--muted)" } }, w.count)));
+    stage.append(h("div", { class: "hive-legend-key" }, "● sensitive · outlined = forgotten · red = quarantined"));
+    stage.append(h("span", { class: "hive-reset link", onClick: () => { Object.assign(hv, { sel: null, filter: null, q: "" }); render(); } }, "Reset"));
+
+    const legendSrc = hv.mode === "recency" ? RECENCY.map((r, i) => [String(i), r[0], r[2]]) : hv.mode === "area" ? AREAS : [...new Set(L.items.map((i) => i.agent))].sort().map((a) => [a, agentName(a), agentColor(a)]);
+    const legend = legendSrc.map(([k, label, color]) => {
+      const on = hv.filter === k, n = L.items.filter((i) => keyOf(i) === k).length;
+      return h("span", { class: "chip" + (on ? " on" : ""), style: { paddingLeft: "9px" }, onClick: () => { hv.filter = on ? null : k; renderHive(); } }, h("span", { class: "legend-hex hex", style: { background: color } }), label, h("span", { style: { opacity: 0.6 } }, n));
+    });
+    const modeTabs = [["recency", "Recency"], ["area", "Area"], ["agent", "Agent"]].map(([v, l]) => h("span", { class: "seg-item" + (hv.mode === v ? " on" : ""), onClick: () => { hv.mode = v; hv.filter = null; renderHive(); } }, l));
+    const pid = hv.sel || hv.hover;
+    const it = pid && pid !== "you" ? L.byId[pid] : null;
+    const panel = it ? ItemPanel(it, fillOf(it), conflictIds.has(it.id)) : YouPanel(L);
+    return h("div", { id: "hive-card", class: "hive-wrap" },
+      h("div", { class: "col", style: { minWidth: 0, borderRight: "1px solid var(--line-2)" } },
+        h("div", { style: { padding: "14px 18px", display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap", borderBottom: "1px solid var(--line-2)" } },
+          h("div", { class: "col", style: { gap: "2px", marginRight: "auto" } }, h("span", { style: { fontWeight: 600, fontSize: "14px" } }, "The hive"),
+            h("span", { class: "sec", style: { fontSize: "12px" } }, L.total > L.items.length ? "The " + L.items.length + " freshest of " + L.total + " memories. Fresher cells sit closer to you." : "Every fact, journal day and note your agents keep about you. Fresher cells sit closer to you.")),
+          h("input", { class: "input sm", key: "hive-q", style: { width: "180px" }, placeholder: "Find in the hive", value: hv.q, onInput: (e) => { hv.q = e.target.value; render(); } }),
+          h("div", { class: "seg" }, modeTabs)),
+        stage,
+        h("div", { style: { padding: "12px 18px", borderTop: "1px solid var(--line-2)", display: "flex", gap: "6px", flexWrap: "wrap" } }, legend)),
+      h("div", { class: "panel" }, panel));
+  }
+  function renderHive() {
+    const el = document.getElementById("hive-card");
+    if (!el) return;
+    const focusKey = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : null;
+    el.replaceWith(HiveCard());
+    if (focusKey) { const again = root.querySelector('[data-key="' + focusKey + '"]'); if (again) again.focus(); }
+  }
+  function YouPanel(L) {
+    const facts = L.items.filter((i) => i.cluster === "facts" && i.note.owner === "shared" && i.note.status === "active").slice(0, 5);
+    return h("div", { class: "col", style: { gap: "14px" } },
+      h("div", { class: "col", style: { gap: "4px" } }, h("span", { class: "eyebrow" }, "At the center"), h("span", { style: { font: "600 18px var(--sans)" } }, "You"),
+        h("span", { class: "sec", style: { fontSize: "12.5px" } }, plural(L.total, "memory", "memories") + " in the hive. Hover a cell to preview it, click to pin it and see its links.")),
+      h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" } }, AREAS.map(([k, l]) => h("div", { class: "mini-stat" }, h("span", { class: "sec", style: { fontSize: "11.5px" } }, l), h("span", { style: { font: "600 18px var(--sans)" } }, L.items.filter((i) => i.cluster === k).length)))),
+      h("div", { class: "col", style: { gap: "2px" } }, h("span", { style: { fontSize: "12px", fontWeight: 600, marginBottom: "4px" } }, "Freshest facts"),
+        facts.length ? facts.map((f) => h("div", { class: "list-row", style: { gridTemplateColumns: "1fr auto" }, onClick: () => { S.hive.sel = f.id; renderHive(); } },
+          h("span", { style: { lineHeight: 1.4 } }, f.text || f.title), h("span", { class: "muted", style: { fontSize: "11.5px", whiteSpace: "nowrap" } }, f.age < 1 ? "today" : Math.round(f.age) + "d ago")))
+          : h("span", { class: "muted", style: { fontSize: "12px" } }, "No shared facts yet.")));
+  }
+  function ItemPanel(it, color, conflict) {
+    const st = it.note.status;
+    const note = st === "quarantined" ? "Quarantined. Kept in storage, out of search." : st === "forgotten" ? "Forgotten. Agents no longer see it; history is kept." : conflict ? "Open conflict with another agent's write." : "";
+    const links = S.layout.adj[it.id] ? S.layout.adj[it.id].size : 0;
+    const agent = S.agents.find((a) => a.id === it.agent);
+    return h("div", { class: "col", style: { gap: "14px" } },
+      h("div", { style: { display: "flex", alignItems: "center", gap: "8px" } }, h("span", { class: "hex", style: { width: "14px", height: "16px", background: color } }), h("span", { class: "eyebrow" }, it.kind),
+        h("span", { class: "muted", style: { marginLeft: "auto", fontSize: "11px" } }, S.hive.sel === it.id ? "Pinned, click again to unpin" : "Preview, click to pin")),
+      h("div", { class: "col", style: { gap: "6px" } }, h("span", { style: { font: "600 16px var(--sans)", wordBreak: "break-word" } }, it.title), it.text ? h("span", { style: { fontSize: "13.5px", lineHeight: 1.55, color: "var(--text-2)" } }, it.text) : null),
+      note ? h("div", { class: "callout" }, note) : null,
+      h("div", { class: "col", style: { gap: "7px", borderTop: "1px solid var(--line-2)", paddingTop: "12px" } },
+        [["path", it.path], [it.kind === "Fact" ? "observed" : "written", fmtDateTime(it.ts)], ["by", agentName(it.agent)], ["links", String(links)]].map(([k, v]) => h("div", { class: "kv" }, h("span", null, k), h("span", { class: "v" }, v)))),
+      h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
+        st === "active" ? h("button", { class: "btn primary", onClick: () => openNote(it.path) }, "Open in Browse") : null,
+        agent ? h("button", { class: "btn", onClick: () => openAgent(agent.id) }, agent.display_name) : null,
+        canCorrect(it.note) ? [h("button", { class: "btn", onClick: () => correctFact(it.note) }, "Correct"), h("button", { class: "btn good", onClick: () => confirmFact(it.note) }, "Looks right")] : null));
+  }
+
+  // ---- browse ----
+  function Browse() {
+    const b = S.browse;
+    const q = b.q.trim().toLowerCase();
+    const rows = [];
+    if (q) {
+      for (const p of S.paths) if ((p.path + " " + (p.title || "")).toLowerCase().includes(q)) rows.push({ file: p, depth: 0, label: p.path });
+    } else {
+      const treeRoot = { dirs: {}, files: [] };
+      for (const p of S.paths) {
+        const segs = p.path.split("/"); let node = treeRoot;
+        for (let i = 0; i < segs.length - 1; i++) node = node.dirs[segs[i]] = node.dirs[segs[i]] || { dirs: {}, files: [] };
+        node.files.push(p);
+      }
+      const count = (n) => n.files.length + Object.values(n.dirs).reduce((a, d) => a + count(d), 0);
+      const walk = (node, prefix, depth) => {
+        for (const name of Object.keys(node.dirs).sort()) {
+          const key = prefix + name + "/", d = node.dirs[name];
+          const isOpen = b.open[key] != null ? b.open[key] : depth === 0;
+          rows.push({ dir: key, depth, label: name + "/", open: isOpen, count: count(d) });
+          if (isOpen) walk(d, key, depth + 1);
+        }
+        for (const f of node.files.sort((x, y) => x.path.localeCompare(y.path))) rows.push({ file: f, depth, label: f.path.split("/").pop() });
+      };
+      walk(treeRoot, "", 0);
+    }
+    const tree = rows.map((r) => r.dir
+      ? h("div", { class: "tree-row dir", style: { paddingLeft: 10 + r.depth * 14 + "px" }, onClick: () => { b.open[r.dir] = !r.open; render(); } }, h("span", { class: "tree-icon" }, r.open ? "▾" : "▸"), h("span", { class: "ellip", style: { flex: 1 } }, r.label), r.open ? null : h("span", { class: "muted", style: { font: "400 11px var(--sans)" } }, r.count))
+      : h("div", { class: "tree-row" + (b.sel === r.file.path ? " on" : ""), style: { paddingLeft: 10 + r.depth * 14 + "px" }, title: r.file.path, onClick: () => { b.sel = r.file.path; b.note = null; render(); ensureNote(); } },
+        h("span", { class: "tree-icon" }), h("span", { class: "ellip", style: { flex: 1 } }, r.label), h("span", { class: "muted", style: { font: "400 11px var(--sans)" } }, ago(r.file.updated_at))));
+    return h("div", { class: "page" },
+      h("div", { class: "title-block" }, h("h1", null, "Browse"), h("span", { class: "sec" }, S.tech ? S.paths.length + " active notes in " + (S.overview.vault.bucket || "the bucket") + ". Markdown in R2 is the source of truth." : "Everything your agents have written down, organised the way it is stored.")),
+      h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) 300px", gap: "18px", flex: 1, minHeight: 0 } },
+        h("div", { class: "card", style: { display: "grid", gridTemplateColumns: "280px minmax(0,1fr)", overflow: "hidden", minHeight: 0 } },
+          h("div", { class: "col", style: { borderRight: "1px solid var(--line-2)", minHeight: 0 } },
+            h("div", { class: "col", style: { padding: "12px", borderBottom: "1px solid var(--line-2)", gap: "6px" } },
+              h("input", { class: "input", key: "browse-q", placeholder: "Filter by path or title", value: b.q, onInput: (e) => { b.q = e.target.value; render(); } }),
+              q ? h("span", { class: "muted", style: { fontSize: "12px" } }, plural(rows.length, "result")) : null),
+            h("div", { style: { overflow: "auto", flex: 1, padding: "6px" } }, tree.length ? tree : h("div", { class: "empty" }, q ? "No paths match." : "The vault is empty."))),
+          NotePane()),
+        NoteSide()));
+  }
+  function noteRow(path) { return S.overview.notes.find((n) => n.path === path); }
+  function NotePane() {
+    const b = S.browse;
+    if (b.err) return h("div", { class: "empty" }, b.err);
+    if (!b.note) return h("div", { class: "empty" }, b.sel ? "Loading…" : "Pick a note on the left.");
+    const n = b.note, row = noteRow(n.path);
+    const statusColor = n.status === "active" ? "var(--ok)" : n.status === "quarantined" ? "var(--bad)" : "var(--mark)";
+    const protectedPath = n.type === "journal" || n.type === "profile" || /^(AGENTS|README)\.md$/.test(n.path) || n.path.startsWith("inbox/") || /decisions\.md$/.test(n.path);
+    return h("div", { class: "col", style: { minWidth: 0, minHeight: 0 } },
+      h("div", { class: "col", style: { padding: "16px 24px", borderBottom: "1px solid var(--line-2)", gap: "8px" } },
+        h("div", { style: { display: "flex", alignItems: "center", gap: "8px" } },
+          h("span", { class: "mono muted ellip", style: { fontSize: "12px", flex: 1, minWidth: 0 } }, n.path.split("/").join(" / ")),
+          h("button", { class: "btn sm", onClick: () => { try { navigator.clipboard.writeText(n.path); toast("Copied " + n.path); } catch (e) { toast(n.path); } } }, "Copy path"),
+          row && canCorrect(row) ? [h("button", { class: "btn sm good", onClick: () => confirmFact(row) }, "Looks right"), h("button", { class: "btn sm", onClick: () => correctFact(row) }, "Correct")] : null,
+          n.status === "active" && !protectedPath ? h("button", { class: "btn sm danger", onClick: () => askForget(n.path) }, "Forget") : null),
+        h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },
+          h("h2", { class: "ellip", style: { margin: 0, font: "600 19px var(--sans)", letterSpacing: "-.01em", minWidth: 0 } }, n.title || n.path.split("/").pop()),
+          h("span", { class: "pill" }, h("span", { class: "dot sm", style: { background: statusColor } }), n.status),
+          n.sensitivity === "sensitive" ? h("span", { class: "pill sens" }, "Sensitive") : null,
+          h("div", { class: "seg", style: { marginLeft: "auto" } }, h("span", { class: "seg-item" + (b.raw ? "" : " on"), onClick: () => { b.raw = false; render(); } }, "Preview"), h("span", { class: "seg-item" + (b.raw ? " on" : ""), onClick: () => { b.raw = true; render(); } }, "Markdown")))),
+      h("div", { style: { flex: 1, overflow: "auto", padding: "22px 24px" } }, b.raw ? h("pre", { class: "raw" }, n.markdown) : Prose(n.markdown)));
+  }
+  function NoteSide() {
+    const b = S.browse, n = b.note;
+    if (!n) return h("div");
+    const { fm } = splitFrontmatter(n.markdown);
+    const hidden = S.tech ? new Set() : new Set(["vault_id", "vault_idempotency", "vault_idempotency_hash", "vault_outcome", "vault_created_at", "vault_summary"]);
+    const out = linksOf(n.markdown);
+    const row = noteRow(n.path);
+    const back = row ? S.overview.links.filter((l) => l[1] === row.id).map((l) => S.overview.notes.find((x) => x.id === l[0])).filter(Boolean).map((x) => x.path) : [];
+    const versions = b.history ? b.history.versions.slice().reverse() : [];
+    return h("div", { class: "col", style: { gap: "14px", overflow: "auto", minHeight: 0 } },
+      h("div", { class: "card col", style: { padding: "14px 16px", gap: "8px" } }, h("span", { style: { fontWeight: 600, fontSize: "13px", marginBottom: "2px" } }, "Details"),
+        fm.filter(([k]) => !hidden.has(k)).map(([k, v]) => h("div", { class: "kv w92" }, h("span", null, k.replace(/_/g, " ")), h("span", { class: "v" }, v)))),
+      h("div", { class: "card col", style: { padding: "14px 16px", gap: "7px" } }, h("span", { style: { fontWeight: 600, fontSize: "13px", marginBottom: "2px" } }, "Links"),
+        !out.length && !back.length ? h("span", { class: "muted", style: { fontSize: "12px" } }, "No links in or out.") : null,
+        out.map((p) => h("span", { class: "mono link ellip", style: { fontSize: "12px" }, onClick: () => openNote(p) }, "→ " + p)),
+        back.map((p) => h("span", { class: "mono ellip sec", style: { fontSize: "12px", cursor: "pointer" }, onClick: () => openNote(p) }, "← " + p))),
+      h("div", { class: "card col", style: { padding: "14px 16px", gap: "12px" } }, h("span", { style: { fontWeight: 600, fontSize: "13px" } }, "Version history"),
+        versions.length ? versions.map((v, i) => h("div", { class: "hist" },
+          h("span", { class: "hist-dot", style: { borderColor: i === 0 ? "var(--accent)" : "var(--mark)" } }),
+          h("div", { class: "col", style: { gap: "1px", fontSize: "12px" } }, h("span", null, versionTime(v.version_ts)), h("span", { class: "muted" }, agentName(v.writer) + " · " + (v.reason || "write"))),
+          i > 0 ? h("span", { class: "link", style: { fontSize: "12px" }, onClick: () => askRestore(n.path, v) }, "Restore") : null)) : h("span", { class: "muted", style: { fontSize: "12px" } }, "No versions recorded.")));
+  }
+  function versionTime(ts) {
+    const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(ts || "");
+    return m ? fmtDateTime(m[1] + "-" + m[2] + "-" + m[3] + "T" + m[4] + ":" + m[5] + ":" + m[6] + "Z") : ts;
+  }
+
+  // ---- facts ----
+  function canCorrect(n) { return n && n.type === "fact" && n.status === "active" && n.owner === "shared" && Boolean(n.fact_key); }
+  function Facts() {
+    const f = S.facts, ov = S.overview;
+    const all = ov.notes.filter((n) => n.type === "fact" && n.status !== "superseded");
+    const domains = [...new Set(all.map((n) => n.domain || "general"))].sort();
+    const q = f.q.trim().toLowerCase();
+    const rows = all.filter((n) => (f.domain === "all" || (n.domain || "general") === f.domain) && (!q || ((n.fact_key || "") + " " + n.snippet + " " + n.path).toLowerCase().includes(q)))
+      .sort((a, b) => String(b.observed_at || b.updated_at).localeCompare(String(a.observed_at || a.updated_at)));
+    const sel = f.sel ? all.find((n) => n.id === f.sel) : null;
+    const cols = { gridTemplateColumns: "150px minmax(0,1fr) 84px 110px 100px 120px" };
+    const tabs = h("div", { class: "seg lg" },
+      h("span", { class: "seg-item" + (f.tab === "facts" ? " on" : ""), onClick: () => { f.tab = "facts"; render(); } }, "Facts"),
+      h("span", { class: "seg-item" + (f.tab === "profile" ? " on" : ""), onClick: () => { f.tab = "profile"; render(); ensureSummary(); } }, "Profile summary"));
+    const head = h("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "16px" } },
+      h("div", { class: "title-block" }, h("h1", null, "Facts & profile"), h("span", { class: "sec" }, "One file per fact. The newest observed fact stays active.")), tabs);
+    if (f.tab === "profile") {
+      const s = f.summary;
+      return h("div", { class: "page" }, head, h("div", { class: "card col", style: { padding: "24px 28px", maxWidth: "760px", gap: "10px", overflow: "auto" } },
+        h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } }, h("span", { class: "mono muted", style: { fontSize: "12px" } }, "profile/summary.md · rebuilt from shared facts"),
+          h("span", { class: "link", style: { fontSize: "12px" }, onClick: () => openNote("profile/summary.md") }, "Open in Browse →")),
+        !s ? h("span", { class: "muted" }, "Loading…") : s.error ? h("span", { class: "muted" }, s.error) : Prose(s.markdown)));
+    }
+    return h("div", { class: "page" }, head,
+      h("div", { style: { display: "grid", gridTemplateColumns: sel ? "minmax(0,1fr) 360px" : "minmax(0,1fr)", gap: "18px", flex: 1, minHeight: 0 } },
+        h("div", { class: "card col", style: { minHeight: 0, overflow: "hidden" } },
+          h("div", { style: { padding: "12px 16px", borderBottom: "1px solid var(--line-2)", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" } },
+            h("input", { class: "input", key: "fact-q", style: { width: "240px" }, placeholder: "Filter facts", value: f.q, onInput: (e) => { f.q = e.target.value; render(); } }),
+            h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, [["all", "All"]].concat(domains.map((d) => [d, d])).map(([v, l]) => h("span", { class: "chip" + (f.domain === v ? " on" : ""), onClick: () => { f.domain = v; render(); } }, l))),
+            h("span", { class: "muted", style: { marginLeft: "auto", fontSize: "12px" } }, rows.length + " of " + all.length)),
+          h("div", { class: "grid-row th", style: Object.assign({ padding: "8px 16px" }, cols) }, ["Key", "Statement", "Area", "Observed", "Confidence", "Writer"].map((x) => h("span", null, x))),
+          h("div", { style: { overflow: "auto", flex: 1 } }, rows.length ? rows.map((n) => h("div", {
+            class: "grid-row tr" + (f.sel === n.id ? " sel" : ""), style: Object.assign({ padding: "10px 16px", color: n.status === "active" ? "" : "var(--muted)" }, cols),
+            onClick: () => selectFact(n),
+          },
+            h("span", { class: "mono ellip", style: { fontSize: "12px", textDecoration: n.status === "forgotten" ? "line-through" : "" } }, n.fact_key),
+            h("span", { class: "ellip", style: { paddingRight: "12px" } }, n.snippet),
+            h("span", { class: "sec" }, n.domain || "general"),
+            h("span", { class: "cell-mono" }, fmtDate(n.observed_at)),
+            h("span", { style: { display: "flex", alignItems: "center", gap: "8px" } }, h("span", { class: "conf-bar" }, h("span", { class: "conf-fill", style: { width: Math.round((n.confidence || 0) * 100) + "%" } })), h("span", { class: "mono sec", style: { fontSize: "11.5px" } }, n.confidence != null ? n.confidence.toFixed(2) : "—")),
+            h("span", { class: "ellip", style: { color: "var(--text-3)" } }, agentName(n.last_writer)))) : h("div", { class: "empty" }, "No facts match."))),
+        sel ? FactPanel(sel) : null));
+  }
+  async function selectFact(n) {
+    S.facts.sel = n.id; S.facts.history = null; render();
+    try { const hist = await api("/v1/history?path=" + encodeURIComponent(n.path)); if (S.facts.sel === n.id) { S.facts.history = hist; render(); } } catch (err) { fail(err); }
+  }
+  function FactPanel(n) {
+    const versions = S.facts.history ? S.facts.history.versions.slice().reverse() : [];
+    const fm = [["Belongs to", n.owner === "shared" ? "Your profile" : agentName(n.owner) + "'s own"], ["Area", n.domain || "general"], ["Observed", fmtDateTime(n.observed_at)], ["Confidence", n.confidence != null ? n.confidence.toFixed(2) : "—"], ["Written by", agentName(n.last_writer)], ["Last confirmed", n.last_confirmed_at ? fmtDateTime(n.last_confirmed_at) : "never"]];
+    if (S.tech) fm.push(["Path", n.path], ["id", n.id]);
+    return h("div", { class: "card col", style: { overflow: "auto", minHeight: 0 } },
+      h("div", { class: "col", style: { padding: "16px 18px", borderBottom: "1px solid var(--line-2)", gap: "8px" } },
+        h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between" } }, h("span", { class: "mono muted", style: { font: "500 12px var(--mono)" } }, n.fact_key),
+          h("span", { class: "muted", style: { cursor: "pointer", fontSize: "16px", lineHeight: 1, padding: "2px 4px" }, title: "Close", onClick: () => { S.facts.sel = null; render(); } }, "×")),
+        h("span", { style: { font: "500 17px/1.4 var(--sans)" } }, n.snippet),
+        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "pill" }, h("span", { class: "dot sm", style: { background: n.status === "active" ? "var(--ok)" : "var(--mark)" } }), n.status), n.sensitivity === "sensitive" ? h("span", { class: "pill sens" }, "Sensitive") : null)),
+      h("div", { class: "col", style: { padding: "14px 18px", borderBottom: "1px solid var(--line-2)", gap: "8px" } }, fm.map(([k, v]) => h("div", { class: "kv w92" }, h("span", null, k), h("span", { class: "v" }, v)))),
+      h("div", { class: "col", style: { padding: "14px 18px", gap: "10px" } }, h("span", { style: { fontWeight: 600 } }, "History"),
+        !S.facts.history ? h("span", { class: "muted", style: { fontSize: "12px" } }, "Loading…") : versions.map((v, i) => h("div", { class: "hist", style: { gridTemplateColumns: "12px 1fr" } }, h("span", { class: "hist-dot", style: { borderColor: i === 0 ? "var(--accent)" : "var(--mark)" } }),
+          h("div", { class: "col", style: { gap: "1px", fontSize: "12px" } }, h("span", null, versionTime(v.version_ts)), h("span", { class: "muted" }, agentName(v.writer) + " · " + (v.reason || "write"))))),
+        h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "6px" } },
+          canCorrect(n) ? [h("button", { class: "btn primary", onClick: () => correctFact(n) }, "Correct"), h("button", { class: "btn good", onClick: () => confirmFact(n) }, "Looks right")] : null,
+          n.status === "active" ? h("button", { class: "btn", onClick: () => openNote(n.path) }, "Open in Browse") : null)));
+  }
+  async function factBody(n) {
+    const note = await api("/v1/notes?path=" + encodeURIComponent(n.path));
+    const { body } = splitFrontmatter(note.markdown);
+    const statement = body.split(/\n\n\[\[/)[0].trim();
+    return { statement, links: linksOf(body) };
+  }
+  async function confirmFact(n) {
+    try {
+      const { statement, links } = await factBody(n);
+      const res = await api("/v1/facts", { method: "POST", body: { key: n.fact_key, statement, scope: "shared", domain: n.domain, observed_at: new Date().toISOString(), confidence: n.confidence != null ? n.confidence : 0.7, links, idempotency_key: idemKey() } });
+      toast(res.outcome === "deduped" ? "Marked as still right." : "Saved.");
+      await loadAll();
+    } catch (err) { fail(err); }
+  }
+  async function correctFact(n) {
+    try {
+      const { statement, links } = await factBody(n);
+      S.modal = { title: "Correct this fact", body: "Write what is true now. The old value stays in the fact's history.", target: n.fact_key, field: { label: "Statement", value: statement, placeholder: "What is true now", min: 1 }, cta: "Save correction",
+        run: async (text) => {
+          await api("/v1/facts", { method: "POST", body: { key: n.fact_key, statement: text, scope: "shared", domain: n.domain, observed_at: new Date().toISOString(), confidence: 1, links, idempotency_key: idemKey() } });
+          toast("Fact corrected."); await loadAll();
+        } };
+      render();
+    } catch (err) { fail(err); }
+  }
+  function askForget(path) {
+    S.modal = { title: "Forget this note?", body: "Agents stop seeing it right away. Its history is kept, and it can be restored from the version history.", target: path, field: { label: "Why are you forgetting it?", value: "", placeholder: "For the audit log", min: 3 }, cta: "Forget", danger: true,
+      run: async (reason) => { await api("/v1/forget", { method: "POST", body: { path, reason, idempotency_key: idemKey() } }); toast("Forgotten."); S.browse.note = null; await loadAll(); } };
+    render();
+  }
+  function askRestore(path, v) {
+    S.modal = { title: "Restore this version?", body: "The note goes back to how it was at " + versionTime(v.version_ts) + ". The current text stays in history.", target: path, cta: "Restore",
+      run: async () => { await api("/v1/admin/restore", { method: "POST", body: { path, version_ts: v.version_ts } }); toast("Restored."); S.browse.note = null; await loadAll(); } };
+    render();
+  }
+  function askRevoke(agent, t) {
+    S.modal = { title: "Revoke this token?", body: agent.display_name + " loses access with this token at once. This cannot be undone; mint a new token to reconnect it.", target: (t.label || "unlabelled") + " · " + t.id, cta: "Revoke", danger: true,
+      run: async () => { await api("/v1/admin/tokens/revoke", { method: "POST", body: { token_id: t.id } }); toast("Token revoked."); await loadAll(); } };
+    render();
+  }
+
+  // ---- journal ----
+  function journalFiles() {
+    const byDay = {};
+    for (const p of S.paths) {
+      if (!/(^|\/)journal(-sensitive)?\//.test(p.path)) continue;
+      const m = /(\d{4}-\d{2}-\d{2})\.md$/.exec(p.path);
+      if (m) (byDay[m[1]] = byDay[m[1]] || []).push(p.path);
+    }
+    return byDay;
+  }
+  async function ensureJournal() {
+    const byDay = journalFiles();
+    const days = Object.keys(byDay).sort().reverse();
+    const j = S.journal;
+    if (!j.day || !byDay[j.day]) j.day = days[0] || null;
+    if (!j.day) { render(); return; }
+    if (j.entries && j.loadedDay === j.day) return;
+    const day = j.day, files = byDay[day];
+    j.entries = null; j.files = files; render();
+    try {
+      const notes = await Promise.all(files.map((p) => api("/v1/notes?path=" + encodeURIComponent(p)).catch(() => null)));
+      if (S.journal.day !== day) return;
+      const entries = [];
+      notes.forEach((n) => { if (n) for (const b of blocks(n.markdown)) if (b.k === "entry") entries.push(Object.assign({ path: n.path }, b)); });
+      entries.sort((a, b) => a.time.localeCompare(b.time));
+      j.entries = entries; j.loadedDay = day;
+    } catch (err) { fail(err); j.entries = []; }
+    render();
+  }
+  function Journal() {
+    const j = S.journal, byDay = journalFiles();
+    const days = Object.keys(byDay).sort().reverse().slice(0, 60);
+    const entries = j.entries || [];
+    const agents = [...new Set(entries.map((e) => e.agent))].sort();
+    const shown = entries.filter((e) => j.agent === "all" || e.agent === j.agent);
+    const dayLabel = (d) => { try { return new Intl.DateTimeFormat("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" }).format(new Date(d + "T12:00:00Z")); } catch (e) { return d; } };
+    const mainPath = j.day ? (byDay[j.day] || []).find((p) => p.startsWith("journal/")) || (byDay[j.day] || [])[0] : null;
+    return h("div", { class: "page" },
+      h("div", { class: "title-block" }, h("h1", null, "Journal"), h("span", { class: "sec" }, "Append-only. Agents log what they did and learned; nothing here is rewritten.")),
+      days.length ? h("div", { style: { display: "grid", gridTemplateColumns: "240px minmax(0,1fr)", gap: "18px", flex: 1, minHeight: 0 } },
+        h("div", { class: "card col", style: { padding: "8px", gap: "2px", alignSelf: "start", maxHeight: "100%", overflow: "auto" } }, days.map((d) => h("div", { class: "day" + (j.day === d ? " on" : ""), onClick: () => { j.day = d; j.agent = "all"; j.entries = null; ensureJournal(); } },
+          h("span", { style: { fontWeight: 500 } }, dayLabel(d)), h("span", { class: "mono muted", style: { fontSize: "11.5px" } }, d + " · " + plural(byDay[d].length, "file"))))),
+        h("div", { class: "card col", style: { minHeight: 0, overflow: "hidden" } },
+          h("div", { class: "col", style: { padding: "16px 22px", borderBottom: "1px solid var(--line-2)", gap: "12px" } },
+            h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "12px" } }, h("span", { style: { font: "600 17px var(--sans)" } }, j.day ? dayLabel(j.day) : ""),
+              mainPath ? h("span", { class: "mono link", style: { fontSize: "12px" }, onClick: () => openNote(mainPath) }, mainPath) : null),
+            h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, [["all", "All agents"]].concat(agents.map((a) => [a, agentName(a)])).map(([v, l]) => h("span", { class: "chip" + (j.agent === v ? " on" : ""), onClick: () => { j.agent = v; render(); } }, l)))),
+          h("div", { style: { overflow: "auto", flex: 1, padding: "8px 22px 22px" } },
+            !j.entries ? h("div", { class: "empty" }, "Loading…") : shown.length ? shown.map((e) => h("div", { style: { display: "grid", gridTemplateColumns: "70px 1fr", gap: "14px", padding: "16px 0", borderBottom: "1px solid var(--line-3)" } },
+              h("span", { class: "mono muted", style: { fontSize: "12.5px", paddingTop: "1px" } }, e.time),
+              h("div", { class: "col", style: { gap: "5px", maxWidth: "680px" } }, h("span", { style: { fontWeight: 600, fontSize: "14px" } }, e.title), e.text ? h("span", { style: { fontSize: "14px", lineHeight: 1.55, color: "var(--text-2)" } }, e.text) : null,
+                h("span", { class: "mono link", style: { fontSize: "12px", alignSelf: "flex-start" }, onClick: () => { const a = S.agents.find((x) => x.id === e.agent); if (a) openAgent(a.id); else openNote(e.path); } }, e.agent + (S.tech ? " · " + e.path : ""))))) : h("div", { class: "empty" }, "No entries from this agent on this day."))))
+        : h("div", { class: "card empty" }, "No journal entries yet. Agents add them with vault_append_journal."));
+  }
+
+  // ---- agents ----
+  function access(a) {
+    const sc = a.scopes, has = (x) => x && (sc.includes(x) || sc.includes("read:all") && x.startsWith("read:"));
+    const lvl = (edit, read, sum) => (has(edit) ? "Edit" : has(read) ? "Read" : sum && has(sum) ? "Summary" : "None");
+    const cols = [["Shared notes", "shared notes", lvl("write:shared", "read:shared")], ["Own folder", "its own folder", lvl("write:own", "read:own")], ["Inbox", "your inbox", lvl("write:inbox", "read:inbox")]];
+    for (const d of S.overview.vault.sensitive_domains) {
+      const wild = (fam) => sc.includes(fam + ":sensitive/*") ? fam + ":sensitive/*" : fam + ":sensitive/" + d;
+      cols.push([d[0].toUpperCase() + d.slice(1), d, lvl(wild("write"), wild("read"), "read:sensitive:summary/" + d)]);
+    }
+    return cols;
+  }
+  function plainAccess(a) {
+    const cols = access(a);
+    const pick = (l) => cols.filter((c) => c[2] === l).map((c) => c[1]);
+    const j = (xs) => (xs.length ? xs.join(", ") : "nothing");
+    const edit = pick("Edit"), read = pick("Read");
+    const out = [["Can edit", j(edit)], ["Can read", read.length ? read.join(", ") : edit.length ? "nothing else" : "nothing"]];
+    if (pick("Summary").length) out.push(["Summaries", j(pick("Summary")) + ", conclusions only"]);
+    return out;
+  }
+  function agentState(a) { return a.disabled_at ? "Disabled" : a.tokens.some((t) => !t.revoked_at) ? "Active" : "No live token"; }
+  function Agents() {
+    const cols = access({ scopes: [] }).map((c) => c[0]);
+    const grid = { gridTemplateColumns: "180px repeat(" + cols.length + ", minmax(0,1fr))" };
+    return h("div", { class: "page scroll" },
+      h("div", { class: "title-block" }, h("h1", null, "Agents"), h("span", { class: "sec" }, "Each agent writes to its own folder and the shared areas its scopes allow.")),
+      S.agents.length ? h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: "14px" } }, S.agents.map((a) => h("div", { class: "agent-card" + (agentState(a) === "Active" ? "" : " off"), onClick: () => openAgent(a.id) },
+        h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "10px" } },
+          h("div", { class: "col", style: { gap: "2px" } }, h("span", { style: { font: "600 15px var(--sans)" } }, a.display_name), h("span", { class: "mono muted", style: { fontSize: "12px" } }, a.id)),
+          h("span", { class: "pill" }, h("span", { class: "dot sm", style: { background: agentDot(a) } }), agentState(a))),
+        h("span", { class: "sec", style: { fontSize: "12.5px", lineHeight: 1.45, minHeight: "36px" } }, plainAccess(a).map(([k, v]) => k + " " + v).join(". ") + "."),
+        h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", borderTop: "1px solid var(--line-3)", paddingTop: "12px" } },
+          [["Writes 24h", a.writes_24h], ["Rejected 24h", a.rejected_24h], ["Last seen", ago(a.last_seen_at)]].map(([k, v], i) => h("div", { class: "col", style: { gap: "2px" } }, h("span", { class: "muted", style: { fontSize: "11.5px" } }, k), h("span", { style: { font: i < 2 ? "500 15px var(--mono)" : "500 13px var(--sans)", paddingTop: i < 2 ? 0 : "1px" } }, v)))),
+        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "tag" }, a.kind), h("span", { class: "tag" }, plural(a.scopes.length, "scope")))))) : h("div", { class: "card empty" }, "No agents yet. Mint a token with POST /v1/admin/tokens to add one."),
+      S.agents.length ? h("div", { class: "card clip", style: { flexShrink: 0 } },
+        h("div", { class: "col", style: { padding: "14px 18px", borderBottom: "1px solid var(--line-2)", gap: "2px" } }, h("span", { class: "card-title" }, "Who can see what"), h("span", { class: "sec", style: { fontSize: "12px" } }, "What each agent can read or change about you. Summary means it sees conclusions only, never the raw notes.")),
+        h("div", { class: "grid-row th", style: grid }, h("span", null, "Agent"), cols.map((c) => h("span", null, c))),
+        S.agents.map((a) => h("div", { class: "grid-row tr", style: Object.assign({ padding: "10px 18px" }, grid), onClick: () => openAgent(a.id) }, h("span", { style: { fontWeight: 500 } }, a.display_name),
+          access(a).map((c) => h("span", null, h("span", { class: "lvl " + c[2] }, c[2] === "None" ? "—" : c[2])))))) : null);
+  }
+  function AgentDetail() {
+    const a = S.agents.find((x) => x.id === S.agentSel);
+    if (!a) { S.agentSel = null; return Agents(); }
+    const owned = S.overview.notes.filter((n) => n.owner === a.id && n.status === "active").length;
+    const rows = S.audit.filter((r) => r.agent_id === a.id).slice(0, 8);
+    const folder = S.paths.find((p) => p.path.startsWith("bots/" + a.id + "/"));
+    return h("div", { class: "page scroll" },
+      h("span", { class: "sec", style: { fontSize: "12.5px", cursor: "pointer", alignSelf: "flex-start" }, onClick: () => { S.agentSel = null; render(); } }, "← All agents"),
+      h("div", { style: { display: "flex", alignItems: "center", gap: "14px" } },
+        h("div", { class: "col", style: { gap: "4px" } },
+          h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } }, h("h1", null, a.display_name), h("span", { class: "pill" }, h("span", { class: "dot sm", style: { background: agentDot(a) } }), agentState(a))),
+          h("span", { class: "mono muted", style: { fontSize: "12.5px" } }, a.id + " · " + a.kind + " · created " + fmtDate(a.created_at))),
+        h("div", { style: { marginLeft: "auto", display: "flex", gap: "8px" } }, h("button", { class: "btn", onClick: () => (folder ? openNote(folder.path) : toast(a.display_name + " has no files in the vault yet.")) }, "Open folder"))),
+      h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: "14px" } },
+        [["Writes 24h", a.writes_24h], ["Rejected 24h", a.rejected_24h], ["Notes owned", owned], ["Live tokens", a.tokens.filter((t) => !t.revoked_at).length]].map(([k, v]) => h("div", { class: "stat" }, h("span", { class: "sec", style: { fontSize: "12px" } }, k), h("span", { class: "stat-v" }, v)))),
+      h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: "14px", alignItems: "start" } },
+        h("div", { class: "col", style: { gap: "14px" } },
+          h("div", { class: "card col", style: { padding: "16px 18px", gap: "10px" } }, h("span", { class: "card-title" }, "Access"),
+            h("div", { class: "col", style: { gap: "6px" } }, plainAccess(a).map(([k, v]) => h("div", { class: "kv w76" }, h("span", null, k), h("span", null, v)))),
+            S.tech ? h("span", { class: "muted", style: { fontSize: "12px", marginTop: "4px" } }, "Scopes") : null,
+            S.tech ? h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, a.scopes.map((s) => h("span", { class: "tag" + (s.startsWith("write") ? " write" : "") }, s))) : null),
+          h("div", { class: "card col clip" },
+            h("div", { class: "card-head" }, h("span", { class: "card-title" }, "Tokens"), S.tech ? h("span", { class: "muted", style: { fontSize: "12px" } }, "Stored as sha256(pepper ‖ token)") : null),
+            a.tokens.length ? a.tokens.slice().reverse().map((t) => h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: "12px", padding: "12px 18px", borderBottom: "1px solid var(--line-3)", alignItems: "center" } },
+              h("div", { class: "col", style: { gap: "2px" } }, h("span", { style: { fontWeight: 500 } }, t.label || "Unlabelled token"),
+                h("span", { class: "mono muted", style: { fontSize: "11.5px" } }, (S.tech ? t.id + " · " : "") + "created " + fmtDate(t.created_at) + " · used " + ago(t.last_used_at) + (t.expires_at ? " · expires " + fmtDate(t.expires_at) : ""))),
+              t.revoked_at ? h("span", { class: "muted", style: { fontSize: "12px" } }, "Revoked " + fmtDate(t.revoked_at)) : h("button", { class: "btn md danger", onClick: () => askRevoke(a, t) }, "Revoke"))) : h("div", { class: "empty" }, "No tokens."))),
+        h("div", { class: "card col clip" },
+          h("div", { class: "card-head" }, h("span", { class: "card-title" }, "Recent audit"), h("span", { class: "link", style: { fontSize: "12px" }, onClick: () => go("audit", { auditF: { agent: a.id, open: null, q: "", outcome: "all", action: "all", server: null } }) }, "Filter audit log →")),
+          rows.length ? rows.map((r) => h("div", { class: "grid-row tr", style: { gridTemplateColumns: "110px 110px minmax(0,1fr) auto", gap: "8px" }, onClick: () => go("audit", { auditF: { open: r.seq, agent: a.id, q: "", outcome: "all", action: "all", server: null } }) },
+            h("span", { class: "mono sec", style: { fontSize: "11.5px" } }, fmtDateTime(r.ts).slice(5)), h("span", null, actionLabel(r.action)), h("span", { class: "mono sec ellip", style: { fontSize: "11.5px" } }, r.path || ""), Outcome(r))) : h("div", { class: "empty" }, "No recent activity."))));
+  }
+
+  // ---- audit ----
+  async function auditSearch() {
+    const f = S.auditF, q = f.q.trim();
+    if (!q) { f.server = null; render(); return; }
+    const param = /^[0-9A-HJKMNP-TV-Z]{26}$/.test(q) ? "request_id" : "path";
+    try { const res = await api("/v1/admin/audit?limit=200&" + param + "=" + encodeURIComponent(q)); f.server = { q, entries: res.entries }; render(); } catch (err) { fail(err); }
+  }
+  function Audit() {
+    const f = S.auditF;
+    const source = f.server ? f.server.entries : S.audit;
+    const agents = [...new Set(source.map((r) => r.agent_id).filter(Boolean))].sort();
+    const actions = [...new Set(source.map((r) => r.action))].sort();
+    const q = f.q.trim().toLowerCase();
+    const rows = source.filter((r) => (f.agent === "all" || r.agent_id === f.agent) && (f.action === "all" || r.action === f.action) && (f.outcome === "all" || (f.outcome === "ok" ? r.outcome === "ok" : r.outcome !== "ok"))
+      && (f.server || !q || ((r.path || "") + " " + r.request_id).toLowerCase().includes(q)));
+    const cols = { gridTemplateColumns: "64px 150px 130px 100px 130px minmax(0,1fr) 150px", padding: "9px 16px" };
+    return h("div", { class: "page" },
+      h("div", { class: "title-block" }, h("h1", null, "Audit log"), h("span", { class: "sec" }, S.tech ? "Append-only, newest " + S.audit.length + " rows. Rejected values are never stored; hashes are HMAC under AUDIT_KEY." : "Every write, in order. Rejected writes are listed, but what they tried to store is never kept.")),
+      h("div", { class: "card col", style: { minHeight: 0, flex: 1, overflow: "hidden" } },
+        h("div", { style: { padding: "12px 16px", borderBottom: "1px solid var(--line-2)", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" } },
+          h("input", { class: "input", key: "audit-q", style: { width: "240px" }, placeholder: "Path or request id, Enter for all history", value: f.q, onInput: (e) => { f.q = e.target.value; if (!f.q.trim()) f.server = null; render(); }, onKeyDown: (e) => { if (e.key === "Enter") auditSearch(); } }),
+          h("select", { class: "input", value: f.agent, onChange: (e) => { f.agent = e.target.value; render(); } }, [["all", "All agents"]].concat(agents.map((a) => [a, agentName(a)])).map(([v, l]) => h("option", { value: v }, l))),
+          h("select", { class: "input", value: f.action, onChange: (e) => { f.action = e.target.value; render(); } }, [["all", "All actions"]].concat(actions.map((a) => [a, actionLabel(a)])).map(([v, l]) => h("option", { value: v }, l))),
+          h("div", { class: "seg" }, [["all", "All"], ["ok", "Stored"], ["rejected", "Rejected"]].map(([v, l]) => h("span", { class: "seg-item" + (f.outcome === v ? " on" : ""), style: { padding: "5px 11px" }, onClick: () => { f.outcome = v; render(); } }, l))),
+          h("span", { class: "muted", style: { marginLeft: "auto", fontSize: "12px" } }, plural(rows.length, "row") + (f.server ? " for " + f.server.q : ""))),
+        h("div", { class: "grid-row th", style: Object.assign({}, cols, { padding: "8px 16px" }) }, ["Seq", "Time", "Agent", "Via", "Action", "Path", "Outcome"].map((x) => h("span", null, x))),
+        h("div", { style: { overflow: "auto", flex: 1 } }, rows.length ? rows.map((r) => {
+          const open = f.open === r.seq;
+          const detail = [["Request", r.request_id], ["Token", r.token_id], ["Bytes", r.bytes], ["Country", r.ip_country], ["Reasons", parseCodes(r.reason_codes).join(", ")]];
+          if (S.tech) detail.push(["Content hash", r.content_hash], ["Note id", r.note_id], ["Detail", r.detail]);
+          return h("div", { style: { borderBottom: "1px solid var(--line-3)", background: open ? "var(--soft)" : "" } },
+            h("div", { class: "grid-row", style: Object.assign({ cursor: "pointer", fontSize: "12.5px" }, cols), onClick: () => { f.open = open ? null : r.seq; render(); } },
+              h("span", { class: "mono muted", style: { fontSize: "12px" } }, r.seq), h("span", { class: "cell-mono" }, fmtDateTime(r.ts)), h("span", { class: "ellip" }, agentName(r.agent_id)),
+              h("span", { class: "mono muted", style: { fontSize: "11.5px" } }, S.tech ? r.client : VIA[r.client] || r.client), h("span", { style: { color: "var(--text-3)" } }, actionLabel(r.action)),
+              h("span", { class: "cell-mono ellip", style: { paddingRight: "12px" } }, r.path || ""), h("span", null, Outcome(r))),
+            open ? h("div", { style: { padding: "4px 16px 16px 80px", display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "10px 24px" } },
+              detail.filter(([, v]) => v != null && v !== "").map(([k, v]) => h("div", { class: "col", style: { gap: "2px" } }, h("span", { class: "muted", style: { fontSize: "11.5px" } }, k), h("span", { class: "mono", style: { fontSize: "12px", color: "var(--text-2)", wordBreak: "break-all" } }, v))),
+              r.path && S.paths.some((p) => p.path === r.path) ? h("span", { class: "link", style: { fontSize: "12px", alignSelf: "end" }, onClick: () => openNote(r.path) }, "Open note →") : null) : null);
+        }) : h("div", { class: "empty" }, "No rows match these filters."))));
+  }
+
+  // ---- palette and modal ----
+  function openPalette() { S.pal = { q: "", idx: 0 }; render(); const el = root.querySelector(".pal-input"); if (el) el.focus(); }
+  function paletteItems() {
+    const q = S.pal.q.trim().toLowerCase();
+    const items = PAGES.map(([id, label]) => ({ kind: "Page", label, sub: "Go to " + label, run: () => { if (id === "agents") S.agentSel = null; go(id); } }));
+    for (const a of S.agents) items.push({ kind: "Agent", label: a.display_name, sub: a.id, run: () => openAgent(a.id) });
+    for (const n of S.overview ? S.overview.notes : []) if (n.type === "fact" && n.status === "active") items.push({ kind: "Fact", label: n.snippet || n.fact_key, sub: n.path, run: () => { S.facts.tab = "facts"; go("facts"); selectFact(n); } });
+    for (const p of S.paths) items.push({ kind: "Note", label: p.title || p.path.split("/").pop(), sub: p.path, run: () => openNote(p.path) });
+    const hits = q ? items.filter((i) => (i.label + " " + i.sub).toLowerCase().includes(q)) : items.filter((i) => i.kind === "Page");
+    return hits.slice(0, 40);
+  }
+  function Palette() {
+    const items = paletteItems();
+    S.pal.idx = Math.min(S.pal.idx, Math.max(0, items.length - 1));
+    const run = (i) => { const it = items[i]; if (it) { S.pal = null; it.run(); } };
+    return h("div", { class: "overlay", onClick: () => set({ pal: null }) }, h("div", { class: "palette", onClick: (e) => e.stopPropagation() },
+      h("input", { class: "pal-input", key: "pal-q", placeholder: "Search notes, facts, agents, or jump to a page", value: S.pal.q, onInput: (e) => { S.pal.q = e.target.value; S.pal.idx = 0; render(); },
+        onKeyDown: (e) => {
+          if (e.key === "ArrowDown") { e.preventDefault(); S.pal.idx = Math.min(items.length - 1, S.pal.idx + 1); render(); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); S.pal.idx = Math.max(0, S.pal.idx - 1); render(); }
+          else if (e.key === "Enter") { e.preventDefault(); run(S.pal.idx); }
+        } }),
+      h("div", { style: { maxHeight: "420px", overflow: "auto", padding: "6px" } }, items.length ? items.map((it, i) => h("div", { class: "pal-item" + (i === S.pal.idx ? " on" : ""), onClick: () => run(i), onMouseEnter: () => { if (S.pal.idx !== i) { S.pal.idx = i; render(); } } },
+        h("span", { class: "eyebrow", style: { width: "52px", fontWeight: 500, letterSpacing: ".04em" } }, it.kind),
+        h("div", { class: "col", style: { gap: "1px", minWidth: 0, flex: 1 } }, h("span", { class: "ellip", style: { fontWeight: 500 } }, it.label), h("span", { class: "mono muted ellip", style: { fontSize: "11.5px" } }, it.sub)),
+        i === S.pal.idx ? h("span", { class: "mono muted", style: { fontSize: "11px" } }, "↵") : null)) : h("div", { class: "empty" }, "Nothing in the vault matches.")),
+      h("div", { class: "pal-foot" }, h("span", null, "↑↓ move"), h("span", null, "↵ open"), h("span", null, "esc close"))));
+  }
+  function Modal() {
+    const m = S.modal;
+    let area = null;
+    const confirm = async () => {
+      const text = area ? area.value.trim() : "";
+      if (m.field && text.length < m.field.min) { m.err = m.field.min > 1 ? "Write at least " + m.field.min + " characters." : "This can't be empty."; m.field.value = area.value; render(); return; }
+      m.busy = true; if (area) m.field.value = area.value; render();
+      try { await m.run(text); S.modal = null; render(); } catch (err) { m.busy = false; m.err = err.message; render(); }
+    };
+    return h("div", { class: "overlay", style: { zIndex: 60 }, onClick: () => { if (!m.busy) set({ modal: null }); } }, h("div", { class: "modal", role: "dialog", "aria-modal": "true", onClick: (e) => e.stopPropagation() },
+      h("div", { class: "col", style: { gap: "6px" } }, h("span", { style: { font: "600 16px var(--sans)" } }, m.title), h("span", { class: "sec", style: { fontSize: "13px", lineHeight: 1.5 } }, m.body), m.target ? h("span", { class: "target" }, m.target) : null),
+      m.field ? h("div", { class: "col", style: { gap: "6px" } }, h("label", { style: { fontSize: "12px", fontWeight: 500, color: "var(--text-3)" } }, m.field.label),
+        area = h("textarea", { class: "input", key: "modal-field", rows: 3, placeholder: m.field.placeholder, value: m.field.value, maxlength: 2000, style: { borderColor: m.err ? "var(--bad)" : "" } })) : null,
+      m.err ? h("span", { class: "err" }, m.err) : null,
+      h("div", { style: { display: "flex", justifyContent: "flex-end", gap: "8px" } }, h("button", { class: "btn", disabled: m.busy, onClick: () => set({ modal: null }) }, "Cancel"),
+        h("button", { class: "btn " + (m.danger ? "danger" : "primary"), style: m.danger ? { background: "var(--bad)", borderColor: "var(--bad)", color: "#fff" } : null, disabled: m.busy, onClick: confirm }, m.busy ? "Working…" : m.cta))));
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (!S.whoami) return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); if (S.pal) set({ pal: null }); else openPalette(); }
+    else if (e.key === "Escape") { if (S.pal) set({ pal: null }); else if (S.modal && !S.modal.busy) set({ modal: null }); }
+  });
+
+  render();
+  if (S.token) signIn(S.token);
+})();
+</script>
+</body>
+</html>
