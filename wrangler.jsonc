@@ -22,14 +22,18 @@
   ],
   "vars": {
     "VAULT_PREFIX": "vault/",
-    "TZ_DISPLAY": "UTC",
+    "VAULT_TZ": "UTC",
+    "SENSITIVE_DOMAINS": "health,finance",
+    "ORDINARY_DOMAINS": "deals,x",
+    "ENVIRONMENT": "production",
     "RATE_LIMIT_WRITES_PER_MIN": "60",
     "RATE_LIMIT_READS_PER_MIN": "300",
     "E2E_CLEANUP_ENABLED": "",
     "DEPLOY_ENV": "",
     "VAULT_BUCKET": "hiveattic-vault",
     "DB_NAME": "hiveattic-index",
-    "WORKER_NAME": "hiveattic"
+    "WORKER_NAME": "hiveattic",
+    "GIT_SHA": ""
   },
   "triggers": {
     "crons": ["15 7 * * *"]

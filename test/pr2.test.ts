@@ -1,7 +1,7 @@
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { ADMIN, mint, nid, resetVault, rest, testEnv } from "./helpers";
+import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv } from "./helpers";
 
 let shared = "";
 let financeRo = "";
@@ -30,7 +30,7 @@ describe("pr2 review regressions", () => {
     });
     expect(decision.status).toBe(200);
     const before = results((await rest("/v1/search?q=qxfirstentry", shared)).json);
-    expect((await rest("/v1/admin/reindex", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reindex")).job.data?.status).toBe("done");
     const after = results((await rest("/v1/search?q=qxfirstentry", shared)).json);
     expect(after.map((row) => row.path).sort()).toEqual(before.map((row) => row.path).sort());
     const journal = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
@@ -52,10 +52,9 @@ describe("pr2 review regressions", () => {
     const r2 = await (await testEnv().VAULT.get(`vault/${path}`))!.text();
     expect(r2).toContain("qxfirstentry");
     expect(r2).toContain("qxsecondentry");
-    expect(r2).not.toContain("status: quarantined");
   });
 
-  it("B3 an outside put of an unchanged day file stays active, and quarantine snapshots then blocks appends", async () => {
+  it("B3 an outside put of an unchanged day file stays active, and an outside edit is indexed once", async () => {
     await resetVault();
     const appended = await rest("/v1/journal", shared, {
       method: "POST",
@@ -71,44 +70,25 @@ describe("pr2 review regressions", () => {
 
     const notePath = `shared/q-${nid()}.md`;
     await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path: notePath, body: "fine qxq", type: "note" }) });
-    await testEnv().VAULT.put(`vault/${notePath}`, "secret AKIAIOSFODNN7EXAMPLE qxq2\n");
+    await testEnv().VAULT.put(`vault/${notePath}`, "key AKIAIOSFODNN7EXAMPLE qxq2\n");
     expect((await deliver("PutObject", `vault/${notePath}`)).acked).toBe(true);
-    const id = (await testEnv().DB.prepare("SELECT id, status, r2_etag FROM notes WHERE path = ?").bind(notePath).first<{ id: string; status: string; r2_etag: string }>());
-    expect(id?.status).toBe("quarantined");
+    const id = await testEnv().DB.prepare("SELECT id, status, r2_etag, body FROM notes WHERE path = ?").bind(notePath).first<{ id: string; status: string; r2_etag: string; body: string }>();
+    expect(id?.status).toBe("active");
     expect(id?.r2_etag).toBeTruthy();
-    const history = await testEnv().VAULT.list({ prefix: `sys/history/${id?.id}/` });
-    expect(history.objects.length).toBeGreaterThan(0);
-    let sawClean = false;
-    for (const object of history.objects) {
-      const text = await (await testEnv().VAULT.get(object.key))!.text();
-      expect(text).not.toContain("AKIAIOSFODNN7EXAMPLE");
-      if (text.includes("fine qxq")) sawClean = true;
-    }
-    expect(sawClean).toBe(true);
-    const reasons = await testEnv().DB.prepare("SELECT reason FROM note_versions WHERE note_id = ?").bind(id?.id).all<{ reason: string }>();
-    expect((reasons.results ?? []).map((row) => row.reason)).not.toContain("quarantine-r2");
+    expect(id?.body).toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(results((await rest("/v1/search?q=qxq2", shared)).json).some((row) => row.path === notePath)).toBe(true);
     const listed = JSON.stringify((await rest(`/v1/history?id=${id?.id}`, ADMIN)).json);
-    expect(listed).not.toContain("AKIAIOSFODNN7EXAMPLE");
     expect(listed).toContain("fine qxq");
-    const inbox = await rest("/v1/notes?path=inbox/quarantine.md", ADMIN);
-    expect(inbox.json.data?.status).toBe("active");
-    const inboxBody = String(inbox.json.data?.markdown ?? "");
-    expect(inboxBody).not.toContain("AKIAIOSFODNN7EXAMPLE");
-    expect(inboxBody).not.toContain(notePath);
     const versions = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM note_versions WHERE note_id = ?").bind(id?.id).first<{ n: number }>())?.n;
-    const audits = async () =>
-      (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE path = ? AND outcome = 'rejected'").bind(notePath).first<{ n: number }>())?.n;
-    const alerts = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'quarantine_alert'").first<{ n: number }>())?.n;
+    const audits = async () => (await testEnv().DB.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE path = ?").bind(notePath).first<{ n: number }>())?.n;
     const beforeVersions = await versions();
     const beforeAudits = await audits();
-    const beforeAlerts = await alerts();
-    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
-    expect((await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
+    expect((await runJob("/v1/admin/reconcile")).job.data?.status).toBe("done");
     expect(await versions()).toBe(beforeVersions);
     expect(await audits()).toBe(beforeAudits);
-    expect(await alerts()).toBe(beforeAlerts);
-    const blocked = await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path: notePath, body: "later", type: "note" }) });
-    expect(blocked.status).toBe(409);
+    const later = await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path: notePath, body: "later", type: "note", if_match: id?.r2_etag }) });
+    expect(later.status, later.text).toBe(200);
   });
 
   it("journal appends do not snapshot the whole file", async () => {
@@ -171,10 +151,18 @@ describe("pr2 review regressions", () => {
     const marker = `qxgone${nid()}`;
     await rest("/v1/notes", shared, { method: "PUT", body: JSON.stringify({ path, body: marker, type: "note" }) });
     await testEnv().VAULT.delete(`vault/${path}`);
-    const reconciled = await rest("/v1/admin/reconcile", ADMIN, { method: "POST", body: "{}" });
-    expect(reconciled.status).toBe(200);
-    const row = await testEnv().DB.prepare("SELECT status FROM notes WHERE path = ?").bind(path).first<{ status: string }>();
+    const reconciled = await runJob("/v1/admin/reconcile");
+    expect(reconciled.job.data?.status).toBe("done");
+    const row = await testEnv().DB.prepare("SELECT status, body FROM notes WHERE path = ?").bind(path).first<{ status: string; body: string }>();
     expect(row?.status).toBe("forgotten");
+    // M1: the row keeps a stub, not the body the object had. Non-admin readers get 404; the admin gets the stub.
+    expect(row?.body).not.toContain(marker);
+    const read = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, shared);
+    expect(read.status).toBe(404);
+    expect(read.text).not.toContain(marker);
+    const admin = await rest(`/v1/notes?path=${encodeURIComponent(path)}`, ADMIN);
+    expect(admin.json.data?.status).toBe("forgotten");
+    expect(admin.text).not.toContain(marker);
     expect(results((await rest(`/v1/search?q=${marker}`, shared)).json)).toEqual([]);
   });
 

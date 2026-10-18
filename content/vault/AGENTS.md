@@ -2,11 +2,12 @@
 
 1. Read first. Before answering anything about the vault owner, their plans, or prior decisions, call `vault_search` (or read `profile/summary.md`). Prefer vault facts over your own guesses.
 2. Write durable facts in the same turn you learn them: `vault_write_fact` with a stable key and `observed_at`.
-3. Log, don't overwrite. Use `vault_append_journal` for what you did or learned. Never rewrite journals.
+3. Log, don't overwrite. Use `vault_append_journal` for what you did or learned. Never rewrite journals. Send an `idempotency_key` with every write, so a retry never writes twice.
 4. Stay in your lane. Write only to your own folder, shared areas you're scoped for, or `inbox/` proposals. Your own role instructions are yours. Other agents' role cards are theirs.
-5. Never store secrets: no passwords, API keys, tokens, card numbers, bank or brokerage account or routing numbers, or government IDs. The server rejects them. Do not try to work around it.
-6. Personal only. No employer confidential, customer, or internal information. Personal career facts (start date, role title, commute) are fine.
-7. Conclusions, not dumps. Summarize. Link to source paths instead of pasting raw data.
-8. When facts conflict, the newest observed fact wins. Real contradictions are flagged in `inbox/conflicts.md`.
-9. Times are written in the configured TZ_DISPLAY zone. The default display zone is UTC.
-10. If the rules change (`vault_whoami` shows a new AGENTS.md hash), re-read this file.
+5. Never store passwords, API keys or other secrets, tokens, private keys, card numbers, bank or brokerage account numbers, routing numbers, or government IDs. The server does not block them: it stores what you send, indexes it for search, keeps it in history, and shows it to every agent scoped for that path. You are responsible for keeping them out.
+6. Personal only. Never store employer work content: nothing confidential, customer-related, or internal from anyone's job. The server does not block that either. Personal career facts (start date, role title, commute) are fine.
+7. Health, finance, and other personal details go to sensitive folders automatically. Text that reads as health or finance is stored under `sensitive/health/` or `sensitive/finance/` at the same relative path. In a note or fact, text with both, or with phone numbers, street addresses, or dates of birth, is stored under `sensitive/restricted/`. A journal entry with only personal details goes to your own `bots/<you>/journal-sensitive/`, which you can always read. The reply says `rerouted: true` and gives the new path, and you may not be able to read other sensitive folders back.
+8. Conclusions, not dumps. Summarize. Link to source paths instead of pasting raw data.
+9. When facts conflict, the newest observed fact wins. Real contradictions are flagged in `inbox/conflicts.md`.
+10. Times are written in the vault time zone, `VAULT_TZ` (UTC unless the operator sets another). Journal day files follow that zone.
+11. If the rules change (`vault_whoami` shows a new AGENTS.md hash), re-read this file.

@@ -1,4 +1,4 @@
-import { env, SELF } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { clearAuthCache } from "../src/auth";
 
 export const ADMIN = "test-admin-token-not-a-secret";
@@ -6,14 +6,12 @@ export const ADMIN = "test-admin-token-not-a-secret";
 export type Envelope = {
   ok: boolean;
   data?: Record<string, unknown>;
-  error?: { code: string; message: string; reasons: string[] };
+  error?: { code: string; message: string; reasons: string[] } & Record<string, unknown>;
   request_id?: string;
 };
 
-type TestEnv = Env & { ACCOUNT_FIXTURE?: string; BENIGN_CORPUS?: string };
-
-export function testEnv(): TestEnv {
-  return env as TestEnv;
+export function testEnv(): Env {
+  return env as Env;
 }
 
 export function nid(): string {
@@ -35,11 +33,17 @@ export async function rest(path: string, token: string | null, init: RequestInit
   return { status: response.status, json, text, headers: response.headers };
 }
 
-export async function mcp(token: string, name: string, args: Record<string, unknown>): Promise<{ status: number; json: Envelope; text: string }> {
-  const headers = {
+export async function mcp(
+  token: string,
+  name: string,
+  args: Record<string, unknown>,
+  extraHeaders: Record<string, string> = {},
+): Promise<{ status: number; json: Envelope; text: string }> {
+  const headers: Record<string, string> = {
     authorization: `Bearer ${token}`,
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
+    ...extraHeaders,
   };
   const init = await SELF.fetch("https://hiveattic.test/mcp", {
     method: "POST",
@@ -80,7 +84,47 @@ export async function mint(agentId: string, scopes: string[], label: string): Pr
   return response.json.data.token;
 }
 
+export function writerStub(): DurableObjectStub {
+  return testEnv().WRITER.get(testEnv().WRITER.idFromName("main"));
+}
+
+// Drives a writer job to its end. Each alarm runs one page, the way the deployed writer does.
+export async function waitJob(id: string, limitMs = 120_000): Promise<Envelope> {
+  const stop = Date.now() + limitMs;
+  for (;;) {
+    const job = await rest(`/v1/admin/jobs/${id}`, ADMIN);
+    const status = job.json.data?.status;
+    if (status === "done" || status === "failed") return job.json;
+    if (Date.now() > stop) throw new Error(`job ${id} did not finish: ${job.text}`);
+    await runDurableObjectAlarm(writerStub());
+  }
+}
+
+// Starts a job through its route, expects 202, and waits for it.
+export async function runJob(path = "/v1/admin/reindex", body: Record<string, unknown> = {}): Promise<{ started: Envelope; job: Envelope; requestId: string }> {
+  const started = await rest(path, ADMIN, { method: "POST", body: JSON.stringify(body) });
+  if (started.status !== 202 || typeof started.json.data?.job_id !== "string") throw new Error(`job did not start: ${started.status} ${started.text}`);
+  const job = await waitJob(started.json.data.job_id);
+  return { started: started.json, job, requestId: String(started.json.request_id) };
+}
+
+// Finishes any job a previous test left running, so the next start does not get 409 job_running.
+export async function drainJobs(): Promise<void> {
+  for (let i = 0; i < 5000; i++) {
+    const active = await runInWriter((state) =>
+      state.storage.sql.exec<{ id: string }>("SELECT id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").toArray()[0]?.id ?? null,
+    );
+    if (!active) return;
+    await runDurableObjectAlarm(writerStub());
+  }
+}
+
+export async function runInWriter<T>(work: (state: DurableObjectState) => T | Promise<T>): Promise<T> {
+  return runInDurableObject(writerStub(), async (_instance: unknown, state: DurableObjectState) => work(state));
+}
+
 export async function resetVault(): Promise<void> {
+  await drainJobs();
   clearAuthCache();
   const db = testEnv().DB;
   await db.batch([
@@ -134,4 +178,37 @@ function parseRpc(text: string): Envelope & { result?: unknown; error?: { messag
   const last = data.at(-1);
   if (!last) return { ok: false };
   return JSON.parse(last) as Envelope;
+}
+
+// Delivers one R2 event notification to the queue consumer, as the bucket would.
+export async function deliverEvent(action: string, key: string, extra: Record<string, unknown> = {}): Promise<{ acked: boolean; retried: boolean }> {
+  const { createExecutionContext, createMessageBatch, getQueueResult } = await import("cloudflare:test");
+  const worker = (await import("../src/index")).default;
+  const batch = createMessageBatch("hiveattic-index-jobs", [
+    {
+      id: nid(),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { account: "test", action, bucket: "hiveattic-vault", object: { key, size: 1, eTag: "event-etag" }, eventTime: new Date().toISOString(), ...extra },
+    },
+  ]);
+  const ctx = createExecutionContext();
+  await worker.queue(batch, testEnv(), ctx);
+  const result = await getQueueResult(batch, ctx);
+  return { acked: result.ackAll || result.explicitAcks.length > 0, retried: result.retryBatch.retry || result.retryMessages.length > 0 };
+}
+
+export function results(json: Envelope): { id?: string; path?: string }[] {
+  const value = json.data?.results;
+  return Array.isArray(value) ? (value as { id?: string; path?: string }[]) : [];
+}
+
+export function versionsOf(json: Envelope): { version_ts?: string; body?: string | null; reason?: string | null }[] {
+  const value = json.data?.versions;
+  return Array.isArray(value) ? (value as { version_ts?: string; body?: string | null; reason?: string | null }[]) : [];
+}
+
+export async function auditText(): Promise<string> {
+  const rows = await testEnv().DB.prepare("SELECT * FROM audit_log").all();
+  return JSON.stringify(rows.results ?? []);
 }

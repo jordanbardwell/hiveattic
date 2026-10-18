@@ -8,9 +8,28 @@ type Counts = { whoami: number; minted: string[]; revoked: string[]; cleanup: nu
 
 const counts: Counts = { whoami: 0, minted: [], revoked: [], cleanup: 0, bootstrap: 0 };
 
+let requests = 0;
+
+// HiveAttic envelopes carry a request_id. The mock adds one so the harness can record it per check.
 function send(response: ServerResponse, status: number, body: unknown): void {
+  requests += 1;
+  const enveloped = body && typeof body === "object" && "ok" in body ? { ...body, request_id: `mock-${requests}` } : body;
   response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify(body));
+  response.end(JSON.stringify(enveloped));
+}
+
+type Artifact = {
+  target?: string;
+  failed?: number;
+  cases?: { id?: string; status?: string; checks?: { name?: string; responses?: { label?: string; via?: string; status?: number | null; request_id?: string | null }[] }[] }[];
+};
+
+function assertResponsesRecorded(artifact: Artifact, label: string): void {
+  for (const item of artifact.cases ?? []) {
+    for (const entry of item.checks ?? []) {
+      if (!Array.isArray(entry.responses)) throw new Error(`${label}: ${item.id} ${entry.name} has no responses list`);
+    }
+  }
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -55,6 +74,7 @@ const server = createServer(async (request, response) => {
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
 const address = server.address();
 if (!address || typeof address === "string") throw new Error("mock did not bind");
+const mockUrl = `http://127.0.0.1:${address.port}`;
 const root = mkdtempSync(join(tmpdir(), "hiveattic-e2e-"));
 const dryOut = join(root, "results.json");
 const abortOut = join(root, "abort.json");
@@ -64,6 +84,7 @@ function baseEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
     TMPDIR: process.env.TMPDIR ?? "/tmp",
+    SystemRoot: process.env.SystemRoot ?? "",
     LANG: process.env.LANG ?? "C.UTF-8",
     ...extra,
   };
@@ -71,7 +92,7 @@ function baseEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
 
 function runHarness(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; output: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("node", ["--experimental-strip-types", "e2e/run.ts", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, ["--experimental-strip-types", "e2e/run.ts", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       output += chunk.toString();
@@ -90,59 +111,174 @@ function runHarness(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: num
   });
 }
 
+// Each of these must stop before the harness sends a single request, prod-named or not.
+const dryStaging = { HIVEATTIC_STAGING_BASE_URL: mockUrl, HIVEATTIC_STAGING_ADMIN_TOKEN: "dry-admin" };
+const refusals: { label: string; args: string[]; env: Record<string, string>; says: string }[] = [
+  { label: "no target", args: [], env: {}, says: "HIVEATTIC_STAGING_BASE_URL" },
+  { label: "prod base url set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_BASE_URL: mockUrl }, says: "HIVEATTIC_BASE_URL" },
+  { label: "prod admin token set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_ADMIN_TOKEN: "prod-admin" }, says: "HIVEATTIC_ADMIN_TOKEN" },
+  { label: "prod reviewer token set", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_REVIEWER_TOKEN: "prod-reviewer" }, says: "HIVEATTIC_REVIEWER_TOKEN" },
+  {
+    label: "reviewer token that is not the staging one",
+    args: ["--dry-run"],
+    env: { ...dryStaging, HIVEATTIC_STAGING_REVIEWER_TOKEN: "staging-reviewer", HIVEATTIC_REVIEWER_TOKEN: "prod-reviewer" },
+    says: "HIVEATTIC_REVIEWER_TOKEN",
+  },
+  { label: "cloudflare api override", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_CF_API: "https://collector.invalid" }, says: "HIVEATTIC_CF_API" },
+  { label: "read-only prod mode", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_E2E_READ_ONLY: "1" }, says: "HIVEATTIC_E2E_READ_ONLY" },
+  { label: "live run against a local url", args: [], env: dryStaging, says: "hiveattic-staging workers.dev" },
+  { label: "live run against the prod host", args: [], env: { HIVEATTIC_STAGING_BASE_URL: "https://hiveattic.example.workers.dev", HIVEATTIC_STAGING_ADMIN_TOKEN: "x" }, says: "production host" },
+  { label: "live run over http", args: [], env: { HIVEATTIC_STAGING_BASE_URL: "http://hiveattic-staging.example.workers.dev", HIVEATTIC_STAGING_ADMIN_TOKEN: "x" }, says: "https" },
+  { label: "dry run against a remote url", args: ["--dry-run"], env: { HIVEATTIC_STAGING_BASE_URL: "https://hiveattic-staging.example.workers.dev", HIVEATTIC_STAGING_ADMIN_TOKEN: "x" }, says: "local mock" },
+  { label: "prod bucket", args: ["--dry-run"], env: { ...dryStaging, R2_BUCKET: "hiveattic-vault", R2_ACCESS_KEY_ID: "a", R2_SECRET_ACCESS_KEY: "b", R2_ENDPOINT: "https://r2.invalid" }, says: "hiveattic-staging-*" },
+  { label: "prod worker name", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_WORKER_NAME: "hiveattic" }, says: "HIVEATTIC_WORKER_NAME" },
+  { label: "prod dlq", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_DLQ_NAME: "hiveattic-index-dlq" }, says: "HIVEATTIC_DLQ_NAME" },
+  { label: "prod wrangler config", args: ["--dry-run"], env: { ...dryStaging, HIVEATTIC_STAGING_WRANGLER_CONFIG: "wrangler.jsonc" }, says: "HIVEATTIC_STAGING_WRANGLER_CONFIG" },
+];
+
 try {
-  const aborted = await runHarness([], baseEnv({ HIVEATTIC_E2E_OUT: abortOut }));
-  if (aborted.code !== 2) throw new Error(`refused run exited ${aborted.code}, expected 2\n${aborted.output}`);
-  const abortArtifact = JSON.parse(readFileSync(abortOut, "utf8")) as { cases?: { id?: string; status?: string }[] };
-  if (!abortArtifact.cases?.some((item) => item.id === "ABORT" && item.status === "failed")) {
-    throw new Error(`refused run did not write an ABORT artifact\n${aborted.output}`);
+  for (const refusal of refusals) {
+    const before = requests;
+    const refused = await runHarness(refusal.args, baseEnv({ HIVEATTIC_E2E_OUT: abortOut, ...refusal.env }));
+    if (refused.code !== 2) throw new Error(`${refusal.label}: exited ${refused.code}, expected 2\n${refused.output}`);
+    if (!refused.output.includes(refusal.says)) throw new Error(`${refusal.label}: output does not name ${refusal.says}\n${refused.output}`);
+    if (requests !== before) throw new Error(`${refusal.label}: the harness sent ${requests - before} request(s) before refusing`);
+    const abortArtifact = JSON.parse(readFileSync(abortOut, "utf8")) as { cases?: { id?: string; status?: string }[] };
+    if (!abortArtifact.cases?.some((item) => item.id === "ABORT" && item.status === "failed")) {
+      throw new Error(`${refusal.label}: refused run did not write an ABORT artifact\n${refused.output}`);
+    }
   }
 
-  const dry = await runHarness(["--dry-run"], baseEnv({
-    HIVEATTIC_E2E_OUT: dryOut,
-    HIVEATTIC_STAGING_BASE_URL: `http://127.0.0.1:${address.port}`,
-    HIVEATTIC_STAGING_ADMIN_TOKEN: "dry-admin",
-    HIVEATTIC_TAIL_SCRIPT: "console.log('tail-ready'); setInterval(() => {}, 60000)",
-    HIVEATTIC_TAIL_ATTACH_MS: "200",
-    HIVEATTIC_LOG_MODE: "tail",
-  }));
+  const dry = await runHarness(["--dry-run"], baseEnv({ HIVEATTIC_E2E_OUT: dryOut, ...dryStaging }));
   if (dry.code !== 0) throw new Error(`dry-run exited ${dry.code}\n${dry.output}`);
-  const artifact = JSON.parse(readFileSync(dryOut, "utf8")) as {
-    target?: string;
-    failed?: number;
-    cases?: { id?: string; status?: string }[];
-  };
+  const artifact = JSON.parse(readFileSync(dryOut, "utf8")) as Artifact;
   if (artifact.target !== "dry-run" || artifact.failed !== 0) throw new Error(`dry-run artifact was not a clean pass\n${dry.output}`);
   if (!artifact.cases?.some((item) => item.id === "DRY-RUN" && item.status === "passed")) {
     throw new Error(`dry-run did not record setup\n${dry.output}`);
   }
   if (artifact.cases.some((item) => item.id === "ABORT")) throw new Error(`dry-run aborted\n${dry.output}`);
+  assertResponsesRecorded(artifact, "dry-run");
   if (counts.whoami < 1 || counts.bootstrap !== 1) throw new Error(`setup did not reach whoami and bootstrap: ${JSON.stringify(counts)}`);
-  if (counts.minted.length < 6 || counts.revoked.length !== counts.minted.length) {
+  if (counts.minted.length < 8 || counts.revoked.length !== counts.minted.length) {
     throw new Error(`finally did not revoke every minted token: ${JSON.stringify(counts)}`);
   }
   if (counts.cleanup !== 1) throw new Error(`finally did not call cleanup: ${JSON.stringify(counts)}`);
   if (!dry.output.includes("DRY-RUN")) throw new Error(`dry-run summary missing\n${dry.output}`);
+  const stagingDlq = JSON.parse(readFileSync(join(root, "dlq.json"), "utf8")) as { queue?: string; dlq_depth?: number | null };
+  if (stagingDlq.queue !== "hiveattic-staging-index-dlq") throw new Error(`dry-run labeled the wrong DLQ: ${stagingDlq.queue}`);
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-function domainSet(source: string, name: string): Set<string> {
-  const match = new RegExp(`export const ${name} = new Set\\(\\[([^\\]]+)\\]\\)`).exec(source);
-  if (!match?.[1]) throw new Error(`${name} is missing from src/access.ts`);
-  return new Set([...match[1].matchAll(/"([a-z0-9-]+)"/g)].map((item) => item[1]!).filter((item) => item.length > 0));
+// Static checks on the harness, the docs, and the example env.
+const harness = readFileSync("e2e/run.ts", "utf8");
+for (const forbidden of ["secretCase", "financialCase", "employerCase", "wrangler deploy", "HIVEATTIC_BASE_URL ??", "process.env.HIVEATTIC_ADMIN_TOKEN", "/v1/admin/policy", "quarantined"]) {
+  if (harness.includes(forbidden)) throw new Error(`e2e/run.ts still contains ${forbidden}`);
 }
-const accessSource = readFileSync("src/access.ts", "utf8");
-const classified = new Set<string>([...domainSet(accessSource, "SENSITIVE_DOMAINS"), ...domainSet(accessSource, "NON_SENSITIVE_DOMAINS")]);
-if (classified.size < 2) throw new Error("domain classification is empty");
+for (const required of ["logsOmit", "shell: process.platform === \"win32\"", "\"--config\"", "Ask Forge", "JOB_CEILING_MS"]) {
+  if (!harness.includes(required)) throw new Error(`e2e/run.ts is missing ${required}`);
+}
+const example = readFileSync(".e2e.env.example", "utf8");
+if (/^R2_BUCKET=hiveattic-vault\s*$/m.test(example)) throw new Error(".e2e.env.example defaults R2_BUCKET to the production bucket");
+if (/^HIVEATTIC_(BASE_URL|ADMIN_TOKEN|REVIEWER_TOKEN)=/m.test(example)) throw new Error(".e2e.env.example still names a production variable");
+
+// Every wrangler command in the README and the harness names its config file.
+const readme = readFileSync("README.md", "utf8");
+for (const [file, text] of [["README.md", readme], ["e2e/run.ts", harness]] as const) {
+  for (const line of text.split("\n")) {
+    const command = /(?:^|\s|`)(?:pnpm exec )?wrangler (deploy|secret|d1|r2|queues|tail|dev|types)\b/.exec(line);
+    if (command && !line.includes("--config")) throw new Error(`${file}: a wrangler command has no --config: ${line.trim()}`);
+  }
+}
+for (const required of ["wrangler secret put JOURNAL_MAC_KEY", "wrangler secret put AUDIT_KEY", "VAULT_TZ", "GET /v1/search", "202", "413", "/v1/admin/migrations/quarantine-erase", "Idempotency-Key"]) {
+  if (!readme.includes(required)) throw new Error(`README.md does not document ${required}`);
+}
+if (!readFileSync(".dev.vars.example", "utf8").includes("VAULT_TZ")) throw new Error(".dev.vars.example does not document VAULT_TZ");
+
+// The vault rule card is guidance only. Nothing may say the server blocks content.
+const blockClaims = /(?:server|it) (?:rejects|blocks|quarantines|filters out) (?:them|it|content|secrets|writes)|the server rejects them|rejected by the (?:secret|financial|employer) filter|(?:are|is) quarantined/i;
+for (const file of ["AGENTS.md", "content/vault/AGENTS.md", "content/vault/README.md", "README.md"]) {
+  const text = readFileSync(file, "utf8");
+  if (blockClaims.test(text)) throw new Error(`${file} claims the server rejects, blocks, or quarantines content`);
+}
+if (readFileSync("AGENTS.md", "utf8") !== readFileSync("content/vault/AGENTS.md", "utf8")) {
+  throw new Error("AGENTS.md and content/vault/AGENTS.md must be the same rule card");
+}
+for (const file of ["AGENTS.md", "content/vault/AGENTS.md"]) {
+  const text = readFileSync(file, "utf8").toLowerCase();
+  for (const required of ["password", "api key", "card", "account number", "employer", "does not block"]) {
+    if (!text.includes(required)) throw new Error(`${file} does not mention ${required}`);
+  }
+}
+
+// T-20. Every domain the repo names must be classified in the deploy configs, and no config may list
+// a name as both sensitive and ordinary. A few test fixtures name unclassified domains on purpose.
+function jsonc(file: string): { vars?: Record<string, string> } {
+  const text = readFileSync(file, "utf8").replace(/^\s*\/\/.*$/gm, "");
+  return JSON.parse(text) as { vars?: Record<string, string> };
+}
+function names(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+const classified = new Set<string>();
+for (const file of ["wrangler.jsonc", "wrangler.example.jsonc", "wrangler.staging.example.jsonc"]) {
+  const vars = jsonc(file).vars ?? {};
+  const sensitive = names(vars.SENSITIVE_DOMAINS || "health,finance");
+  const ordinary = names(vars.ORDINARY_DOMAINS);
+  const both = sensitive.filter((name) => ordinary.includes(name));
+  if (both.length) throw new Error(`${file} lists ${both.join(", ")} as both sensitive and ordinary`);
+  if ([...sensitive, ...ordinary].includes("restricted")) throw new Error(`${file} uses restricted as a domain name`);
+  for (const name of [...sensitive, ...ordinary]) classified.add(name);
+}
+// Test fixtures that name an unclassified or mixed-case domain on purpose, to prove it fails closed.
+const UNCLASSIFIED_FIXTURES = new Set(["legal", "medical", "Finance", "HEALTH"]);
+const SPECIAL = new Set(["pii", "restricted"]);
+// Case-insensitive: `domains/Finance/` is a different, unclassified name, and is reported.
 const domainPatterns = [
-  /domains\/([a-z0-9-]+)\//g,
-  /(?:read|write):domain\/([a-z0-9-]+)/g,
-  /(?:read|write):sensitive\/([a-z0-9-]+)/g,
-  /read:sensitive:summary\/([a-z0-9-]+)/g,
-  /domain["']?\s*[:=]\s*["']([a-z0-9-]+)["']/g,
+  /domains\/([a-z0-9-]+)\//gi,
+  /sensitive\/([a-z0-9-]+)\//gi,
+  /(?:read|write):domain\/([a-z0-9-]+)/gi,
+  /(?:read|write):sensitive\/([a-z0-9-]+)/gi,
+  /read:sensitive:summary\/([a-z0-9-]+)/gi,
+  /domain["']?\s*[:=]\s*["']([a-z0-9-]+)["']/gi,
 ];
-const skipDir = new Set(["node_modules", ".git", "e2e-results", "dist"]);
+
+// Every domain name the given files mention that is not classified, as "name (file)".
+function unclassifiedDomains(files: { path: string; text: string }[], known: Set<string>): string[] {
+  const missing = new Set<string>();
+  for (const file of files) {
+    const isTest = file.path.replaceAll("\\", "/").startsWith("test/");
+    for (const pattern of domainPatterns) {
+      pattern.lastIndex = 0;
+      for (const match of file.text.matchAll(pattern)) {
+        const name = match[1] ?? "";
+        if (!name || SPECIAL.has(name) || known.has(name)) continue;
+        if (isTest && UNCLASSIFIED_FIXTURES.has(name)) continue;
+        missing.add(`${name} (${file.path})`);
+      }
+    }
+  }
+  return [...missing].sort();
+}
+
+// The check itself must fail on an unclassified or mixed-case name outside the test fixtures, and
+// pass on classified ones (PR #3 review, A5/A6).
+{
+  const known = new Set(["health", "finance", "deals"]);
+  const caught = unclassifiedDomains(
+    [
+      { path: "src/example.ts", text: "const path = `domains/qxunlisted/x.md`; const scope = 'read:domain/qxother';" },
+      { path: "README.md", text: "A note under domains/Finance/x.md." },
+      { path: "wrangler.jsonc", text: '"domain": "qxconfig"' },
+      { path: "test/fixture.test.ts", text: "domains/medical/x.md and domains/Finance/y.md" },
+      { path: "content/ok.md", text: "domains/deals/a.md, sensitive/health/x.md, read:sensitive/pii" },
+    ],
+    known,
+  );
+  const expected = ["Finance (README.md)", "qxconfig (wrangler.jsonc)", "qxother (src/example.ts)", "qxunlisted (src/example.ts)"];
+  if (JSON.stringify(caught) !== JSON.stringify(expected)) throw new Error(`the T-20 domain check does not fail as it should: ${JSON.stringify(caught)}`);
+}
+const skipDir = new Set(["node_modules", ".git", "e2e-results", "dist", ".wrangler"]);
 function sourceFiles(dir: string): string[] {
   const info = statSync(dir);
   if (info.isFile()) return /\.(ts|md|json|txt)$/.test(dir) ? [dir] : [];
@@ -156,20 +292,16 @@ function sourceFiles(dir: string): string[] {
   }
   return found;
 }
-const missing = new Set<string>();
-for (const file of ["src", "e2e", "examples", "policy", "README.md"].flatMap((root) => sourceFiles(root))) {
-  const text = readFileSync(file, "utf8");
-  for (const pattern of domainPatterns) {
-    pattern.lastIndex = 0;
-    for (const match of text.matchAll(pattern)) {
-      const name = match[1] ?? "";
-      if (!name || name === "pii") continue;
-      if (!classified.has(name)) missing.add(`${name} (${file})`);
-    }
-  }
-}
-if (missing.size > 0) {
-  throw new Error(`Unclassified domains:\n${[...missing].sort().join("\n")}`);
+const scanned = [
+  ...["src", "e2e", "test", "scripts", "examples", "content", "README.md", "AGENTS.md"].flatMap((item) => sourceFiles(item)),
+  ...readdirSync(".").filter((name) => /^wrangler.*\.jsonc?$/.test(name)),
+]
+  // This file holds the check's own failing fixtures above.
+  .filter((path) => !path.replaceAll("\\", "/").endsWith("e2e/dry-run.check.ts"))
+  .map((path) => ({ path, text: readFileSync(path, "utf8") }));
+const missing = unclassifiedDomains(scanned, classified);
+if (missing.length > 0) {
+  throw new Error(`Unclassified domains:\n${missing.join("\n")}`);
 }
 
 console.log("e2e dry-run check passed");

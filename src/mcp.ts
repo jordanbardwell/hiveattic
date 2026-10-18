@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { authenticate, countryOf } from "./auth";
 import { ulid } from "./crypto";
-import { VaultError } from "./errors";
+import { errorBody, VaultError } from "./errors";
 import {
   appendJournal,
   currentAgent,
@@ -19,13 +19,17 @@ import {
 } from "./service";
 import { factSchema, forgetSchema, journalSchema, noteSchema, parseInput } from "./schemas";
 
-export function mcpHandler(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const handler = createMcpHandler(() => buildServer(env, request, ctx), { route: "/mcp" });
+// `request` carries the body the HTTP layer already read and counted. `original` is the incoming
+// request, kept for its auth header and edge metadata.
+export function mcpHandler(request: Request, env: Env, ctx: ExecutionContext, original: Request = request): Promise<Response> {
+  const handler = createMcpHandler(() => buildServer(env, original, ctx), { route: "/mcp" });
   return handler(request, env, ctx);
 }
 
 function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServer {
   const server = new McpServer({ name: "hiveattic", version: "0.1.0" });
+  // One /mcp request can carry several tool calls, so the Idempotency-Key header is ignored here.
+  // Only the idempotency_key tool argument counts.
   const session = async (): Promise<Session> => {
     const access = await authenticate(request, env, ctx);
     return { access, requestId: ulid(), client: "mcp", country: countryOf(request) };
@@ -42,7 +46,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
         const vault = err instanceof VaultError ? err : new VaultError("invalid", "Request failed");
         return {
           isError: true,
-          content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: { code: vault.code, message: vault.message, reasons: vault.reasons }, request_id: requestId }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: errorBody(vault), request_id: requestId }) }],
         };
       }
     });
@@ -53,7 +57,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
       return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, data }) }] };
     } catch (err) {
       const vault = err instanceof VaultError ? err : new VaultError("invalid", "Request failed");
-      return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: { code: vault.code, message: vault.message, reasons: vault.reasons } }) }] };
+      return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: errorBody(vault) }) }] };
     }
   });
   tool("vault_read", "Read one vault note by path or id.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) => {
@@ -62,7 +66,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   });
   tool(
     "vault_search",
-    "Keyword search. Hybrid mode is keyword-only until a later milestone.",
+    "Keyword search, the same as GET /v1/search. Hybrid mode is keyword-only until a later milestone.",
     z.object({
       q: z.string().optional(),
       query: z.string().optional(),
@@ -80,15 +84,21 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
         since: typeof args.since === "string" ? args.since : undefined,
       }),
   );
-  tool("vault_list", "List notes under a path prefix.", z.object({ prefix: z.string().optional() }), async (current, args) => list(env, current, typeof args.prefix === "string" ? args.prefix : ""));
+  tool("vault_list", "List notes under a path prefix. Pass the returned cursor to get the next page.", z.object({ prefix: z.string().optional(), cursor: z.string().optional() }), async (current, args) =>
+    list(env, current, typeof args.prefix === "string" ? args.prefix : "", typeof args.cursor === "string" ? args.cursor : ""),
+  );
   tool("vault_history", "List retained versions of a note.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) =>
     history(env, current, typeof args.path === "string" ? args.path : undefined, typeof args.id === "string" ? args.id : undefined),
   );
-  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active.", factSchema, async (current, args) => writeFact(env, current, parseInput(factSchema, args)));
-  tool("vault_append_journal", "Append one journal or decision entry.", journalSchema, async (current, args) => appendJournal(env, current, parseInput(journalSchema, args)));
-  tool("vault_write_note", "Create or replace a note. Existing notes require if_match.", noteSchema, async (current, args) =>
-    writeNote(env, current, parseInput(noteSchema, args), null),
+  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active. Send an idempotency_key so a retry writes once.", factSchema, async (current, args) =>
+    (await writeFact(env, current, parseInput(factSchema, args))).data,
   );
-  tool("vault_forget", "Soft-delete a note. History is kept.", forgetSchema, async (current, args) => forgetNote(env, current, parseInput(forgetSchema, args)));
+  tool("vault_append_journal", "Append one journal or decision entry. Send an idempotency_key so a retry writes once.", journalSchema, async (current, args) =>
+    (await appendJournal(env, current, parseInput(journalSchema, args))).data,
+  );
+  tool("vault_write_note", "Create or replace a note. Existing notes require if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
+    (await writeNote(env, current, parseInput(noteSchema, args), null)).data,
+  );
+  tool("vault_forget", "Soft-delete a note. History is kept for the admin. Send an idempotency_key so a retry writes once.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
   return server;
 }

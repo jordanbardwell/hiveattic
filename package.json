@@ -14,15 +14,14 @@
   "scripts": {
     "test": "node --experimental-strip-types e2e/dry-run.check.ts && vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json && tsc --noEmit -p e2e/tsconfig.json",
+    "cf-typegen": "wrangler types --config wrangler.jsonc",
     "e2e": "node --experimental-strip-types e2e/run.ts",
     "provision": "node --experimental-strip-types scripts/provision-pilot.ts",
     "mint-reviewer": "node --experimental-strip-types scripts/mint-reviewer.ts",
     "hash-token": "node --experimental-strip-types scripts/hash-token.ts",
     "rebuild": "node --experimental-strip-types scripts/rebuild-from-r2.ts",
-    "policy:apply": "node --experimental-strip-types scripts/apply-policy.ts",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev --config wrangler.jsonc"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

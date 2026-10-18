@@ -1,20 +1,70 @@
+import { isSensitiveDomain, RESTRICTED } from "./config";
+
 export function factPath(agentId: string, scope: "own" | "shared", key: string): string {
   return scope === "shared" ? `profile/facts/${key}.md` : `bots/${agentId}/facts/${key}.md`;
 }
 
-export function journalPath(agentId: string, target: "own" | "shared" | "decisions", date: string, sensitive = false): string {
+export function journalPath(agentId: string, target: "own" | "shared" | "decisions", date: string): string {
   if (target === "decisions") return "shared/decisions.md";
   const [year, month] = date.split("-");
   if (target === "shared") return `journal/${year}/${month}/${date}.md`;
-  const folder = sensitive ? "journal-sensitive" : "journal";
-  return `bots/${agentId}/${folder}/${year}/${month}/${date}.md`;
+  return `bots/${agentId}/journal/${year}/${month}/${date}.md`;
+}
+
+// The journal route for PII alone. It is not a domain: it names the writer's own PII day file.
+export const PII_ROUTE = "pii";
+
+// A rerouted journal entry goes to a day file of the writer's, whatever the requested target was:
+// PII alone to bots/<writer>/journal-sensitive/<date>.md, anything else to
+// sensitive/<d>/journal/<writer>/<date>.md (restricted included). Dates are flat, in VAULT_TZ.
+export function sensitiveJournalPath(route: string, agentId: string, date: string): string {
+  if (route === PII_ROUTE) return `bots/${agentId}/journal-sensitive/${date}.md`;
+  return `sensitive/${route}/journal/${agentId}/${date}.md`;
+}
+
+// The bot that owns a bots/<a>/journal-sensitive/ file, or null for any other path.
+export function piiJournalOwner(path: string): string | null {
+  return /^bots\/([^/]+)\/journal-sensitive\//.exec(path)?.[1] ?? null;
+}
+
+export function reroutedPath(domain: string, path: string): string {
+  return `sensitive/${domain}/${path}`;
+}
+
+export function isRestrictedPath(path: string): boolean {
+  return path.startsWith(`sensitive/${RESTRICTED}/`);
+}
+
+// The domain segment of a path under sensitive/, or null for any other path.
+export function sensitiveSegment(path: string): string | null {
+  const match = /^sensitive\/([^/]+)\//.exec(path);
+  return match?.[1] ?? null;
+}
+
+// The path a sensitive/<d>/ file was rerouted from.
+export function innerPath(path: string): string | null {
+  const match = /^sensitive\/[^/]+\/(.+)$/.exec(path);
+  return match?.[1] ?? null;
+}
+
+// Sensitive folders: domains/<sensitive d>/, sensitive/<d>/ (restricted included), and the legacy
+// own PII journal bots/<a>/journal-sensitive/. A write already inside one is never rerouted.
+export function inSensitiveFolder(path: string): boolean {
+  if (path.startsWith("sensitive/")) return true;
+  const domain = /^domains\/([^/]+)\//.exec(path)?.[1];
+  if (domain && isSensitiveDomain(domain)) return true;
+  return /^bots\/[^/]+\/journal-sensitive\//.test(path);
+}
+
+// Files the server writes for every reader. They are never classified or moved.
+export function isServerDocument(path: string): boolean {
+  return path === "AGENTS.md" || path === "README.md" || path === "profile/summary.md" || path === "inbox/conflicts.md";
 }
 
 export function isAppendOnlyPath(path: string): boolean {
   return (
     path === "shared/decisions.md" ||
     path === "inbox/conflicts.md" ||
-    path === "inbox/quarantine.md" ||
     path.startsWith("journal/") ||
     path.includes("/journal/") ||
     path.includes("/journal-sensitive/")
@@ -29,13 +79,27 @@ export function isServerManagedPath(path: string): boolean {
   return path === "profile/summary.md" || isFactPath(path);
 }
 
-export function isGeneratedNote(path: string): boolean {
-  return path === "inbox/quarantine.md" || path === "inbox/conflicts.md" || path === "profile/summary.md";
+// Only the admin token may forget these: append-only journals and decisions, server-written
+// files, and the vault rule card. Appends to a protected day file keep working.
+export function isForgetProtectedPath(path: string): boolean {
+  return (
+    path.startsWith("journal/") ||
+    /^bots\/[^/]+\/journal(?:-sensitive)?\//.test(path) ||
+    /^sensitive\/[^/]+\/journal\//.test(path) ||
+    path === "shared/decisions.md" ||
+    path.startsWith("inbox/") ||
+    path === "profile/summary.md" ||
+    path === "AGENTS.md" ||
+    path === "README.md" ||
+    path.startsWith("sys/")
+  );
 }
 
 export function ownerForPath(path: string): string {
-  const bot = /^bots\/([^/]+)\//.exec(path);
-  return bot?.[1] ?? "shared";
+  const bot = /^(?:sensitive\/[^/]+\/)?bots\/([^/]+)\//.exec(path);
+  if (bot?.[1]) return bot[1];
+  const journal = /^sensitive\/[^/]+\/journal\/([^/]+)\//.exec(path);
+  return journal?.[1] ?? "shared";
 }
 
 export function r2KeyFor(prefix: string, path: string): string {

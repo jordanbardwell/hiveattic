@@ -59,7 +59,8 @@ export async function authenticate(request: Request, env: Env, ctx: ExecutionCon
     agentId: row.agent_id,
     tokenId: row.token_id,
     scopes,
-    admin: scopes.includes("admin"),
+    // Only the admin token is admin. A stored scope list never grants it.
+    admin: false,
   };
   cache.set(tokenHash, { exp: now + AUTH_CACHE_MS, access });
   ctx.waitUntil(
