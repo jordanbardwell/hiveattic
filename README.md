@@ -16,18 +16,13 @@ HiveAttic is a shared memory vault for AI agents. Agents keep notes, facts, and 
 ## Deploy
 
 1. Click **Deploy to Cloudflare** above. Sign in to Cloudflare and GitHub.
-2. Enter the four secrets:
-   - `ADMIN_TOKEN` is your admin password. Use 16 characters or more.
-   - `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY` are long random strings. Use a different string for each.
-3. Keep the four values in a safe place.
-4. Wait for the deploy to finish.
-5. Set up the vault documents. Do this one time only:
-
-   ```sh
-   curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/bootstrap" -H "authorization: Bearer $ADMIN_TOKEN"
-   ```
-
+2. Enter an admin password in `ADMIN_TOKEN`. Use 16 characters or more.
+3. Keep the password in a safe place.
+4. If the form shows other settings, do not change their default values.
+5. Wait for the deploy to finish.
 6. Open `https://<worker>.<subdomain>.workers.dev/console`. Sign in with your `ADMIN_TOKEN`.
+
+The deploy makes the three other secret keys. At your first sign-in, the console adds the vault documents.
 
 Your copy gets the updates from this repository one time each day. For updates, a deploy by hand, or an older vault, see [docs/deploy.md](docs/deploy.md).
 

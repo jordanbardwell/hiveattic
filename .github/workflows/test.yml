@@ -30,7 +30,6 @@ jobs:
       - name: Tracked config holds no resource ids
         run: |
           if grep -q database_id wrangler.jsonc; then echo "wrangler.jsonc must not name a database_id; Deploy to Cloudflare creates the database"; exit 1; fi
-          grep -q '"E2E_CLEANUP_ENABLED": ""' wrangler.jsonc
-          grep -q '"DEPLOY_ENV": ""' wrangler.jsonc
+          if grep -qE '"(E2E_CLEANUP_ENABLED|DEPLOY_ENV)"' wrangler.jsonc; then echo "wrangler.jsonc must not set staging flags"; exit 1; fi
           grep -q '"workers_dev": true' wrangler.jsonc
           if grep -q hiveattic.com wrangler.jsonc; then echo "tracked prod config must not route hiveattic.com"; exit 1; fi
