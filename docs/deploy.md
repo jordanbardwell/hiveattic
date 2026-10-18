@@ -44,6 +44,15 @@ If both are set, `ADMIN_TOKEN` wins. Thus a new `ADMIN_TOKEN` replaces an older 
 
 After that, use this password to sign in as admin and to the console. The old admin token stops working. The deploy script keeps the existing `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`, so the agent tokens and the journal signatures stay valid.
 
+**Connect an existing worker to builds.** Use this procedure for a vault that you did not make with the button.
+
+1. In the Cloudflare dashboard, open the worker. Go to **Settings**, then **Builds**.
+2. Connect the GitHub repository of the vault.
+3. Keep the **Build command** empty.
+4. Set the **Deploy command** to `pnpm run deploy`.
+
+After this step, each push to `main` deploys the worker. Do not use a plain wrangler deploy as the deploy command. It does not make the missing keys and does not apply the D1 migrations.
+
 ## Deploy by hand
 
 Create the resources, add the D1 id, then deploy. These commands are the runbook. They are not run by CI. Every command names its config file: `wrangler.jsonc` here, or your copy of `wrangler.staging.example.jsonc` for staging.
