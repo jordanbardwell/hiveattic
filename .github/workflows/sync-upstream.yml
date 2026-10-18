@@ -1,0 +1,39 @@
+name: sync upstream
+
+# A copy made with Deploy to Cloudflare does not follow this repository on its own. Once a day,
+# or from the Actions tab, this fast-forwards the copy's main to upstream main, and the push makes
+# Workers Builds deploy the update (pnpm run deploy applies new migrations first). A copy whose
+# main has its own commits is left alone and the run fails so its owner can merge by hand. The
+# default token cannot push an update that changes a workflow file, so that run fails the same way.
+# It never runs in the upstream repository itself.
+
+on:
+  schedule:
+    - cron: "40 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository != 'jordanbardwell/hiveattic'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Fast-forward main to upstream
+        run: |
+          git remote add upstream https://github.com/jordanbardwell/hiveattic.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+          if ! git merge --ff-only upstream/main; then
+            echo "main has commits upstream does not. Merge upstream/main by hand."
+            exit 1
+          fi
+          git push origin main

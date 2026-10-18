@@ -4,7 +4,9 @@ HiveAttic is a shared memory vault for agents. Markdown in R2 is the source of t
 
 This repository is the Milestone 1 vault: REST and MCP, bearer tokens and scopes, an append-only audit log, and a queue consumer for R2 object notifications. Semantic search, OAuth, and the cost load test are later milestones.
 
-The `database_id` in `wrangler.jsonc` is a placeholder. No Cloudflare account id, resource id, or secret belongs in git.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jordanbardwell/hiveattic)
+
+`wrangler.jsonc` names resources but no `database_id`, so a deploy creates them. No Cloudflare account id, resource id, or secret belongs in git.
 
 ## Content is not filtered
 
@@ -44,7 +46,7 @@ Sensitive folders are `domains/<sensitive d>/`, `sensitive/<d>/`, and `bots/<a>/
 - `content/vault/` generic `AGENTS.md` and `README.md` seeded into the bucket
 - `test/` acceptance tests named by spec id
 - `e2e/run.ts` live suite against staging
-- `scripts/` token hash, pilot provisioning, reviewer mint, and rebuild
+- `scripts/` deploy, token hash, pilot provisioning, reviewer mint, and rebuild
 
 ## Local setup
 
@@ -89,9 +91,26 @@ pnpm test
 
 CI (`.github/workflows/test.yml`) runs install, typecheck, and the full suite on every push and pull request. It uses no secrets and deploys nothing.
 
-## Deploy
+## Deploy to Cloudflare
 
-Create the resources, replace the placeholder `database_id`, then deploy. These commands are the runbook. They are not run by CI. Every command names its config file: `wrangler.jsonc` here, or your copy of `wrangler.staging.example.jsonc` for staging.
+The button above sets up a new vault in your own Cloudflare account. It copies this repository into your GitHub account, creates the R2 bucket, the D1 database, the Durable Object, and the queues from `wrangler.jsonc`, asks for the four secrets, and deploys with Workers Builds. The repository must be public for the button to read it.
+
+1. Click the button and sign in to Cloudflare and GitHub.
+2. Fill in the secrets. `ADMIN_TOKEN` is your admin password, at least 16 characters; you sign in to the console with it. `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY` are any long random strings, each different. Keep all four somewhere safe.
+3. When the deploy finishes, open `https://<worker>.<subdomain>.workers.dev/console` and sign in with `ADMIN_TOKEN`.
+4. Set up the vault documents once: `curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/bootstrap" -H "authorization: Bearer $ADMIN_TOKEN"`.
+
+Every push to your copy runs `pnpm run deploy` (`scripts/deploy.ts`). It creates the queues if they are missing, applies D1 migrations before the new code goes live, deploys, and adds the R2 event notification that feeds outside edits to the index. If the build token cannot create the notification, the deploy still succeeds and logs the `wrangler r2 bucket notification create ... --config wrangler.jsonc` command to run by hand; API writes are indexed without it.
+
+**Updates.** Your copy does not follow this repository on its own. `.github/workflows/sync-upstream.yml` fast-forwards your `main` to this repository's `main` once a day (or from the Actions tab), and that push deploys the update. If your `main` has its own commits, or an update changes a workflow file, the run fails and you merge `upstream/main` by hand. GitHub pauses scheduled workflows in a repository with no activity for 60 days; re-enable it from the Actions tab.
+
+The worker accepts the admin token either as the plain `ADMIN_TOKEN`, which it hashes with `TOKEN_PEPPER`, or as `ADMIN_TOKEN_HASH`. `ADMIN_TOKEN` wins when both are set, so setting it replaces an older hashed admin token; agent tokens are unaffected.
+
+**An existing vault.** `wrangler.jsonc` lists `ADMIN_TOKEN` as required, and wrangler refuses to deploy a worker that lacks a required secret. Before the first deploy of this config onto a vault set up with `ADMIN_TOKEN_HASH`, set `ADMIN_TOKEN` once (`pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc`, or the worker's Settings, Variables and Secrets in the Cloudflare dashboard). That password is then the admin and console login, and the old admin token stops working.
+
+## Deploy by hand
+
+Create the resources, add the D1 id, then deploy. These commands are the runbook. They are not run by CI. Every command names its config file: `wrangler.jsonc` here, or your copy of `wrangler.staging.example.jsonc` for staging.
 
 ```sh
 pnpm exec wrangler d1 create hiveattic-index --config wrangler.jsonc
@@ -101,24 +120,24 @@ pnpm exec wrangler queues create hiveattic-index-dlq --config wrangler.jsonc
 pnpm exec wrangler r2 bucket notification create hiveattic-vault --event-type object-create --event-type object-delete --prefix vault/ --queue hiveattic-index-jobs --config wrangler.jsonc
 ```
 
-Put the new D1 id into `wrangler.jsonc` at `d1_databases[0].database_id`. Then apply the migrations, set the four required secrets, and deploy:
+Add the new D1 id to `wrangler.jsonc` as `d1_databases[0].database_id` in your working copy only; CI refuses a committed `database_id`. Then apply the migrations, set the four required secrets, and deploy:
 
 ```sh
 pnpm exec wrangler d1 migrations apply hiveattic-index --remote --config wrangler.jsonc
-printf '%s' "$ADMIN_TOKEN" | TOKEN_PEPPER="$TOKEN_PEPPER" pnpm hash-token
 pnpm exec wrangler secret put TOKEN_PEPPER --config wrangler.jsonc
-pnpm exec wrangler secret put ADMIN_TOKEN_HASH --config wrangler.jsonc
+pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc
 pnpm exec wrangler secret put AUDIT_KEY --config wrangler.jsonc
 pnpm exec wrangler secret put JOURNAL_MAC_KEY --config wrangler.jsonc
 pnpm exec wrangler deploy --config wrangler.jsonc --var GIT_SHA:$(git rev-parse HEAD)
 ```
 
-All four secrets are required. A deploy missing one answers every request with 500 `misconfigured` naming it, rather than writing rows it cannot hash or sign.
+All four secrets are required. `ADMIN_TOKEN` is at least 16 characters; a config that lists `ADMIN_TOKEN_HASH` instead (the example configs) takes the hash from `pnpm hash-token`. A deploy missing one answers every request with 500 `misconfigured` naming it, rather than writing rows it cannot hash or sign.
 
 | Secret | Purpose |
 | --- | --- |
 | `TOKEN_PEPPER` | Pepper for bearer-token hashes: the stored value is `sha256(pepper \|\| token)`. Rotating it invalidates every token, the admin token included. |
-| `ADMIN_TOKEN_HASH` | The hash of the admin token, made with `pnpm hash-token`. Only that token is admin. |
+| `ADMIN_TOKEN` | The admin token itself, at least 16 characters; the worker hashes it with the pepper. Only that token is admin. It wins over `ADMIN_TOKEN_HASH`. |
+| `ADMIN_TOKEN_HASH` | The admin token's hash, made with `pnpm hash-token`, for configs that list it instead (the example configs). |
 | `AUDIT_KEY` | Keys the HMAC-SHA256 `content_hash` of the content of every write in the audit log, and of tombstones, so a hash cannot be checked against a guessed text. |
 | `JOURNAL_MAC_KEY` | Signs journal entry markers, including the idempotency marker. Rebuild only restores entries and idempotency rows whose MAC verifies. |
 
@@ -142,7 +161,7 @@ pnpm exec wrangler deploy --config wrangler.staging.jsonc
 
 `--var` overrides that one key for the deploy and leaves the other bindings in place. Secrets are left in place. If the dashboard holds extra plain vars that are absent from the config, add `--keep-vars` to both commands.
 
-Copy `wrangler.example.jsonc` when you create an environment. Leave the tracked `wrangler.jsonc` `database_id` as the placeholder `00000000-0000-0000-0000-000000000001`. Production stays on `workers.dev`: `workers_dev` is true and `wrangler.jsonc` has no routes. Staging is a separate worker, `hiveattic-staging`, with its own D1, R2 bucket, and queue; start from `wrangler.staging.example.jsonc`. Cleanup runs only when `E2E_CLEANUP_ENABLED` is `true`, `DEPLOY_ENV` is `staging`, `VAULT_BUCKET` and `DB_NAME` contain `-staging`, and `WORKER_NAME` contains `staging`. Otherwise `POST /v1/admin/cleanup` returns 404.
+Copy `wrangler.example.jsonc` when you create an environment by hand. The tracked `wrangler.jsonc` names no `database_id`; it is the Deploy to Cloudflare config. Production stays on `workers.dev`: `workers_dev` is true and `wrangler.jsonc` has no routes. Staging is a separate worker, `hiveattic-staging`, with its own D1, R2 bucket, and queue; start from `wrangler.staging.example.jsonc`. Cleanup runs only when `E2E_CLEANUP_ENABLED` is `true`, `DEPLOY_ENV` is `staging`, `VAULT_BUCKET` and `DB_NAME` contain `-staging`, and `WORKER_NAME` contains `staging`. Otherwise `POST /v1/admin/cleanup` returns 404.
 
 Plain vars: `VAULT_PREFIX`, `VAULT_TZ`, `SENSITIVE_DOMAINS`, `ORDINARY_DOMAINS`, `ENVIRONMENT`, `RATE_LIMIT_WRITES_PER_MIN`, `RATE_LIMIT_READS_PER_MIN`, `E2E_CLEANUP_ENABLED`, `DEPLOY_ENV`, `VAULT_BUCKET`, `DB_NAME`, `WORKER_NAME`, `GIT_SHA`. Production is any deploy that is not a verified staging deploy, or one that sets `ENVIRONMENT=production`.
 
@@ -305,7 +324,7 @@ Errors are 400 `invalid`, `unclassified_domain`, `forget_protected_path`, `idemp
 | `DB` | D1 database `hiveattic-index` |
 | `WRITER` | Durable Object class `VaultWriter`, instance name `main` |
 | `INDEX_Q` | Queue `hiveattic-index-jobs`, dead letter `hiveattic-index-dlq` |
-| `TOKEN_PEPPER`, `ADMIN_TOKEN_HASH`, `AUDIT_KEY`, `JOURNAL_MAC_KEY` | Worker secrets |
+| `TOKEN_PEPPER`, `ADMIN_TOKEN_HASH` or `ADMIN_TOKEN`, `AUDIT_KEY`, `JOURNAL_MAC_KEY` | Worker secrets |
 
 The queue consumer receives both agent index jobs and R2 event notifications for `vault/` object create, copy, and delete. `copySource` may be a string or `{ bucket, object }`. A copy is treated as ours only when the bucket matches `VAULT_BUCKET`. An event is skipped only when the object etag equals `notes.r2_etag` and the `vault-id` metadata equals `notes.id`. Each write records an intent in the Durable Object so a crash after the R2 put can be replayed.
 

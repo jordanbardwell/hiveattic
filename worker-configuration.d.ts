@@ -19,7 +19,9 @@ interface __BaseEnv_Env {
 	WORKER_NAME: string;
 	GIT_SHA: string;
 	TOKEN_PEPPER: string;
-	ADMIN_TOKEN_HASH: string;
+	// The admin token: its hash from `pnpm hash-token`, or the plain token, which the worker hashes.
+	ADMIN_TOKEN_HASH?: string;
+	ADMIN_TOKEN?: string;
 	AUDIT_KEY: string;
 	JOURNAL_MAC_KEY: string;
 	// Deprecated alias for VAULT_TZ, read for one release.
@@ -40,7 +42,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "VAULT_PREFIX" | "VAULT_TZ" | "SENSITIVE_DOMAINS" | "ORDINARY_DOMAINS" | "ENVIRONMENT" | "RATE_LIMIT_WRITES_PER_MIN" | "RATE_LIMIT_READS_PER_MIN" | "E2E_CLEANUP_ENABLED" | "DEPLOY_ENV" | "VAULT_BUCKET" | "DB_NAME" | "WORKER_NAME" | "GIT_SHA" | "TOKEN_PEPPER" | "ADMIN_TOKEN_HASH" | "AUDIT_KEY" | "JOURNAL_MAC_KEY">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "VAULT_PREFIX" | "VAULT_TZ" | "SENSITIVE_DOMAINS" | "ORDINARY_DOMAINS" | "ENVIRONMENT" | "RATE_LIMIT_WRITES_PER_MIN" | "RATE_LIMIT_READS_PER_MIN" | "E2E_CLEANUP_ENABLED" | "DEPLOY_ENV" | "VAULT_BUCKET" | "DB_NAME" | "WORKER_NAME" | "GIT_SHA" | "TOKEN_PEPPER" | "ADMIN_TOKEN_HASH" | "ADMIN_TOKEN" | "AUDIT_KEY" | "JOURNAL_MAC_KEY">> {}
 }
 declare module "*.md" {
 	const value: string;

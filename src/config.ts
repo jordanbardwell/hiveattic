@@ -62,14 +62,23 @@ function domainList(raw: string, label: string): Set<string> {
   return new Set(names);
 }
 
-// The four secrets. TOKEN_PEPPER hashes bearer tokens, ADMIN_TOKEN_HASH is the admin token's
-// hash, AUDIT_KEY keys the HMAC of the content of every write in the audit log and tombstones, and
-// JOURNAL_MAC_KEY signs journal entry markers. A deploy missing one answers 500 misconfigured
-// instead of writing audit rows or journal entries it could not hash or sign.
-export const REQUIRED_SECRETS = ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"] as const;
+// The four secrets. TOKEN_PEPPER hashes bearer tokens, ADMIN_TOKEN_HASH (or the plain
+// ADMIN_TOKEN) is the admin token, AUDIT_KEY keys the HMAC of the content of every write in the
+// audit log and tombstones, and JOURNAL_MAC_KEY signs journal entry markers. A deploy missing one
+// answers 500 misconfigured instead of writing audit rows or journal entries it could not hash or
+// sign.
+export const REQUIRED_SECRETS = ["TOKEN_PEPPER", "AUDIT_KEY", "JOURNAL_MAC_KEY"] as const;
+
+// A plain ADMIN_TOKEN is typed by a person, so it has to be long enough not to be guessed.
+export const ADMIN_TOKEN_MIN_LENGTH = 16;
 
 export function requireSecrets(env: Env): void {
-  const missing = REQUIRED_SECRETS.filter((name) => !env[name]?.trim());
+  const missing: string[] = REQUIRED_SECRETS.filter((name) => !env[name]?.trim());
+  const plain = env.ADMIN_TOKEN?.trim() ?? "";
+  if (plain && plain.length < ADMIN_TOKEN_MIN_LENGTH) {
+    throw new VaultError("misconfigured", `ADMIN_TOKEN must be at least ${ADMIN_TOKEN_MIN_LENGTH} characters`, ["ADMIN_TOKEN"]);
+  }
+  if (!plain && !env.ADMIN_TOKEN_HASH?.trim()) missing.push("ADMIN_TOKEN");
   if (missing.length) throw new VaultError("misconfigured", "A required secret is not set", missing);
 }
 
