@@ -22,6 +22,21 @@ type TokenRow = {
   disabled_at: string | null;
 };
 
+// The admin token is set either as ADMIN_TOKEN_HASH, made with `pnpm hash-token`, or as the
+// plain ADMIN_TOKEN, which the Deploy to Cloudflare form asks for and the worker hashes here with
+// the same pepper. ADMIN_TOKEN_HASH wins when both are set.
+let adminMemo: { key: string; hash: string } | null = null;
+
+async function adminTokenHash(env: Env): Promise<string | null> {
+  const stored = env.ADMIN_TOKEN_HASH?.trim();
+  if (stored) return stored;
+  const token = env.ADMIN_TOKEN?.trim();
+  if (!token || !env.TOKEN_PEPPER) return null;
+  const key = `${env.TOKEN_PEPPER}\u0000${token}`;
+  if (adminMemo?.key !== key) adminMemo = { key, hash: await hashToken(env.TOKEN_PEPPER, token) };
+  return adminMemo.hash;
+}
+
 export async function authenticate(request: Request, env: Env, ctx: ExecutionContext): Promise<Access> {
   const header = request.headers.get("authorization") ?? "";
   const match = /^Bearer\s+(\S+)$/i.exec(header);
@@ -32,7 +47,8 @@ export async function authenticate(request: Request, env: Env, ctx: ExecutionCon
   const cached = cache.get(tokenHash);
   if (cached && cached.exp > now) return cached.access;
 
-  if (env.ADMIN_TOKEN_HASH && timingSafeEqual(tokenHash, env.ADMIN_TOKEN_HASH)) {
+  const adminHash = await adminTokenHash(env);
+  if (adminHash && timingSafeEqual(tokenHash, adminHash)) {
     const access: Access = { agentId: "owner", tokenId: "secret-admin", scopes: ["admin"], admin: true };
     cache.set(tokenHash, { exp: now + AUTH_CACHE_MS, access });
     return access;

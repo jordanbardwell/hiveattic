@@ -39,7 +39,7 @@
     "crons": ["15 7 * * *"]
   },
   "secrets": {
-    "required": ["TOKEN_PEPPER", "ADMIN_TOKEN_HASH", "AUDIT_KEY", "JOURNAL_MAC_KEY"]
+    "required": ["TOKEN_PEPPER", "ADMIN_TOKEN", "AUDIT_KEY", "JOURNAL_MAC_KEY"]
   },
   "r2_buckets": [
     {
@@ -51,7 +51,6 @@
     {
       "binding": "DB",
       "database_name": "hiveattic-index",
-      "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "migrations"
     }
   ],

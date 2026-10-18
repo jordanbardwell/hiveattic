@@ -27,9 +27,9 @@ jobs:
         run: node --experimental-strip-types e2e/dry-run.check.ts
       - name: Test suite
         run: pnpm exec vitest run
-      - name: Tracked config stays a placeholder
+      - name: Tracked config holds no resource ids
         run: |
-          grep -q '00000000-0000-0000-0000-000000000001' wrangler.jsonc
+          if grep -q database_id wrangler.jsonc; then echo "wrangler.jsonc must not name a database_id; Deploy to Cloudflare creates the database"; exit 1; fi
           grep -q '"E2E_CLEANUP_ENABLED": ""' wrangler.jsonc
           grep -q '"DEPLOY_ENV": ""' wrangler.jsonc
           grep -q '"workers_dev": true' wrangler.jsonc
