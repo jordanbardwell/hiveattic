@@ -1,4 +1,4 @@
-import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
+import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, RESERVED_AGENT_IDS, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
 import { clearAuthCache } from "./auth";
 import { classifyText, frontmatterText, journalRouteFor, routeFor } from "./classify";
 import { CONTENT_LIMIT_BYTES, domainConfig, isOrdinaryDomain, isSensitiveDomain, stagingResources, utf8Length, vaultTimeZone } from "./config";
@@ -23,25 +23,6 @@ export type Session = {
 export type Reply = { status: number; data: Record<string, unknown> };
 
 const WRITE_TOOLS = new Set(["vault_write_fact", "vault_append_journal", "vault_write_note", "vault_forget"]);
-
-// Agent ids the server uses for itself or for system actors. A token cannot be minted for them.
-export const RESERVED_AGENT_IDS = new Set([
-  "admin",
-  "owner",
-  "operator",
-  "system",
-  "sys",
-  "shared",
-  "external",
-  "replay",
-  "rebuild",
-  "reconcile",
-  "indexer",
-  "migration",
-  "hiveattic",
-  "restricted",
-  "sensitive",
-]);
 
 const REROUTE_ACTIONS = new Set(["reroute", "journal_reroute", "reroute_move", "reroute_tombstone"]);
 

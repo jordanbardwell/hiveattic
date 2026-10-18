@@ -73,7 +73,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
       const access = await authenticate(request, env, ctx);
       const parsed = parseLoose(raw);
       assertMcpContent(parsed);
-      await enforceRateLimit(env, access.tokenId, mcpRateKind(request.method, parsed));
+      const rate = mcpRateCost(request.method, parsed);
+      await enforceRateLimit(env, access.tokenId, rate.kind, rate.cost);
       const forwarded = new Request(request.url, { method: request.method, headers: request.headers, body: raw && raw.length ? raw : undefined });
       return mcp(forwarded, env, ctx, request);
     }
@@ -244,12 +245,14 @@ function assertMcpContent(parsed: unknown): void {
   }
 }
 
-function mcpRateKind(method: string, parsed: unknown): "read" | "write" {
-  if (method !== "POST") return "read";
-  for (const message of rpcMessages(parsed)) {
-    if (message.method === "tools/call" && toolRateKind(message.params?.name) === "write") return "write";
-  }
-  return "read";
+// A JSON-RPC batch runs every call it holds, so it costs one write unit per write call, or one read
+// unit per message when it holds no writes. Counting the request once let a batch skip the limit.
+function mcpRateCost(method: string, parsed: unknown): { kind: "read" | "write"; cost: number } {
+  if (method !== "POST") return { kind: "read", cost: 1 };
+  const messages = rpcMessages(parsed);
+  const writes = messages.filter((message) => message.method === "tools/call" && toolRateKind(message.params?.name) === "write").length;
+  if (writes > 0) return { kind: "write", cost: writes };
+  return { kind: "read", cost: Math.max(1, messages.length) };
 }
 
 function splitList(value: string | null): string[] | undefined {
