@@ -12,12 +12,13 @@ interface __BaseEnv_Env {
 	ENVIRONMENT: string;
 	RATE_LIMIT_WRITES_PER_MIN: "60";
 	RATE_LIMIT_READS_PER_MIN: "300";
-	E2E_CLEANUP_ENABLED: string;
-	DEPLOY_ENV: string;
+	// Staging-only flags and the build's commit; unset in the Deploy to Cloudflare config.
+	E2E_CLEANUP_ENABLED?: string;
+	DEPLOY_ENV?: string;
 	VAULT_BUCKET: string;
 	DB_NAME: string;
 	WORKER_NAME: string;
-	GIT_SHA: string;
+	GIT_SHA?: string;
 	TOKEN_PEPPER: string;
 	// The admin token: its hash from `pnpm hash-token`, or the plain token, which the worker hashes.
 	ADMIN_TOKEN_HASH?: string;

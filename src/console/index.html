@@ -339,6 +339,10 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
       writeStore(sessionStorage, TOKEN_KEY, S.token);
       S.whoami = who; S.gateBusy = false;
       await loadAll();
+      // A vault deployed with the button has no AGENTS.md yet. Bootstrap only writes missing files.
+      if (!S.loadErr && !S.paths.some((p) => p.path === "AGENTS.md")) {
+        try { await api("/v1/admin/bootstrap", { method: "POST", body: {} }); await loadAll(); } catch (err) { fail(err); }
+      }
     } catch (err) {
       if (err.code !== "unauthorized") { S.token = ""; S.gateErr = err.message; }
       S.gateBusy = false; render();

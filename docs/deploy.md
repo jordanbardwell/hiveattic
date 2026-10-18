@@ -6,20 +6,43 @@ How to deploy, update, and configure a vault.
 
 `wrangler.jsonc` names resources but no `database_id`, so a deploy creates them. No Cloudflare account id, resource id, or secret belongs in git.
 
-The Deploy to Cloudflare button in the [README](../README.md) sets up a new vault in your own Cloudflare account. It copies this repository into your GitHub account, creates the R2 bucket, the D1 database, the Durable Object, and the queues from `wrangler.jsonc`, asks for the four secrets, and deploys with Workers Builds. The repository must be public for the button to read it.
+The Deploy to Cloudflare button in the [README](../README.md) sets up a new vault in your Cloudflare account. The button does these steps:
 
-1. Click the button and sign in to Cloudflare and GitHub.
-2. Fill in the secrets. `ADMIN_TOKEN` is your admin password, at least 16 characters; you sign in to the console with it. `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY` are any long random strings, each different. Keep all four somewhere safe.
-3. When the deploy finishes, open `https://<worker>.<subdomain>.workers.dev/console` and sign in with `ADMIN_TOKEN`.
-4. Set up the vault documents once: `curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/bootstrap" -H "authorization: Bearer $ADMIN_TOKEN"`.
+- It copies this repository into your GitHub account.
+- It creates the R2 bucket, the D1 database, the Durable Object, and the queues from `wrangler.jsonc`.
+- It asks for one secret, `ADMIN_TOKEN`.
+- It deploys the worker with Workers Builds.
+
+The button can read only a public repository.
+
+1. Click the button. Sign in to Cloudflare and GitHub.
+2. Enter your admin password in `ADMIN_TOKEN`. Use 16 characters or more.
+3. Keep the password in a safe place.
+4. If the form shows other settings, do not change their default values.
+5. Wait for the deploy to finish.
+6. Open `https://<worker>.<subdomain>.workers.dev/console`. Sign in with `ADMIN_TOKEN`.
+
+The deploy script makes `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`. Each key is a random 32-byte value. The script sets only the keys that the worker does not have. It never changes a key that is set. You do not need to know these keys.
+
+At the first admin sign-in, the console adds the vault documents (`POST /v1/admin/bootstrap`). Bootstrap writes only the files that are missing.
 
 Every push to your copy runs `pnpm run deploy` (`scripts/deploy.ts`). It creates the queues if they are missing, applies D1 migrations before the new code goes live, deploys, and adds the R2 event notification that feeds outside edits to the index. If the build token cannot create the notification, the deploy still succeeds and logs the `wrangler r2 bucket notification create ... --config wrangler.jsonc` command to run by hand; API writes are indexed without it.
 
 **Updates.** Your copy does not follow this repository on its own. `.github/workflows/sync-upstream.yml` fast-forwards your `main` to this repository's `main` once a day (or from the Actions tab), and that push deploys the update. If your `main` has its own commits, or an update changes a workflow file, the run fails and you merge `upstream/main` by hand. GitHub pauses scheduled workflows in a repository with no activity for 60 days; re-enable it from the Actions tab.
 
-The worker accepts the admin token either as the plain `ADMIN_TOKEN`, which it hashes with `TOKEN_PEPPER`, or as `ADMIN_TOKEN_HASH`. `ADMIN_TOKEN` wins when both are set, so setting it replaces an older hashed admin token; agent tokens are unaffected.
+The worker accepts the admin token in two forms:
 
-**An existing vault.** `wrangler.jsonc` lists `ADMIN_TOKEN` as required, and wrangler refuses to deploy a worker that lacks a required secret. Before the first deploy of this config onto a vault set up with `ADMIN_TOKEN_HASH`, set `ADMIN_TOKEN` once (`pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc`, or the worker's Settings, Variables and Secrets in the Cloudflare dashboard). That password is then the admin and console login, and the old admin token stops working.
+- `ADMIN_TOKEN` is the plain password. The worker hashes it with `TOKEN_PEPPER`.
+- `ADMIN_TOKEN_HASH` is the hash of the password.
+
+If both are set, `ADMIN_TOKEN` wins. Thus a new `ADMIN_TOKEN` replaces an older hashed admin token. Agent tokens do not change.
+
+**An existing vault.** `wrangler.jsonc` lists `ADMIN_TOKEN` as required. Wrangler does not deploy a worker that does not have a required secret. A vault set up with `ADMIN_TOKEN_HASH` needs `ADMIN_TOKEN` before its first deploy of this config. Set it one time with one of these:
+
+- `pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc`
+- In the Cloudflare dashboard, open the worker. Go to **Settings**, then **Variables and Secrets**.
+
+After that, use this password to sign in as admin and to the console. The old admin token stops working. The deploy script keeps the existing `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`, so the agent tokens and the journal signatures stay valid.
 
 ## Deploy by hand
 

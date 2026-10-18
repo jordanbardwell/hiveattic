@@ -28,15 +28,6 @@
     "bindings": {
       "ADMIN_TOKEN": {
         "description": "Your admin password, at least 16 characters. You sign in to /console with it. Keep it somewhere safe."
-      },
-      "TOKEN_PEPPER": {
-        "description": "Any long random text (32+ characters). Changing it later signs out every token."
-      },
-      "AUDIT_KEY": {
-        "description": "Any long random text (32+ characters), different from the others."
-      },
-      "JOURNAL_MAC_KEY": {
-        "description": "Any long random text (32+ characters), different from the others."
       }
     }
   },
