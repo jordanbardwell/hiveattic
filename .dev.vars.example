@@ -1,5 +1,5 @@
 TOKEN_PEPPER=replace-with-a-long-random-string
-ADMIN_TOKEN_HASH=replace-with-the-sha256-hex-from-pnpm-hash-token
+ADMIN_TOKEN=replace-with-an-admin-password-of-16-characters-or-more
 AUDIT_KEY=replace-with-another-long-random-string
 JOURNAL_MAC_KEY=replace-with-a-different-long-random-string
 RATE_LIMIT_WRITES_PER_MIN=60

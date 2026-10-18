@@ -21,7 +21,7 @@
     "mint-reviewer": "node --experimental-strip-types scripts/mint-reviewer.ts",
     "hash-token": "node --experimental-strip-types scripts/hash-token.ts",
     "rebuild": "node --experimental-strip-types scripts/rebuild-from-r2.ts",
-    "dev": "wrangler dev --config wrangler.jsonc",
+    "dev": "node --experimental-strip-types scripts/dev.ts",
     "deploy": "node --experimental-strip-types scripts/deploy.ts"
   },
   "cloudflare": {

@@ -205,6 +205,8 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
   const RECENCY = [["Today", 1, "#E08A1E"], ["Last 3 days", 3, "#EDA94F"], ["This week", 7, "#F4C987"], ["Older", Infinity, "#F6E0BA"]];
   const AREAS = [["facts", "Facts", "oklch(0.74 0.13 70)"], ["journal", "Journal", "oklch(0.74 0.13 140)"], ["agents", "Agent notes", "oklch(0.74 0.13 250)"], ["shared", "Shared & rules", "oklch(0.74 0.13 320)"]];
   const HUES = [70, 150, 25, 250, 200, 300, 110, 340, 180, 45];
+  // A console-made agent reads the whole vault and writes its own folder and the shared areas.
+  const AGENT_SCOPES = ["read:all", "read:own", "write:own", "write:shared"];
   const VIA = { mcp: "Agent (MCP)", rest: "Agent (API)", r2: "Edited by hand", cron: "Scheduled", queue: "Index" };
   const ACTIONS = {
     write_fact: "Wrote fact", append_journal: "Journal entry", write_note: "Wrote note", forget: "Forgot", restore: "Restored", purge: "Purged",
@@ -954,6 +956,40 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
       run: async () => { await api("/v1/admin/restore", { method: "POST", body: { path, version_ts: v.version_ts } }); toast("Restored."); S.browse.note = null; await loadAll(); } };
     render();
   }
+  function agentIdOf(name) { return name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64); }
+  function askNewAgent() {
+    S.modal = { title: "New agent", body: "The agent gets a token that reads the whole vault and writes to its own folder and the shared areas.", field: { label: "Agent name", value: "", placeholder: "For example muse", min: 1, line: true }, cta: "Make token",
+      run: async (name) => {
+        const agentId = agentIdOf(name);
+        if (!agentId) throw new Error("Use letters or numbers in the name.");
+        if (S.agents.some((a) => a.id === agentId)) throw new Error("An agent named " + agentId + " exists. Open it and make a new token there.");
+        await mintFor(agentId, name);
+      } };
+    render();
+  }
+  function askNewToken(agent) {
+    S.modal = { title: "New token for " + agent.display_name + "?", body: "The new token reads the whole vault and writes to " + agent.display_name + "'s folder and the shared areas. Old tokens keep working until you revoke them.", target: agent.id, cta: "Make token",
+      run: async () => { await mintFor(agent.id, agent.display_name); } };
+    render();
+  }
+  async function mintFor(agentId, name) {
+    const res = await api("/v1/admin/tokens", { method: "POST", body: { agent_id: agentId, display_name: name.slice(0, 80), scopes: AGENT_SCOPES, label: "console " + fmtDate(new Date().toISOString()) } });
+    S.modal = { minted: { agentId, token: res.token, mcp: location.origin + "/mcp" } };
+    await loadAll();
+  }
+  function copy(text, done) { try { navigator.clipboard.writeText(text); toast(done); } catch (e) { toast(text); } }
+  function MintedModal() {
+    const m = S.modal.minted;
+    const row = (label, value, what) => h("div", { class: "col", style: { gap: "6px" } }, h("label", { style: { fontSize: "12px", fontWeight: 500, color: "var(--text-3)" } }, label),
+      h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, h("span", { class: "target", style: { flex: 1 } }, value), h("button", { class: "btn sm", onClick: () => copy(value, what + " copied.") }, "Copy")));
+    return h("div", { class: "overlay", style: { zIndex: 60 } }, h("div", { class: "modal", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "col", style: { gap: "6px" } }, h("span", { style: { font: "600 16px var(--sans)" } }, "Token for " + m.agentId),
+        h("span", { class: "sec", style: { fontSize: "13px", lineHeight: 1.5 } }, "Copy the token now. The vault shows it one time only. Give the agent the MCP address and send the token as a bearer token. Tell the agent to read AGENTS.md first.")),
+      row("Token", m.token, "Token"),
+      row("MCP address", m.mcp, "Address"),
+      row("Authorization header", "Bearer " + m.token, "Header"),
+      h("div", { style: { display: "flex", justifyContent: "flex-end" } }, h("button", { class: "btn primary", onClick: () => set({ modal: null }) }, "Done"))));
+  }
   function askRevoke(agent, t) {
     S.modal = { title: "Revoke this token?", body: agent.display_name + " loses access with this token at once. This cannot be undone; mint a new token to reconnect it.", target: (t.label || "unlabelled") + " · " + t.id, cta: "Revoke", danger: true,
       run: async () => { await api("/v1/admin/tokens/revoke", { method: "POST", body: { token_id: t.id } }); toast("Token revoked."); await loadAll(); } };
@@ -1040,7 +1076,9 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
     const cols = access({ scopes: [] }).map((c) => c[0]);
     const grid = { gridTemplateColumns: "180px repeat(" + cols.length + ", minmax(0,1fr))" };
     return h("div", { class: "page scroll" },
-      h("div", { class: "title-block" }, h("h1", null, "Agents"), h("span", { class: "sec" }, "Each agent writes to its own folder and the shared areas its scopes allow.")),
+      h("div", { style: { display: "flex", alignItems: "flex-end", gap: "14px" } },
+        h("div", { class: "title-block" }, h("h1", null, "Agents"), h("span", { class: "sec" }, "Each agent writes to its own folder and the shared areas its scopes allow.")),
+        h("button", { class: "btn primary", style: { marginLeft: "auto" }, onClick: askNewAgent }, "New agent")),
       S.agents.length ? h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: "14px" } }, S.agents.map((a) => h("div", { class: "agent-card" + (agentState(a) === "Active" ? "" : " off"), onClick: () => openAgent(a.id) },
         h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "10px" } },
           h("div", { class: "col", style: { gap: "2px" } }, h("span", { style: { font: "600 15px var(--sans)" } }, a.display_name), h("span", { class: "mono muted", style: { fontSize: "12px" } }, a.id)),
@@ -1048,7 +1086,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
         h("span", { class: "sec", style: { fontSize: "12.5px", lineHeight: 1.45, minHeight: "36px" } }, plainAccess(a).map(([k, v]) => k + " " + v).join(". ") + "."),
         h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", borderTop: "1px solid var(--line-3)", paddingTop: "12px" } },
           [["Writes 24h", a.writes_24h], ["Rejected 24h", a.rejected_24h], ["Last seen", ago(a.last_seen_at)]].map(([k, v], i) => h("div", { class: "col", style: { gap: "2px" } }, h("span", { class: "muted", style: { fontSize: "11.5px" } }, k), h("span", { style: { font: i < 2 ? "500 15px var(--mono)" : "500 13px var(--sans)", paddingTop: i < 2 ? 0 : "1px" } }, v)))),
-        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "tag" }, a.kind), h("span", { class: "tag" }, plural(a.scopes.length, "scope")))))) : h("div", { class: "card empty" }, "No agents yet. Mint a token with POST /v1/admin/tokens to add one."),
+        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "tag" }, a.kind), h("span", { class: "tag" }, plural(a.scopes.length, "scope")))))) : h("div", { class: "card empty" }, "No agents yet. Click New agent to make one."),
       S.agents.length ? h("div", { class: "card clip", style: { flexShrink: 0 } },
         h("div", { class: "col", style: { padding: "14px 18px", borderBottom: "1px solid var(--line-2)", gap: "2px" } }, h("span", { class: "card-title" }, "Who can see what"), h("span", { class: "sec", style: { fontSize: "12px" } }, "What each agent can read or change about you. Summary means it sees conclusions only, never the raw notes.")),
         h("div", { class: "grid-row th", style: grid }, h("span", null, "Agent"), cols.map((c) => h("span", null, c))),
@@ -1067,7 +1105,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
         h("div", { class: "col", style: { gap: "4px" } },
           h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } }, h("h1", null, a.display_name), h("span", { class: "pill" }, h("span", { class: "dot sm", style: { background: agentDot(a) } }), agentState(a))),
           h("span", { class: "mono muted", style: { fontSize: "12.5px" } }, a.id + " · " + a.kind + " · created " + fmtDate(a.created_at))),
-        h("div", { style: { marginLeft: "auto", display: "flex", gap: "8px" } }, h("button", { class: "btn", onClick: () => (folder ? openNote(folder.path) : toast(a.display_name + " has no files in the vault yet.")) }, "Open folder"))),
+        h("div", { style: { marginLeft: "auto", display: "flex", gap: "8px" } }, h("button", { class: "btn", onClick: () => askNewToken(a) }, "New token"), h("button", { class: "btn", onClick: () => (folder ? openNote(folder.path) : toast(a.display_name + " has no files in the vault yet.")) }, "Open folder"))),
       h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: "14px" } },
         [["Writes 24h", a.writes_24h], ["Rejected 24h", a.rejected_24h], ["Notes owned", owned], ["Live tokens", a.tokens.filter((t) => !t.revoked_at).length]].map(([k, v]) => h("div", { class: "stat" }, h("span", { class: "sec", style: { fontSize: "12px" } }, k), h("span", { class: "stat-v" }, v)))),
       h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: "14px", alignItems: "start" } },
@@ -1159,17 +1197,20 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
   }
   function Modal() {
     const m = S.modal;
+    if (m.minted) return MintedModal();
     let area = null;
     const confirm = async () => {
       const text = area ? area.value.trim() : "";
       if (m.field && text.length < m.field.min) { m.err = m.field.min > 1 ? "Write at least " + m.field.min + " characters." : "This can't be empty."; m.field.value = area.value; render(); return; }
       m.busy = true; if (area) m.field.value = area.value; render();
-      try { await m.run(text); S.modal = null; render(); } catch (err) { m.busy = false; m.err = err.message; render(); }
+      try { await m.run(text); if (S.modal === m) S.modal = null; render(); } catch (err) { m.busy = false; m.err = err.message; render(); }
     };
     return h("div", { class: "overlay", style: { zIndex: 60 }, onClick: () => { if (!m.busy) set({ modal: null }); } }, h("div", { class: "modal", role: "dialog", "aria-modal": "true", onClick: (e) => e.stopPropagation() },
       h("div", { class: "col", style: { gap: "6px" } }, h("span", { style: { font: "600 16px var(--sans)" } }, m.title), h("span", { class: "sec", style: { fontSize: "13px", lineHeight: 1.5 } }, m.body), m.target ? h("span", { class: "target" }, m.target) : null),
       m.field ? h("div", { class: "col", style: { gap: "6px" } }, h("label", { style: { fontSize: "12px", fontWeight: 500, color: "var(--text-3)" } }, m.field.label),
-        area = h("textarea", { class: "input", key: "modal-field", rows: 3, placeholder: m.field.placeholder, value: m.field.value, maxlength: 2000, style: { borderColor: m.err ? "var(--bad)" : "" } })) : null,
+        area = m.field.line
+          ? h("input", { class: "input", key: "modal-field", placeholder: m.field.placeholder, value: m.field.value, maxlength: 80, style: { borderColor: m.err ? "var(--bad)" : "" }, onKeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); confirm(); } } })
+          : h("textarea", { class: "input", key: "modal-field", rows: 3, placeholder: m.field.placeholder, value: m.field.value, maxlength: 2000, style: { borderColor: m.err ? "var(--bad)" : "" } })) : null,
       m.err ? h("span", { class: "err" }, m.err) : null,
       h("div", { style: { display: "flex", justifyContent: "flex-end", gap: "8px" } }, h("button", { class: "btn", disabled: m.busy, onClick: () => set({ modal: null }) }, "Cancel"),
         h("button", { class: "btn " + (m.danger ? "danger" : "primary"), style: m.danger ? { background: "var(--bad)", borderColor: "var(--bad)", color: "#fff" } : null, disabled: m.busy, onClick: confirm }, m.busy ? "Working…" : m.cta))));
