@@ -104,7 +104,9 @@ Every push to your copy runs `pnpm run deploy` (`scripts/deploy.ts`). It creates
 
 **Updates.** Your copy does not follow this repository on its own. `.github/workflows/sync-upstream.yml` fast-forwards your `main` to this repository's `main` once a day (or from the Actions tab), and that push deploys the update. If your `main` has its own commits, or an update changes a workflow file, the run fails and you merge `upstream/main` by hand. GitHub pauses scheduled workflows in a repository with no activity for 60 days; re-enable it from the Actions tab.
 
-The worker accepts the admin token either as the plain `ADMIN_TOKEN`, which it hashes with `TOKEN_PEPPER`, or as `ADMIN_TOKEN_HASH`. `ADMIN_TOKEN_HASH` wins when both are set.
+The worker accepts the admin token either as the plain `ADMIN_TOKEN`, which it hashes with `TOKEN_PEPPER`, or as `ADMIN_TOKEN_HASH`. `ADMIN_TOKEN` wins when both are set, so setting it replaces an older hashed admin token; agent tokens are unaffected.
+
+**An existing vault.** `wrangler.jsonc` lists `ADMIN_TOKEN` as required, and wrangler refuses to deploy a worker that lacks a required secret. Before the first deploy of this config onto a vault set up with `ADMIN_TOKEN_HASH`, set `ADMIN_TOKEN` once (`pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc`, or the worker's Settings, Variables and Secrets in the Cloudflare dashboard). That password is then the admin and console login, and the old admin token stops working.
 
 ## Deploy by hand
 
@@ -122,20 +124,20 @@ Add the new D1 id to `wrangler.jsonc` as `d1_databases[0].database_id` in your w
 
 ```sh
 pnpm exec wrangler d1 migrations apply hiveattic-index --remote --config wrangler.jsonc
-printf '%s' "$ADMIN_TOKEN" | TOKEN_PEPPER="$TOKEN_PEPPER" pnpm hash-token
 pnpm exec wrangler secret put TOKEN_PEPPER --config wrangler.jsonc
-pnpm exec wrangler secret put ADMIN_TOKEN_HASH --config wrangler.jsonc
+pnpm exec wrangler secret put ADMIN_TOKEN --config wrangler.jsonc
 pnpm exec wrangler secret put AUDIT_KEY --config wrangler.jsonc
 pnpm exec wrangler secret put JOURNAL_MAC_KEY --config wrangler.jsonc
 pnpm exec wrangler deploy --config wrangler.jsonc --var GIT_SHA:$(git rev-parse HEAD)
 ```
 
-All four secrets are required; `ADMIN_TOKEN` (at least 16 characters) can stand in for `ADMIN_TOKEN_HASH`. A deploy missing one answers every request with 500 `misconfigured` naming it, rather than writing rows it cannot hash or sign.
+All four secrets are required. `ADMIN_TOKEN` is at least 16 characters; a config that lists `ADMIN_TOKEN_HASH` instead (the example configs) takes the hash from `pnpm hash-token`. A deploy missing one answers every request with 500 `misconfigured` naming it, rather than writing rows it cannot hash or sign.
 
 | Secret | Purpose |
 | --- | --- |
 | `TOKEN_PEPPER` | Pepper for bearer-token hashes: the stored value is `sha256(pepper \|\| token)`. Rotating it invalidates every token, the admin token included. |
-| `ADMIN_TOKEN_HASH` | The hash of the admin token, made with `pnpm hash-token`. Only that token is admin. Or set `ADMIN_TOKEN`, the token itself, and the worker hashes it. |
+| `ADMIN_TOKEN` | The admin token itself, at least 16 characters; the worker hashes it with the pepper. Only that token is admin. It wins over `ADMIN_TOKEN_HASH`. |
+| `ADMIN_TOKEN_HASH` | The admin token's hash, made with `pnpm hash-token`, for configs that list it instead (the example configs). |
 | `AUDIT_KEY` | Keys the HMAC-SHA256 `content_hash` of the content of every write in the audit log, and of tombstones, so a hash cannot be checked against a guessed text. |
 | `JOURNAL_MAC_KEY` | Signs journal entry markers, including the idempotency marker. Rebuild only restores entries and idempotency rows whose MAC verifies. |
 

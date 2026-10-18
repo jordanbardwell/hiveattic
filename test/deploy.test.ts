@@ -21,11 +21,11 @@ describe("plain ADMIN_TOKEN", () => {
     expect((await rest("/v1/admin/agents", "not-the-admin-token-at-all")).status).toBe(401);
   });
 
-  it("loses to ADMIN_TOKEN_HASH when both are set", async () => {
+  it("replaces ADMIN_TOKEN_HASH when both are set", async () => {
     testEnv().ADMIN_TOKEN = "another-admin-password-1234";
     clearAuthCache();
-    expect((await rest("/v1/admin/agents", ADMIN)).status).toBe(200);
-    expect((await rest("/v1/admin/agents", "another-admin-password-1234")).status).toBe(401);
+    expect((await rest("/v1/admin/agents", "another-admin-password-1234")).status).toBe(200);
+    expect((await rest("/v1/admin/agents", ADMIN)).status).toBe(401);
   });
 
   it("must be set when there is no hash, and long enough", async () => {

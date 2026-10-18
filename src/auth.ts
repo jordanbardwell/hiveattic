@@ -24,14 +24,13 @@ type TokenRow = {
 
 // The admin token is set either as ADMIN_TOKEN_HASH, made with `pnpm hash-token`, or as the
 // plain ADMIN_TOKEN, which the Deploy to Cloudflare form asks for and the worker hashes here with
-// the same pepper. ADMIN_TOKEN_HASH wins when both are set.
+// the same pepper. ADMIN_TOKEN wins when both are set, so setting it replaces an older hashed token.
 let adminMemo: { key: string; hash: string } | null = null;
 
 async function adminTokenHash(env: Env): Promise<string | null> {
-  const stored = env.ADMIN_TOKEN_HASH?.trim();
-  if (stored) return stored;
   const token = env.ADMIN_TOKEN?.trim();
-  if (!token || !env.TOKEN_PEPPER) return null;
+  if (!token) return env.ADMIN_TOKEN_HASH?.trim() || null;
+  if (!env.TOKEN_PEPPER) return null;
   const key = `${env.TOKEN_PEPPER}\u0000${token}`;
   if (adminMemo?.key !== key) adminMemo = { key, hash: await hashToken(env.TOKEN_PEPPER, token) };
   return adminMemo.hash;

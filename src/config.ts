@@ -75,12 +75,10 @@ export const ADMIN_TOKEN_MIN_LENGTH = 16;
 export function requireSecrets(env: Env): void {
   const missing: string[] = REQUIRED_SECRETS.filter((name) => !env[name]?.trim());
   const plain = env.ADMIN_TOKEN?.trim() ?? "";
-  if (!env.ADMIN_TOKEN_HASH?.trim()) {
-    if (!plain) missing.push("ADMIN_TOKEN");
-    else if (plain.length < ADMIN_TOKEN_MIN_LENGTH) {
-      throw new VaultError("misconfigured", `ADMIN_TOKEN must be at least ${ADMIN_TOKEN_MIN_LENGTH} characters`, ["ADMIN_TOKEN"]);
-    }
+  if (plain && plain.length < ADMIN_TOKEN_MIN_LENGTH) {
+    throw new VaultError("misconfigured", `ADMIN_TOKEN must be at least ${ADMIN_TOKEN_MIN_LENGTH} characters`, ["ADMIN_TOKEN"]);
   }
+  if (!plain && !env.ADMIN_TOKEN_HASH?.trim()) missing.push("ADMIN_TOKEN");
   if (missing.length) throw new VaultError("misconfigured", "A required secret is not set", missing);
 }
 
