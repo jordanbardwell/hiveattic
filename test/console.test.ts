@@ -107,6 +107,30 @@ describe("console admin routes", () => {
   });
 });
 
+describe("owner fact corrections", () => {
+  beforeEach(async () => {
+    await resetVault();
+  });
+
+  it("settle the fact without opening a conflict", async () => {
+    const research = await mint("research", ["read:shared", "write:shared"], "research");
+    const finance = await mint("finance-bot", ["read:shared", "write:shared"], "finance");
+    const fact = (statement: string, observedAt: string, key: string) =>
+      JSON.stringify({ key: "gym", statement, scope: "shared", observed_at: observedAt, idempotency_key: key });
+    await rest("/v1/facts", research, { method: "POST", body: fact("Gym Mon/Wed/Fri.", "2026-10-17T10:00:00Z", "own-1") });
+    const corrected = await rest("/v1/facts", ADMIN, { method: "POST", body: fact("Gym Tue/Thu.", "2026-10-17T11:00:00Z", "own-2") });
+    expect(corrected.status).toBe(200);
+    expect(corrected.json.data?.outcome).toBe("updated");
+    let overview = await rest("/v1/admin/overview", ADMIN);
+    expect(overview.json.data?.conflicts).toEqual([]);
+    // Another agent contradicting the owner within 24 hours is still flagged.
+    const contradicted = await rest("/v1/facts", finance, { method: "POST", body: fact("Gym Mon/Wed.", "2026-10-17T12:00:00Z", "own-3") });
+    expect(contradicted.json.data?.outcome).toBe("conflict_flagged");
+    overview = await rest("/v1/admin/overview", ADMIN);
+    expect(overview.json.data?.conflicts).toHaveLength(1);
+  });
+});
+
 describe("snippet", () => {
   it("skips frontmatter, headings, markers, and bare links", () => {
     expect(snippet("---\ntype: note\n---\n# Title\n\n[[a/b.md]]\n<!-- hiveattic:e=x -->\n- First **point** with [[c/d.md]]\n")).toBe("First **point** with c/d.md");
