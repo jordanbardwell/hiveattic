@@ -266,9 +266,17 @@ The token is printed once and expires after 30 days. Its scopes are `read:shared
 
 Mint copies the preset scopes onto the token (`tokens.scopes_override`) and, for a new agent, onto the agent row. Later requests use that stored list. A reviewer token minted before the preset dropped `audit:read` and the summary scopes keeps its old scopes. Revoke it and mint a new one under a fresh agent id.
 
+## Console
+
+The worker serves an owner console at `/console` (`/` redirects there). It is part of the same deploy: nothing else to create or configure. Sign in with the admin token. The token is kept in that browser tab's session storage and sent only to this worker; closing the tab signs you out. The page holds no vault data itself and loads no third-party script; it runs under a per-response nonce CSP that allows only its own script, Google Fonts, and calls back to this worker.
+
+It shows the hive of recent memories, notes with their links and version history, facts and the profile summary, journal days, agents with what each can read or edit, and the audit log. From it you can forget a note, restore a version, revoke a token, and confirm or correct a shared fact. Corrections are written as the `owner` agent, so a correction within 24 hours of another agent's write is recorded as a conflict like any other cross-agent write.
+
+It reads two admin-only routes besides the ones below: `GET /v1/admin/agents` (agents, token metadata without hashes, writes in the last 24 hours) and `GET /v1/admin/overview` (the 500 most recently updated notes without bodies, links between them, writes per hour for 24 hours, open conflicts).
+
 ## API
 
-Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(pepper || token)`. `GET /v1/health` is the only unauthenticated route, and it shows the build only to a caller with a token.
+Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(pepper || token)`. `GET /v1/health` is the only unauthenticated API route, and it shows the build only to a caller with a token. The console page is served without a token; it has no data until you sign in.
 
 | Method | Path | Tool |
 | --- | --- | --- |

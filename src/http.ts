@@ -1,6 +1,8 @@
 import { authenticate, countryOf, enforceRateLimit } from "./auth";
+import { consoleResponse } from "./console";
 import { configure, CONTENT_LIMIT_BYTES, REQUEST_LIMIT_BYTES, requireSecrets, utf8Length } from "./config";
 import { ulid } from "./crypto";
+import { adminAgents, adminOverview } from "./dashboard";
 import { asVaultError, errorBody, VaultError } from "./errors";
 import { logEvent } from "./log";
 import {
@@ -52,6 +54,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const url = new URL(request.url);
   const requestId = ulid();
   const clientRequestId = request.headers.get("x-request-id")?.slice(0, 80) || null;
+  const page = consoleResponse(request, url);
+  if (page) return page;
   if (url.pathname === "/v1/health" && request.method === "GET") {
     // A bad or missing token still gets the plain health answer, never a 401.
     let authenticated = false;
@@ -172,6 +176,8 @@ async function route(request: Request, env: Env, url: URL, session: Session, raw
       ),
     );
   }
+  if (method === "GET" && pathname === "/v1/admin/agents") return ok(await adminAgents(env, session));
+  if (method === "GET" && pathname === "/v1/admin/overview") return ok(await adminOverview(env, session));
   if (method === "POST" && pathname === "/v1/admin/audit/verify-append-only") return ok(await verifyAuditAppendOnly(env, session));
   throw new VaultError("not_found", "Route not found");
 }
