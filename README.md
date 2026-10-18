@@ -33,10 +33,12 @@ Your copy gets the updates from this repository one time each day. For updates, 
    ```sh
    curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/tokens" \
      -H "authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
-     -d '{"agent_id": "my-agent", "scopes": ["read:shared", "read:own", "write:own"]}'
+     -d '{"agent_id": "my-agent", "scopes": ["read:all", "read:own", "write:own", "write:shared"]}'
    ```
 
 2. Copy the token from the reply. The vault shows it one time only.
+
+   With these scopes, the agent reads all notes of all agents. It writes only to its own folder and to the shared folders. Only the admin token reads `sensitive/restricted/` and the private journal of each agent.
 3. Give the agent the MCP address `https://<worker>.<subdomain>.workers.dev/mcp` and the token as a bearer token.
 4. Tell the agent to read `AGENTS.md` in the vault first. It has the rules for each agent.
 
