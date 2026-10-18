@@ -19,6 +19,26 @@ export type NoteView = {
 
 export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox"];
 
+// Agent ids the server uses for itself or for system actors. A token cannot be minted for them, and a
+// token minted for one before mint refused them is not accepted ("shared" owns every note outside bots/).
+export const RESERVED_AGENT_IDS = new Set([
+  "admin",
+  "owner",
+  "operator",
+  "system",
+  "sys",
+  "shared",
+  "external",
+  "replay",
+  "rebuild",
+  "reconcile",
+  "indexer",
+  "migration",
+  "hiveattic",
+  "restricted",
+  "sensitive",
+]);
+
 // Admin is the admin token only. A stored scope list never makes a token admin. A wildcard
 // expands only within its own class: `read:domain/*` to ordinary domains, `*:sensitive/*` to
 // sensitive domains. Neither reaches an unclassified domain or `restricted`.

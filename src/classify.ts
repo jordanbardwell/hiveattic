@@ -149,34 +149,50 @@ export function journalRouteFor(classification: Classification, flagged: boolean
   return route === RESTRICTED && piiOnly ? PII_ROUTE : route;
 }
 
+const isString = (pattern: RegExp) => (value: unknown) => typeof value === "string" && pattern.test(value);
+const isBoolean = (value: unknown) => typeof value === "boolean";
+const isInstant = (value: unknown) => typeof value === "string" && value.length <= 40 && !Number.isNaN(Date.parse(value));
+const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
 // Frontmatter keys the server writes. Their values are ids, agent names, and timestamps, and
-// are left out of classification so an agent id cannot reroute every file it touches.
-const SERVER_KEYS = new Set([
-  "vault_id",
-  "vault_idempotency",
-  "vault_summary",
-  "type",
-  "owner",
-  "status",
-  "source",
-  "updated_at",
-  "created_at",
-  "domain",
-  "sensitivity",
-  "key",
-  "observed_at",
-  "confidence",
-  "supersedes",
+// are left out of classification so an agent id cannot reroute every file it touches. A key is
+// left out only when its value has the shape the server writes, so an outside edit cannot hide
+// health or finance text under one of these names (or under any other vault_ key).
+const SERVER_KEYS = new Map<string, (value: unknown) => boolean>([
+  ["vault_id", isString(ULID)],
+  ["vault_idempotency", isString(/^[A-Za-z0-9_.:-]{1,64}$/)],
+  ["vault_idempotency_hash", isString(/^(?:[0-9a-f]{64}|-)$/)],
+  ["vault_outcome", isString(/^[a-z_]{1,32}$/)],
+  ["vault_rerouted", isBoolean],
+  ["vault_created_at", isInstant],
+  ["vault_summary", isBoolean],
+  ["type", isString(/^[a-z-]{1,20}$/)],
+  ["owner", isString(SLUG)],
+  ["status", isString(/^(?:active|superseded|forgotten|quarantined)$/)],
+  ["source", isString(SLUG)],
+  ["updated_at", isInstant],
+  ["created_at", isInstant],
+  ["domain", isString(SLUG)],
+  ["sensitivity", isString(/^(?:normal|sensitive)$/)],
+  ["key", isString(SLUG)],
+  ["observed_at", isInstant],
+  ["confidence", (value) => typeof value === "number"],
+  ["supersedes", isString(/^(?:\d{8}T\d{9}Z[0-9a-f]{4}|[0-9A-HJKMNP-TV-Z]{26})$/)],
 ]);
 
 export function frontmatterText(frontmatter: Frontmatter): string {
   const parts: string[] = [];
   for (const [key, value] of Object.entries(frontmatter)) {
-    if (SERVER_KEYS.has(key) || key.startsWith("vault_")) continue;
+    if (SERVER_KEYS.get(key)?.(value)) continue;
     parts.push(typeof value === "string" ? value : JSON.stringify(value) ?? "");
   }
   return parts.join("\n");
 }
+
+// The two journal markers the server writes, each on a line of its own (see journalEntries).
+const SERVER_MARKER_LINE =
+  /^<!-- hiveattic:(?:e=[0-9A-HJKMNP-TV-Z]{26}:[^:\s]+:[0-9a-f]{16}|idempotency=[A-Za-z0-9_.:-]{1,64}(?: h=(?:[0-9a-f]{64}|-) mac=(?:[0-9a-f]{16})?)?) -->$/;
 
 // The text a stored file is classified on: the body plus caller frontmatter. Journal heading
 // lines keep only their title, and server markers are dropped, so a rebuild classifies a day
@@ -185,7 +201,7 @@ export function classificationText(markdown: string): string {
   const { frontmatter, body } = parseMarkdown(markdown);
   const lines = body
     .split("\n")
-    .filter((line) => !/<!-- hiveattic:/i.test(line))
+    .filter((line) => !SERVER_MARKER_LINE.test(line))
     .map((line) => {
       const heading = /^## .+ · [^·\n]+ · (.+?) \^[0-9A-HJKMNP-TV-Z]{26}\s*$/.exec(line);
       return heading ? heading[1]! : line;

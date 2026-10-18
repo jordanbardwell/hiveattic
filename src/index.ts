@@ -32,5 +32,9 @@ export async function nightly(env: Env): Promise<void> {
     const code = err instanceof VaultError ? err.code : "error";
     logEvent({ event: "nightly_reconcile_skipped", reason: code });
   }
-  await pruneRateCounters(env);
+  try {
+    await pruneRateCounters(env);
+  } catch (err) {
+    logEvent({ event: "nightly_prune_failed", name: err instanceof Error ? err.name : "error" });
+  }
 }
