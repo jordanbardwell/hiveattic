@@ -182,22 +182,24 @@ const example = readFileSync(".e2e.env.example", "utf8");
 if (/^R2_BUCKET=hiveattic-vault\s*$/m.test(example)) throw new Error(".e2e.env.example defaults R2_BUCKET to the production bucket");
 if (/^HIVEATTIC_(BASE_URL|ADMIN_TOKEN|REVIEWER_TOKEN)=/m.test(example)) throw new Error(".e2e.env.example still names a production variable");
 
-// Every wrangler command in the README and the harness names its config file.
-const readme = readFileSync("README.md", "utf8");
-for (const [file, text] of [["README.md", readme], ["e2e/run.ts", harness]] as const) {
+// Every wrangler command in the README, the docs, and the harness names its config file.
+const docFiles = ["README.md", ...readdirSync("docs").filter((name) => name.endsWith(".md")).map((name) => `docs/${name}`)];
+const docs = docFiles.map((file) => [file, readFileSync(file, "utf8")] as const);
+const readme = docs.map(([, text]) => text).join("\n");
+for (const [file, text] of [...docs, ["e2e/run.ts", harness]] as const) {
   for (const line of text.split("\n")) {
     const command = /(?:^|\s|`)(?:pnpm exec )?wrangler (deploy|secret|d1|r2|queues|tail|dev|types)\b/.exec(line);
     if (command && !line.includes("--config")) throw new Error(`${file}: a wrangler command has no --config: ${line.trim()}`);
   }
 }
 for (const required of ["wrangler secret put JOURNAL_MAC_KEY", "wrangler secret put AUDIT_KEY", "VAULT_TZ", "GET /v1/search", "202", "413", "/v1/admin/migrations/quarantine-erase", "Idempotency-Key"]) {
-  if (!readme.includes(required)) throw new Error(`README.md does not document ${required}`);
+  if (!readme.includes(required)) throw new Error(`README.md and docs/ do not document ${required}`);
 }
 if (!readFileSync(".dev.vars.example", "utf8").includes("VAULT_TZ")) throw new Error(".dev.vars.example does not document VAULT_TZ");
 
 // The vault rule card is guidance only. Nothing may say the server blocks content.
 const blockClaims = /(?:server|it) (?:rejects|blocks|quarantines|filters out) (?:them|it|content|secrets|writes)|the server rejects them|rejected by the (?:secret|financial|employer) filter|(?:are|is) quarantined/i;
-for (const file of ["AGENTS.md", "content/vault/AGENTS.md", "content/vault/README.md", "README.md"]) {
+for (const file of ["AGENTS.md", "content/vault/AGENTS.md", "content/vault/README.md", ...docFiles]) {
   const text = readFileSync(file, "utf8");
   if (blockClaims.test(text)) throw new Error(`${file} claims the server rejects, blocks, or quarantines content`);
 }
@@ -293,7 +295,7 @@ function sourceFiles(dir: string): string[] {
   return found;
 }
 const scanned = [
-  ...["src", "e2e", "test", "scripts", "examples", "content", "README.md", "AGENTS.md"].flatMap((item) => sourceFiles(item)),
+  ...["src", "e2e", "test", "scripts", "examples", "content", "docs", "README.md", "AGENTS.md"].flatMap((item) => sourceFiles(item)),
   ...readdirSync(".").filter((name) => /^wrangler.*\.jsonc?$/.test(name)),
 ]
   // This file holds the check's own failing fixtures above.
