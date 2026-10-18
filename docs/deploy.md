@@ -51,7 +51,7 @@ After that, use this password to sign in as admin and to the console. The old ad
 3. Keep the **Build command** empty.
 4. Set the **Deploy command** to `pnpm run deploy`.
 
-After this step, each push to `main` deploys the worker. Do not use a plain wrangler deploy as the deploy command. It does not make the missing keys and does not apply the D1 migrations.
+After this step, each push to `main` deploys the worker. Do not use a deploy command that only uploads the code. That command does not make the missing keys and does not apply the D1 migrations.
 
 ## Deploy by hand
 
