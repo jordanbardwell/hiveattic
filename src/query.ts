@@ -22,22 +22,31 @@ type NoteHit = {
 
 export async function searchVault(env: Env, access: Access, query: string, mode: string, options: SearchOptions = {}): Promise<Record<string, unknown>> {
   const match = ftsQuery(query);
-  const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
+  const limit = clampInt(options.limit, 20, 1, 50);
   const scope = scopeSql(access);
   const filters = extraFilters(options);
   let rows: NoteHit[] = [];
   try {
+    // One row per note (its best chunk), so a long note cannot take several result slots. A few extra
+    // candidates let the boosts below reorder notes that sit just past the keyword cut.
     const selected = await env.DB.prepare(
-      `SELECT n.id, n.path, n.title, n.owner, n.type, n.domain, n.sensitivity, n.updated_at, n.frontmatter,
-              c.text AS chunk_text, bm25(chunks_fts) AS rank
-       FROM chunks_fts
-       JOIN chunks c ON c.rowid = chunks_fts.rowid
-       JOIN notes n ON n.id = c.note_id
-       WHERE chunks_fts MATCH ? AND n.status = 'active' AND (${scope.sql}) ${filters.sql}
-       ORDER BY bm25(chunks_fts)
+      `WITH hits AS (
+         SELECT c.note_id, c.text AS chunk_text, bm25(chunks_fts) AS rank
+         FROM chunks_fts
+         JOIN chunks c ON c.rowid = chunks_fts.rowid
+         WHERE chunks_fts MATCH ?
+       ), best AS (
+         SELECT note_id, chunk_text, rank, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY rank) AS rn FROM hits
+       )
+       SELECT n.id, n.path, n.title, n.owner, n.type, n.domain, n.sensitivity, n.updated_at, n.frontmatter,
+              b.chunk_text, b.rank
+       FROM best b
+       JOIN notes n ON n.id = b.note_id
+       WHERE b.rn = 1 AND n.status = 'active' AND (${scope.sql}) ${filters.sql}
+       ORDER BY b.rank
        LIMIT ?`,
     )
-      .bind(match, ...scope.binds, ...filters.binds, limit)
+      .bind(match, ...scope.binds, ...filters.binds, Math.min(limit * 3, 150))
       .all<NoteHit>();
     rows = selected.results ?? [];
   } catch {
@@ -204,6 +213,11 @@ export function stagingResources(env: Env): boolean {
   return env.DEPLOY_ENV === "staging" && bucket.includes("-staging") && db.includes("-staging") && worker.includes("staging");
 }
 
+export function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
 function likePrefix(prefix: string): string {
   return `${prefix.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
 }
@@ -248,7 +262,13 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (access.admin || hasScope(access, "read:all")) return { sql: "1 = 1", binds: [] };
   const parts: { sql: string; binds: string[] }[] = [{ sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] }];
   if (hasScope(access, "read:own") || hasScope(access, "write:own")) {
-    parts.push({ sql: "n.path LIKE ?", binds: [`bots/${access.agentId}/%`] });
+    // Same rule as canRead: sensitive notes in the own folder need a sensitive scope (granted below),
+    // except the own journal-sensitive file with no domain.
+    const ordinary = ordinaryDomainSql();
+    parts.push({
+      sql: `(n.path LIKE ? AND (${ordinary.sql} OR (n.path LIKE ? AND n.domain IS NULL)))`,
+      binds: [`bots/${access.agentId}/%`, ...ordinary.binds, `bots/${access.agentId}/journal-sensitive/%`],
+    });
   }
   for (const scope of access.scopes) {
     const summary = /^read:sensitive:summary\/([a-z0-9-]+)$/.exec(scope);

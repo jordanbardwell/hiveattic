@@ -42,8 +42,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   try {
     if (url.pathname === "/mcp") {
       const access = await authenticate(request, env, ctx);
-      const kind = await mcpRateKind(request);
-      await enforceRateLimit(env, access.tokenId, kind);
+      const rate = await mcpRateCost(request);
+      await enforceRateLimit(env, access.tokenId, rate.kind, rate.cost);
       return mcp(request, env, ctx);
     }
     const access = await authenticate(request, env, ctx);
@@ -116,20 +116,35 @@ async function route(request: Request, env: Env, url: URL, session: Session): Pr
   throw new VaultError("not_found", "Route not found");
 }
 
-async function mcpRateKind(request: Request): Promise<"read" | "write"> {
-  if (request.method !== "POST") return "read";
+const BODY_LIMIT = 256_000;
+
+// A JSON-RPC batch runs every call it holds, so the cost is the number of write calls when there are
+// any, and the number of messages otherwise.
+async function mcpRateCost(request: Request): Promise<{ kind: "read" | "write"; cost: number }> {
+  if (request.method !== "POST") return { kind: "read", cost: 1 };
+  assertDeclaredSize(request);
+  const text = await request.clone().text();
+  if (text.length > BODY_LIMIT) throw new VaultError("invalid", "Request body is too large");
+  let body: unknown;
   try {
-    const body = (await request.clone().json()) as unknown;
-    const messages = Array.isArray(body) ? body : [body];
-    for (const message of messages) {
-      if (!message || typeof message !== "object") continue;
-      const call = message as { method?: string; params?: { name?: string } };
-      if (call.method === "tools/call" && toolRateKind(call.params?.name) === "write") return "write";
-    }
+    body = JSON.parse(text) as unknown;
   } catch {
-    return "read";
+    return { kind: "read", cost: 1 };
   }
-  return "read";
+  const messages = Array.isArray(body) ? body : [body];
+  let writes = 0;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const call = message as { method?: string; params?: { name?: string } };
+    if (call.method === "tools/call" && toolRateKind(call.params?.name) === "write") writes += 1;
+  }
+  if (writes > 0) return { kind: "write", cost: writes };
+  return { kind: "read", cost: Math.max(1, messages.length) };
+}
+
+function assertDeclaredSize(request: Request): void {
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > BODY_LIMIT) throw new VaultError("invalid", "Request body is too large");
 }
 
 function splitList(value: string | null): string[] | undefined {
@@ -151,8 +166,9 @@ function requiredQuery(url: URL, name: string): string {
 }
 
 async function readJson(request: Request): Promise<unknown> {
+  assertDeclaredSize(request);
   const text = await request.text();
-  if (text.length > 256_000) throw new VaultError("invalid", "Request body is too large");
+  if (text.length > BODY_LIMIT) throw new VaultError("invalid", "Request body is too large");
   if (!text.trim()) return {};
   try {
     return JSON.parse(text) as unknown;

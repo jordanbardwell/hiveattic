@@ -1,4 +1,4 @@
-import type { Access } from "./access";
+import { RESERVED_AGENT_IDS, type Access } from "./access";
 import { hashToken, timingSafeEqual } from "./crypto";
 import { VaultError } from "./errors";
 import { logEvent } from "./log";
@@ -46,6 +46,8 @@ export async function authenticate(request: Request, env: Env, ctx: ExecutionCon
     .bind(tokenHash)
     .first<TokenRow>();
   if (!row || row.revoked_at || row.disabled_at) throw new VaultError("unauthorized", "Token is not valid");
+  // Tokens minted for a reserved id before mint refused them would pass owner checks on shared notes.
+  if (RESERVED_AGENT_IDS.has(row.agent_id)) throw new VaultError("unauthorized", "Token is not valid");
   if (row.expires_at && Date.parse(row.expires_at) <= now) throw new VaultError("unauthorized", "Token is not valid");
   let scopes: string[] = [];
   try {
@@ -74,20 +76,21 @@ export async function authenticate(request: Request, env: Env, ctx: ExecutionCon
   return access;
 }
 
-export async function enforceRateLimit(env: Env, tokenId: string, kind: "read" | "write"): Promise<void> {
+// cost is the number of operations in the request. A JSON-RPC batch on /mcp counts each call.
+export async function enforceRateLimit(env: Env, tokenId: string, kind: "read" | "write", cost = 1): Promise<void> {
   const limit = numberVar(kind === "write" ? env.RATE_LIMIT_WRITES_PER_MIN : env.RATE_LIMIT_READS_PER_MIN, kind === "write" ? 60 : 300);
   if (limit <= 0) return;
   const windowMs = 60_000;
   const now = Date.now();
   const bucket = String(Math.floor(now / windowMs));
   const row = await env.DB.prepare(
-    `INSERT INTO rate_counters (token_id, bucket_start, kind, count) VALUES (?, ?, ?, 1)
-     ON CONFLICT (token_id, bucket_start, kind) DO UPDATE SET count = count + 1
+    `INSERT INTO rate_counters (token_id, bucket_start, kind, count) VALUES (?, ?, ?, ?)
+     ON CONFLICT (token_id, bucket_start, kind) DO UPDATE SET count = count + excluded.count
      RETURNING count`,
   )
-    .bind(tokenId, bucket, kind)
+    .bind(tokenId, bucket, kind, cost)
     .first<{ count: number }>();
-  if ((row?.count ?? 1) > limit) {
+  if ((row?.count ?? cost) > limit) {
     const retryAfter = Math.max(1, Math.ceil((windowMs - (now % windowMs)) / 1000));
     throw new VaultError("rate_limited", `Rate limit exceeded; retry after ${retryAfter}s`, [String(retryAfter)]);
   }

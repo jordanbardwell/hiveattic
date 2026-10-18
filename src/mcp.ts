@@ -80,7 +80,12 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
         since: typeof args.since === "string" ? args.since : undefined,
       }),
   );
-  tool("vault_list", "List notes under a path prefix.", z.object({ prefix: z.string().optional() }), async (current, args) => list(env, current, typeof args.prefix === "string" ? args.prefix : ""));
+  tool(
+    "vault_list",
+    "List notes under a path prefix. Pass the returned cursor to get the next page.",
+    z.object({ prefix: z.string().optional(), cursor: z.string().optional() }),
+    async (current, args) => list(env, current, typeof args.prefix === "string" ? args.prefix : "", typeof args.cursor === "string" ? args.cursor : ""),
+  );
   tool("vault_history", "List retained versions of a note.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) =>
     history(env, current, typeof args.path === "string" ? args.path : undefined, typeof args.id === "string" ? args.id : undefined),
   );

@@ -111,14 +111,31 @@ function journalBlockBody(block: string): string {
   return kept.join("\n").trim();
 }
 
+// Frontmatter keys the server writes, with the exact value shape it writes. A key is left out of the
+// filter only when its value has that shape, so an outside edit cannot hide text under one of these names.
+const SERVER_FIELDS = new Map<string, (value: unknown) => boolean>([
+  ["vault_id", (value) => typeof value === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value)],
+  ["vault_idempotency", (value) => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(value)],
+  ["vault_summary", (value) => typeof value === "boolean"],
+  ["source", (value) => typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value)],
+  ["supersedes", (value) => typeof value === "string" && /^(?:\d{8}T\d{9}Z[0-9a-f]{4}|[0-9A-HJKMNP-TV-Z]{26})$/.test(value)],
+]);
+
+// Only the journal markers the server writes. Any other hiveattic comment is filtered like body text.
+const SERVER_MARKER = /<!-- hiveattic:(?:e=[0-9A-HJKMNP-TV-Z]{26}:[a-z0-9][a-z0-9-]{0,63}:(?:[0-9a-f]{16})?|idempotency=[A-Za-z0-9_.:-]{1,64}) -->/g;
+
+// The hash in a quarantine alert line is hex and can hold a digit run that passes the card check.
+// Only the hash is dropped, and only on a line with exactly the shape the server writes.
+const QUARANTINE_ALERT_HASH = /^(A vault file was excluded from search \([a-z_, ]+\)\. Hash )[0-9a-f]{64}(\.(?: Ref e2e[0-9a-f]{10}\.)?)$/gm;
+
 export function textForFilter(markdown: string): string {
   const parsed = parseMarkdown(markdown);
   const frontmatter: Frontmatter = {};
   for (const [key, value] of Object.entries(parsed.frontmatter)) {
-    if (key.startsWith("vault_") || key === "source" || key === "supersedes") continue;
+    if (SERVER_FIELDS.get(key)?.(value)) continue;
     frontmatter[key] = value;
   }
-  const body = parsed.body.replace(/<!--\s*hiveattic:[\s\S]*?-->/g, "");
+  const body = parsed.body.replace(SERVER_MARKER, "").replace(QUARANTINE_ALERT_HASH, "$1$2");
   return buildMarkdown(frontmatter, body);
 }
 

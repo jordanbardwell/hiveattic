@@ -18,7 +18,7 @@ import {
 } from "./markdown";
 import { canWrite, domainOf, type Access } from "./access";
 import { stagingResources } from "./query";
-import { isAppendOnlyPath, isFactPath, isGeneratedNote, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
+import { isAppendOnlyPath, isFactPath, journalPath, ownerForPath, r2KeyFor, vaultPathFromKey } from "./paths";
 import { etStamp, versionStamp, within24h } from "./time";
 
 export type Actor = {
@@ -33,6 +33,7 @@ export type WriterOp =
   | {
       kind: "fact";
       actor: Actor;
+      access: Access;
       key: string;
       statement: string;
       scope: "own" | "shared";
@@ -59,6 +60,7 @@ export type WriterOp =
   | {
       kind: "note";
       actor: Actor;
+      access: Access;
       path: string;
       body: string;
       extra: Frontmatter;
@@ -206,6 +208,9 @@ export class VaultWriter extends DurableObject<Env> {
     const owner = op.scope === "shared" ? "shared" : op.actor.agentId;
     const path = op.scope === "shared" ? `profile/facts/${op.key}.md` : `bots/${op.actor.agentId}/facts/${op.key}.md`;
     const existing = await this.noteByOwnerKey(owner, op.key);
+    // The key resolves to an existing note. Authorize against its classification too, so a caller
+    // cannot replace a finance or health fact by writing the same key with no domain.
+    if (existing) this.assertCanReplace(op.access, existing);
     const statementHash = await sha256Hex(normalizeStatement(op.statement));
     if (existing && existing.statement_hash === statementHash && existing.status === "active") {
       await this.env.DB.prepare("UPDATE notes SET last_confirmed_at = ? WHERE id = ?").bind(new Date().toISOString(), existing.id).run();
@@ -291,7 +296,7 @@ export class VaultWriter extends DurableObject<Env> {
     });
     if (!saved.ok) return saved;
     if (conflict && existing) await this.flagConflict(op.key, id, existing.version_ts ?? existing.id, op.actor, op.observedAt, existing.observed_at);
-    if (op.scope === "shared") await this.refreshSummary(op.actor);
+    await this.refreshSummaryFor(path, op.actor);
     const data = {
       id,
       path,
@@ -384,7 +389,6 @@ export class VaultWriter extends DurableObject<Env> {
               source: op.actor.agentId,
               updated_at: stamp.iso,
               sensitivity: sensitive ? "sensitive" : "normal",
-              domain: op.domain,
             },
             `${op.target === "decisions" ? "# Decisions\n\n" : `# ${stamp.date}\n\n`}${entry}\n`,
           );
@@ -396,7 +400,9 @@ export class VaultWriter extends DurableObject<Env> {
         markdown,
         type: op.target === "decisions" ? "decision" : "journal",
         owner: op.target === "own" ? op.actor.agentId : "shared",
-        domain: op.domain,
+        // A day file holds entries from many writers, so it is never domain-tagged. The entry domain
+        // still decides sensitivity and the write scope, which the service checked before this call.
+        domain: null,
         sensitivity: sensitive ? "sensitive" : "normal",
         factKey: null,
         title: current?.title ?? (op.target === "decisions" ? "Decisions" : stamp.date),
@@ -429,6 +435,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (existing && existing.status !== "active") {
       throw new VaultError("conflict_etag", `Cannot write to a ${existing.status} note`, [existing.status]);
     }
+    if (existing) this.assertCanReplace(op.access, existing);
     if (existing && normalizeEtag(op.ifMatch) !== normalizeEtag(existing.r2_etag)) {
       throw new VaultError("conflict_etag", existing ? "if_match does not match the current etag" : "if_match does not match");
     }
@@ -532,6 +539,7 @@ export class VaultWriter extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM write_intents WHERE op_id = ?", intentId);
     await this.audit(op.actor, "forget", note.path, note.id, "ok", [], hash, stub.length);
     await this.enqueue({ kind: "forget", note_id: note.id, chunk_ids: chunkIds });
+    await this.refreshSummaryFor(note.path, op.actor);
     return { ok: true, data: { id: note.id, path: note.path, status: "forgotten" } };
   }
 
@@ -568,6 +576,7 @@ export class VaultWriter extends DurableObject<Env> {
       journal: null,
     });
     if (!saved.ok) return saved;
+    await this.refreshSummaryFor(note.path, op.actor);
     return { ok: true, data: { id: note.id, path: note.path, etag: saved.data.etag, restored_version: op.versionTs } };
   }
 
@@ -617,7 +626,7 @@ export class VaultWriter extends DurableObject<Env> {
       return { ok: true, data: { skipped: true, reason: "unchanged" } };
     }
     const markdown = await object.text();
-    const hit = await this.contentHit(path, markdown);
+    const hit = await this.contentHit(markdown);
     if (hit) {
       await this.quarantine(path, markdown, hit.reasons, actor, true, actionName, detail, objectEtag);
       return { ok: true, data: { quarantined: true, path, reasons: hit.reasons } };
@@ -656,6 +665,7 @@ export class VaultWriter extends DurableObject<Env> {
       ),
     ]);
     await this.audit(actor, "external_delete", path, note.id, "ok", [], note.content_hash, 0, detail);
+    await this.refreshSummaryFor(path, actor);
     return { ok: true, data: { id: note.id, path, status: "forgotten" } };
   }
 
@@ -738,6 +748,7 @@ export class VaultWriter extends DurableObject<Env> {
       }
       historyCursor = page.truncated ? page.cursor : undefined;
     } while (historyCursor);
+    await this.refreshSummary(actor);
     const count = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM notes").first<{ n: number }>();
     return { ok: true, data: { imported, versions, notes: count?.n ?? 0 } };
   }
@@ -769,7 +780,7 @@ export class VaultWriter extends DurableObject<Env> {
     actor: Actor,
     metaId: string | null = null,
   ): Promise<{ id: string; hash: string } | null> {
-    const hit = await this.contentHit(path, markdown);
+    const hit = await this.contentHit(markdown);
     const id = await this.existingNoteId(path, markdown, metaId);
     let stored = markdown;
     let forced: string | null = null;
@@ -874,6 +885,8 @@ export class VaultWriter extends DurableObject<Env> {
     let purged = 0;
     let rewritten = 0;
     for (const row of rows.results ?? []) {
+      // Purging a run fact regenerates the summary, which would leave this row's etag stale.
+      if (row.path === "profile/summary.md") continue;
       const owned = row.path.includes(op.runId) || row.owner.includes(op.runId);
       const stripped = owned ? null : stripRunContent(row.body, op.runId);
       if (owned || stripped?.empty) {
@@ -909,6 +922,7 @@ export class VaultWriter extends DurableObject<Env> {
         .bind(row.id, like, stripped.markdown)
         .run();
     }
+    await this.refreshSummary(op.actor);
     await this.env.DB.prepare("DELETE FROM journal_entries WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM idempotency WHERE agent_id LIKE ? ESCAPE '\\'").bind(like).run();
     await this.env.DB.prepare("DELETE FROM links WHERE target LIKE ? ESCAPE '\\'").bind(like).run();
@@ -1248,6 +1262,7 @@ export class VaultWriter extends DurableObject<Env> {
       detail: input.detail ?? null,
     });
     if (saved.ok && (type === "journal" || type === "decision")) await restoreJournalMarkers(this.env, id, input.path, markdown, owner);
+    if (saved.ok) await this.refreshSummaryFor(input.path, input.actor);
     return saved;
   }
 
@@ -1324,14 +1339,17 @@ export class VaultWriter extends DurableObject<Env> {
       await this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(id).run();
     }
     await this.audit(actor, action, path, id, "rejected", reasons, hash, markdown.length, detail);
-    if (!alert) return;
+    await this.refreshSummaryFor(path, actor);
+    // The alert file cannot report on itself: appending to it would write the stub back as active.
+    if (!alert || path === "inbox/quarantine.md") return;
     const inbox = await this.noteByPath("inbox/quarantine.md");
-    if (hash && inbox?.body.includes(hash)) return;
+    if (hash && inbox?.status === "active" && inbox.body.includes(hash)) return;
     const ref = runMarker(path) ?? runMarker(actor.agentId);
     const block = `## ${now} · quarantine\nA vault file was excluded from search (${reasons.join(", ")}). Hash ${hash ?? "none"}.${ref ? ` Ref ${ref}.` : ""}\n`;
     const base =
-      inbox?.body ??
-      buildMarkdown({ vault_id: ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal", vault_summary: false }, "# Quarantine\n");
+      inbox?.status === "active"
+        ? inbox.body
+        : buildMarkdown({ vault_id: inbox?.id ?? ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal", vault_summary: false }, "# Quarantine\n");
     const markdownInbox = `${base.endsWith("\n") ? base : `${base}\n`}\n${block}`;
     await this.saveMarkdown({
       id: inbox?.id ?? stringField(parseMarkdown(base).frontmatter.vault_id) ?? ulid(),
@@ -1348,16 +1366,34 @@ export class VaultWriter extends DurableObject<Env> {
       actor,
       ifMatch: inbox?.r2_etag ?? null,
       create: !inbox,
-      reason: "quarantine-alert",
+      reason: !inbox || inbox.status === "active" ? "quarantine-alert" : "updated",
       action: "quarantine_alert",
       idempotencyKey: null,
       journal: null,
     });
   }
 
+  private assertCanReplace(access: Access, existing: NoteRow): void {
+    const sensitivity = existing.sensitivity === "sensitive" ? "sensitive" : "normal";
+    if (!canWrite(access, existing.path, sensitivity, existing.domain)) {
+      throw new VaultError("forbidden_scope", "Scope does not allow this write");
+    }
+  }
+
+  // The summary is derived from shared facts, so any change to one (write, forget, purge, outside edit,
+  // outside delete, quarantine, restore, rebuild) has to regenerate it.
+  private async refreshSummaryFor(path: string, actor: Actor): Promise<void> {
+    if (path.startsWith("profile/facts/")) await this.refreshSummary(actor);
+  }
+
   private async refreshSummary(actor: Actor): Promise<void> {
+    // profile/summary.md is readable with read:shared or any summary scope. A domain-tagged fact needs
+    // read:domain/<d> on its own, so only untagged, normal facts belong in the summary.
     const rows = await this.env.DB.prepare(
-      `SELECT fact_key, body FROM notes WHERE owner = 'shared' AND type = 'fact' AND status = 'active' AND sensitivity = 'normal' ORDER BY fact_key`,
+      `SELECT fact_key, body FROM notes
+       WHERE owner = 'shared' AND type = 'fact' AND status = 'active' AND sensitivity = 'normal' AND domain IS NULL
+         AND path LIKE 'profile/facts/%'
+       ORDER BY fact_key`,
     ).all<{ fact_key: string; body: string }>();
     const lines = ["# Profile", ""];
     for (const row of rows.results ?? []) {
@@ -1365,6 +1401,8 @@ export class VaultWriter extends DurableObject<Env> {
       lines.push(`## ${row.fact_key}`, "", statement, "");
     }
     const existing = await this.noteByPath("profile/summary.md");
+    if (!existing && (rows.results ?? []).length === 0) return;
+    if (existing?.status === "active" && parseMarkdown(existing.body).body.trim() === lines.join("\n").trim()) return;
     const id = existing?.id ?? ulid();
     const markdown = buildMarkdown(
       {
@@ -1412,8 +1450,9 @@ export class VaultWriter extends DurableObject<Env> {
     const existing = await this.noteByPath("inbox/conflicts.md");
     const block = `## ${now} · ${actor.agentId} · ${key}\nObserved ${observedAt}. Previous observed ${previous ?? "unknown"}. Newest observed fact stays active.\n`;
     const base =
-      existing?.body ??
-      buildMarkdown({ vault_id: ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal" }, "# Conflicts\n");
+      existing?.status === "active"
+        ? existing.body
+        : buildMarkdown({ vault_id: existing?.id ?? ulid(), type: "note", owner: "shared", status: "active", sensitivity: "normal" }, "# Conflicts\n");
     const markdown = `${base.endsWith("\n") ? base : `${base}\n`}\n${block}`;
     await this.saveMarkdown({
       id: existing?.id ?? stringField(parseMarkdown(base).frontmatter.vault_id) ?? ulid(),
@@ -1430,7 +1469,7 @@ export class VaultWriter extends DurableObject<Env> {
       actor,
       ifMatch: existing?.r2_etag ?? null,
       create: !existing,
-      reason: "conflict",
+      reason: !existing || existing.status === "active" ? "conflict" : "updated",
       action: "conflict",
       idempotencyKey: null,
       journal: null,
@@ -1495,6 +1534,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare("DELETE FROM notes WHERE id = ?").bind(note.id),
     ]);
     if (audit) await this.audit(actor, "purge", note.path, note.id, "ok", [], note.content_hash, 0);
+    await this.refreshSummaryFor(note.path, actor);
     return { ok: true, data: { purged: true, id: note.id, path: note.path } };
   }
 
@@ -1600,7 +1640,7 @@ export class VaultWriter extends DurableObject<Env> {
         const file = await this.env.VAULT.get(object.key);
         if (!file) continue;
         const markdown = await file.text();
-        const hit = await this.contentHit(path, markdown);
+        const hit = await this.contentHit(markdown);
         if (hit) await this.quarantine(path, markdown, hit.reasons, actor, false, "reconcile", null, normalizeEtag(file.etag));
         else {
           await this.indexBytes({
@@ -1646,8 +1686,9 @@ export class VaultWriter extends DurableObject<Env> {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
   }
 
-  private async contentHit(path: string, markdown: string) {
-    if (isGeneratedNote(path)) return null;
+  // Generated notes are filtered as well. The server's own puts never reach here (their etag matches),
+  // so text in them on this path came from an outside edit or a rebuild.
+  private async contentHit(markdown: string) {
     return inspectWrite(textForFilter(markdown), await this.policy());
   }
 

@@ -17,6 +17,10 @@ export type NoteView = {
 
 export const REVIEWER_SCOPES = ["read:shared", "read:decisions", "read:domain/*", "read:inbox"];
 
+// Ids the server uses for itself. "shared" owns every note outside bots/, so an agent with that id
+// would pass owner checks on shared notes. The others are actor ids for admin and server writes.
+export const RESERVED_AGENT_IDS = new Set(["shared", "owner", "external", "rebuild", "reconcile", "replay", "hiveattic"]);
+
 // Domain config. A name has to be in one of these sets. Sensitive domains stay
 // hidden without read:sensitive/<domain>. Anything not listed is rejected on
 // write and treated as sensitive on read, so a new folder cannot leak through
@@ -77,8 +81,10 @@ export function isSensitive(note: NoteView): boolean {
 export function canRead(access: Access, note: NoteView): boolean {
   if (access.admin || hasScope(access, "read:all")) return true;
   if (note.path === "AGENTS.md" || note.path === "README.md") return true;
+  // Own-folder reads mirror canWrite: a sensitive note in bots/<self>/ still needs the sensitive scope,
+  // except the owner's own journal-sensitive file with no domain.
   const ownFolder = note.path.startsWith(`bots/${access.agentId}/`);
-  if (ownFolder && (note.owner === access.agentId || ownFolder) && (hasScope(access, "read:own") || hasScope(access, "write:own"))) {
+  if (ownFolder && (hasScope(access, "read:own") || hasScope(access, "write:own")) && (!isSensitive(note) || isOwnPiiJournal(access, note))) {
     return true;
   }
   const domain = effectiveDomain(note);
@@ -106,6 +112,10 @@ export function canRead(access: Access, note: NoteView): boolean {
   if (isSummary(note) && domain && hasScope(access, `read:sensitive:summary/${domain}`)) return true;
   if (note.path === "profile/summary.md" && access.scopes.some((scope) => scope.startsWith("read:sensitive:summary/"))) return true;
   return access.scopes.some((scope) => scope.startsWith("read:prefix:") && note.path.startsWith(scope.slice("read:prefix:".length)));
+}
+
+function isOwnPiiJournal(access: Access, note: NoteView): boolean {
+  return note.path.startsWith(`bots/${access.agentId}/journal-sensitive/`) && effectiveDomain(note) === null;
 }
 
 function sensitiveRead(access: Access, note: NoteView, domain: string | null): boolean {

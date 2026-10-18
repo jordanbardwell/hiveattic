@@ -1,4 +1,4 @@
-import { assertClassifiedDomain, canWrite, hasScope, NON_SENSITIVE_DOMAINS, resolveDomain, REVIEWER_SCOPES, type Access } from "./access";
+import { assertClassifiedDomain, canWrite, hasScope, NON_SENSITIVE_DOMAINS, RESERVED_AGENT_IDS, resolveDomain, REVIEWER_SCOPES, type Access } from "./access";
 import { clearAuthCache } from "./auth";
 import { AGENTS_MD, README_MD } from "./content";
 import { hashToken, hmacSha256Hex, randomToken, ulid } from "./crypto";
@@ -7,7 +7,7 @@ import { classifySensitive, inspectWrite, type PolicyTerm } from "./filters";
 import { logEvent } from "./log";
 import { assertVaultPath } from "./access";
 import { factPath, journalPath } from "./paths";
-import { listNotes, noteHistory, readNote, searchVault, stagingResources, whoami } from "./query";
+import { clampInt, listNotes, noteHistory, readNote, searchVault, stagingResources, whoami } from "./query";
 import { etStamp } from "./time";
 import type { Actor, WriterOp } from "./writer-do";
 
@@ -82,6 +82,7 @@ export async function writeFact(
   return perform(env, {
     kind: "fact",
     actor: actor(session),
+    access: session.access,
     key: input.key,
     statement: input.statement,
     scope: input.scope,
@@ -158,6 +159,7 @@ export async function writeNote(
   return perform(env, {
     kind: "note",
     actor: actor(session),
+    access: session.access,
     path,
     body: input.body,
     extra: input.extra ?? {},
@@ -229,6 +231,7 @@ export async function mintToken(
   const reviewer = input.preset === "reviewer";
   const agentId = input.agent_id ?? (reviewer ? "reviewer" : "");
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(agentId)) throw new VaultError("invalid", "agent_id is required");
+  if (RESERVED_AGENT_IDS.has(agentId)) throw new VaultError("invalid", "agent_id is reserved", ["agent_id"]);
   const scopes = reviewer ? REVIEWER_SCOPES : input.scopes;
   if (!scopes?.length) throw new VaultError("invalid", "scopes are required");
   const now = new Date().toISOString();
@@ -354,7 +357,7 @@ export async function listAudit(env: Env, session: Session, limit: number, reque
   if (!session.access.admin && !session.access.scopes.includes("audit:read")) {
     throw new VaultError("forbidden_scope", "Scope does not allow audit reads");
   }
-  const cap = Math.min(Math.max(limit, 1), 200);
+  const cap = clampInt(limit, 50, 1, 200);
   const columns = `seq, ts, request_id, agent_id, token_id, client, action, path, note_id, outcome, reason_codes, content_hash, bytes, ip_country, detail`;
   if (requestId) {
     if (requestId.length > 80) throw new VaultError("invalid", "request_id is too long");

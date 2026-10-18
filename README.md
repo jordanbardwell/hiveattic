@@ -66,6 +66,7 @@ printf '%s' "$ADMIN_TOKEN" | TOKEN_PEPPER="$TOKEN_PEPPER" pnpm hash-token
 pnpm exec wrangler secret put TOKEN_PEPPER
 pnpm exec wrangler secret put ADMIN_TOKEN_HASH
 pnpm exec wrangler secret put AUDIT_KEY
+pnpm exec wrangler secret put JOURNAL_MAC_KEY
 pnpm exec wrangler deploy
 ```
 
@@ -83,7 +84,7 @@ The Durable Object class is created by the `v1` migration during deploy. There i
 
 Set a $10/month budget alert on the Cloudflare account. That alert is account configuration, not a binding in this repo.
 
-Production rate limits are 60 writes per minute and 300 reads per minute per token. `0` disables a limit.
+Production rate limits are 60 writes per minute and 300 reads per minute per token. `0` disables a limit. A JSON-RPC batch on `/mcp` is charged per call: one unit for each write tool call it holds, or one read unit per message when it holds none. Request bodies over 256,000 characters return 400 on REST and MCP.
 
 The live T-06 case sends 140 journal writes in one window, so a deployed limit of 60 returns `429` before the case finishes. Raise the plain var for the run, then deploy again to restore `60` from `wrangler.jsonc`:
 
@@ -117,7 +118,11 @@ A folder under `domains/<name>/` is that domain. A `domain` field that disagrees
 | reader-x | `read:shared`, `read:own`, `write:own`, `read:domain/x`, `write:domain/x` |
 | shared-writer | `read:shared`, `read:own`, `write:own`, `write:shared` |
 
-The same matrix is in `examples/scopes.example.json`. A write into `health` or `finance`, including a note in the caller's own `bots/<self>/` folder, needs `write:sensitive/<domain>`. Finance read-only cannot write finance anywhere. A sensitive note with no domain needs `write:sensitive/pii`, except the owner's own `journal-sensitive` file, which `write:own` can append. Summary scopes see summary paths only. `read:domain/*` does not grant `read:sensitive/finance`.
+The same matrix is in `examples/scopes.example.json`. A write into `health` or `finance`, including a note in the caller's own `bots/<self>/` folder, needs `write:sensitive/<domain>`. Finance read-only cannot write finance anywhere. A sensitive note with no domain needs `write:sensitive/pii`, except the owner's own `journal-sensitive` file, which `write:own` can append. Reads in the caller's own folder follow the same rule: a sensitive note in `bots/<self>/` needs `read:sensitive/<domain>` (or `read:sensitive/pii` without a domain), and the own `journal-sensitive` file needs only `read:own` or `write:own`. A write that replaces an existing note or fact is checked against the existing note's domain and sensitivity as well as the new ones. Summary scopes see summary paths only. `read:domain/*` does not grant `read:sensitive/finance`.
+
+`profile/summary.md` lists the active shared facts that have no domain and normal sensitivity. A domain-tagged fact needs `read:domain/<d>` on its own, so it is left out. The server regenerates the summary whenever a shared fact is written, forgotten, purged, restored, edited or deleted outside the server, quarantined, or rebuilt.
+
+Agent ids `shared`, `owner`, `external`, `rebuild`, `reconcile`, `replay`, and `hiveattic` are reserved for the server. Mint refuses them, and an existing token for one returns 401.
 
 ## Employer list
 
@@ -129,7 +134,7 @@ HIVEATTIC_BASE_URL=... HIVEATTIC_ADMIN_TOKEN=... pnpm policy:apply
 
 `policy/employers.local.txt` is gitignored. A sentence is rejected when it matches an employer term, or when it matches both a subject and a qualifier. An allow term is the escape hatch for a sentence that would otherwise match, such as a personal purchase. Tests insert only fake names.
 
-When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`, and the loser reference is that version's timestamp. Journal files are `journal/YYYY/MM/YYYY-MM-DD.md`. A sensitive entry stays in the writer's own `journal-sensitive` file.
+When two agents write the same shared fact with the same `observed_at` and different text, the incoming write wins because the Durable Object serializes it later. The tie is still flagged in `conflicts`, and the loser reference is that version's timestamp. Journal files are `journal/YYYY/MM/YYYY-MM-DD.md`. A sensitive entry stays in the writer's own `journal-sensitive` file. Journal and decision files are never domain-tagged, because one file holds entries from many writers. An entry's `domain` still decides its sensitivity and the scope the write needs, but it does not change who can read the file.
 
 ## Live end-to-end suite
 
@@ -178,7 +183,7 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 | GET | `/v1/whoami` | `vault_whoami` |
 | GET | `/v1/notes?path=` or `?id=` | `vault_read` |
 | GET | `/v1/search?q=` (`query` is an alias) | `vault_search` |
-| GET | `/v1/list?prefix=` | `vault_list` |
+| GET | `/v1/list?prefix=&cursor=` | `vault_list` (`prefix`, `cursor`) |
 | GET | `/v1/history?path=` | `vault_history` |
 | POST | `/v1/facts` | `vault_write_fact` |
 | POST | `/v1/journal` | `vault_append_journal` |
@@ -189,7 +194,7 @@ MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` retu
 
 Admin routes, all requiring the admin token: bootstrap, token mint and revoke, policy edit, reindex, reconcile, journal order, restore, purge, audit read, append-only verification, and quarantine list. `POST /v1/admin/cleanup` returns 404 unless the staging flag and the staging resource names are both set. A refusal while the flag is on is audited. `GET /v1/admin/audit` accepts `limit`, `request_id`, and `path`. The server always assigns `request_id`. A caller `x-request-id` is echoed as `client_request_id`. Writes to a forgotten or quarantined note return 409. Rebuild and reconcile ignore server journal markers when they run the content filter, and they snapshot the previous bytes before a quarantine.
 
-Writes that fail the secret filter return 422 `rejected_secret`. Card, routing, account, and IBAN failures return `rejected_financial`. SSN, passport, and license failures return `rejected_government_id`. Employer failures return `rejected_employer`. The response lists reason codes and does not echo the value. A human edit that contains a secret stays in R2, is removed from search, and is recorded under `sys/quarantine/` without the secret text. An outside delete tombstones the D1 row and does not write the object back.
+Writes that fail the secret filter return 422 `rejected_secret`. Card, routing, account, and IBAN failures return `rejected_financial`. SSN, passport, and license failures return `rejected_government_id`. Employer failures return `rejected_employer`. The response lists reason codes and does not echo the value. A human edit that contains a secret stays in R2, is removed from search, and is recorded under `sys/quarantine/` without the secret text. The filter skips only the journal markers and frontmatter values the server writes, matched by their exact shape, so other `<!-- hiveattic: -->` comments and `vault_*` keys are filtered like body text. Generated files (`profile/summary.md`, `inbox/quarantine.md`, `inbox/conflicts.md`) are filtered too. An outside delete tombstones the D1 row and does not write the object back.
 
 ## Bindings
 
