@@ -150,14 +150,18 @@ export async function listNotes(env: Env, access: Access, prefix: string, cursor
   const notes: { id: string; path: string; title: string | null; type: string; updated_at: string }[] = [];
   let after = cursor;
   let more = false;
+  // The paths that start with the prefix sort from the prefix up to its end, so the list reads only
+  // that folder from the path index.
+  const end = prefixEnd(prefix);
+  const range = end === null ? "" : "AND path >= ? AND path < ?";
   for (let round = 0; round < 20; round++) {
     const rows = await env.DB.prepare(
       `SELECT id, path, title, type, owner, domain, sensitivity, frontmatter, updated_at, status
-       FROM notes n WHERE status = 'active' AND path LIKE ? ESCAPE '\\' AND (? = '' OR path > ?) AND (${scope.sql})
+       FROM notes n WHERE status = 'active' AND instr(path, ?) = 1 ${range} AND (? = '' OR path > ?) AND (${scope.sql})
          AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
        ORDER BY path LIMIT ?`,
     )
-      .bind(likePrefix(prefix), after, after, ...scope.binds, page + 1)
+      .bind(prefix, ...(end === null ? [] : [prefix, end]), after, after, ...scope.binds, page + 1)
       .all<{ id: string; path: string; title: string | null; type: string; owner: string; domain: string | null; sensitivity: string; frontmatter: string; updated_at: string; status: string }>();
     const batch = rows.results ?? [];
     for (const note of batch.slice(0, page)) {
@@ -235,8 +239,13 @@ export async function whoami(env: Env, access: Access): Promise<Record<string, u
   };
 }
 
-function likePrefix(prefix: string): string {
-  return `${prefix.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+// The first string after every string that starts with prefix: the prefix with its last character
+// one higher. Null when there is none to make, and then the list does without the range.
+function prefixEnd(prefix: string): string | null {
+  const chars = [...prefix];
+  const last = chars.pop()?.codePointAt(0);
+  if (last === undefined || (last >= 0xd7ff && last <= 0xdfff) || last >= 0x10ffff) return null;
+  return chars.join("") + String.fromCodePoint(last + 1);
 }
 
 function extraFilters(options: SearchOptions): { sql: string; binds: string[] } {
@@ -277,25 +286,27 @@ function domainTagSql(access: Access): { sql: string; binds: string[] } {
 
 // A SQL prefilter that is broader than canRead, which still checks every row. No branch reaches
 // sensitive/restricted/ or another bot's bots/<a>/journal-sensitive/ for a non-admin token, and a
-// bot always reaches its own journal-sensitive/ files.
+// bot always reaches its own journal-sensitive/ files. A path that starts with an agent id, a
+// domain name, or a prefix is tested with instr(n.path, ?) = 1, not LIKE: D1 refuses a LIKE
+// pattern longer than 50 bytes, and these can be longer. Case counts, the same as in canRead.
 function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (access.admin) return { sql: "1 = 1", binds: [] };
-  const ownPii = `bots/${access.agentId}/journal-sensitive/%`;
+  const ownPii = `bots/${access.agentId}/journal-sensitive/`;
   const fenced = (inner: { sql: string; binds: string[] }) => ({
-    sql: `n.path NOT LIKE ? AND (n.path NOT LIKE 'bots/%/journal-sensitive/%' OR n.path LIKE ?) AND (${inner.sql})`,
+    sql: `n.path NOT LIKE ? AND (n.path NOT LIKE 'bots/%/journal-sensitive/%' OR instr(n.path, ?) = 1) AND (${inner.sql})`,
     binds: [RESTRICTED_LIKE, ownPii, ...inner.binds],
   });
   if (hasScope(access, "read:all")) return fenced({ sql: "1 = 1", binds: [] });
   const parts: { sql: string; binds: string[] }[] = [
     { sql: "n.path IN ('AGENTS.md', 'README.md')", binds: [] },
-    { sql: "n.path LIKE ?", binds: [ownPii] },
+    { sql: "instr(n.path, ?) = 1", binds: [ownPii] },
   ];
   if (hasScope(access, "read:own") || hasScope(access, "write:own")) {
-    parts.push({ sql: "n.path LIKE ?", binds: [`bots/${access.agentId}/%`] });
+    parts.push({ sql: "instr(n.path, ?) = 1", binds: [`bots/${access.agentId}/`] });
   }
   for (const scope of access.scopes) {
     const summary = /^read:sensitive:summary\/([a-z0-9-]+)$/.exec(scope);
-    if (summary) parts.push({ sql: "(n.path LIKE ? OR n.path = 'profile/summary.md')", binds: [`domains/${summary[1]}/summaries/%`] });
+    if (summary) parts.push({ sql: "(instr(n.path, ?) = 1 OR n.path = 'profile/summary.md')", binds: [`domains/${summary[1]}/summaries/`] });
   }
   const visible: { sql: string; binds: string[] }[] = [];
   if (hasScope(access, "read:shared")) {
@@ -310,13 +321,13 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
   if (hasScope(access, "read:decisions")) visible.push({ sql: "n.path = 'shared/decisions.md'", binds: [] });
   for (const scope of access.scopes) {
     const domain = /^read:domain\/([a-z0-9-]+)$/.exec(scope);
-    if (domain) visible.push({ sql: "(n.domain = ? OR n.path LIKE ?)", binds: [domain[1]!, `domains/${domain[1]}/%`] });
+    if (domain) visible.push({ sql: "(n.domain = ? OR instr(n.path, ?) = 1)", binds: [domain[1]!, `domains/${domain[1]}/`] });
     if (scope === "read:domain/*") visible.push({ sql: "(n.domain IS NOT NULL OR n.path LIKE 'domains/%')", binds: [] });
     const bot = /^read:bots\/([a-z0-9-]+)$/.exec(scope);
-    if (bot) visible.push({ sql: "n.path LIKE ?", binds: [`bots/${bot[1]}/%`] });
+    if (bot) visible.push({ sql: "instr(n.path, ?) = 1", binds: [`bots/${bot[1]}/`] });
     if (scope === "read:bots/*") visible.push({ sql: "n.path LIKE 'bots/%'", binds: [] });
     const prefix = scope.startsWith("read:prefix:") ? scope.slice("read:prefix:".length) : "";
-    if (prefix) visible.push({ sql: "n.path LIKE ?", binds: [likePrefix(prefix)] });
+    if (prefix) visible.push({ sql: "instr(n.path, ?) = 1", binds: [prefix] });
   }
   if (visible.length) {
     const tag = domainTagSql(access);
@@ -330,7 +341,7 @@ function scopeSql(access: Access): { sql: string; binds: string[] } {
   for (const scope of access.scopes) {
     const sens = /^read:sensitive\/([a-z0-9-]+)$/.exec(scope);
     if (sens && sens[1] !== "pii" && sens[1] !== "*") {
-      parts.push({ sql: "(n.domain = ? OR n.path LIKE ? OR n.path LIKE ?)", binds: [sens[1]!, `domains/${sens[1]}/%`, `sensitive/${sens[1]}/%`] });
+      parts.push({ sql: "(n.domain = ? OR instr(n.path, ?) = 1 OR instr(n.path, ?) = 1)", binds: [sens[1]!, `domains/${sens[1]}/`, `sensitive/${sens[1]}/`] });
     }
     if (scope === "read:sensitive/*" && sensitive.length) {
       parts.push({
@@ -350,11 +361,11 @@ function ordinaryDomainSql(): { sql: string; binds: string[] } {
   const ordinary = [...ordinarySet];
   const sensitive = [...sensitiveSet];
   const domainClause = ordinary.length ? `(n.domain IS NULL OR n.domain IN (${ordinary.map(() => "?").join(", ")}))` : "n.domain IS NULL";
-  const sensitivePaths = sensitive.map(() => " AND n.path NOT LIKE ?").join("");
-  const ordinaryPaths = ordinary.length ? ` OR ${ordinary.map(() => "n.path LIKE ?").join(" OR ")}` : "";
+  const sensitivePaths = sensitive.map(() => " AND instr(n.path, ?) != 1").join("");
+  const ordinaryPaths = ordinary.length ? ` OR ${ordinary.map(() => "instr(n.path, ?) = 1").join(" OR ")}` : "";
   return {
     sql: `(n.sensitivity != 'sensitive' AND ${domainClause}${sensitivePaths} AND n.path NOT LIKE 'sensitive/%' AND (n.path NOT LIKE 'domains/%'${ordinaryPaths}))`,
-    binds: [...ordinary, ...sensitive.map((name) => `domains/${name}/%`), ...ordinary.map((name) => `domains/${name}/%`)],
+    binds: [...ordinary, ...sensitive.map((name) => `domains/${name}/`), ...ordinary.map((name) => `domains/${name}/`)],
   };
 }
 
