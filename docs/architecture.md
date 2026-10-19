@@ -31,6 +31,8 @@ When two agents write the same shared fact with the same `observed_at` and diffe
 
 Only active notes are served to non-admin callers: a forgotten, moved, or superseded note is 404 by path, id, and history. The admin token reads the stub. An outside delete, or a reconcile that finds the object missing, forgets the note like the API does, and the last indexed body stays in history for the admin token. A delete event for a key that exists again is ignored. An outside create or copy gets its `vault_id` written into its frontmatter, so a rebuild keeps the same id. A forgotten note's path, a forgotten fact's key, and a day file the admin forgot can be written again; the new write gets a new id and the forgotten row keeps its admin-only history.
 
+A `[[link]]` resolves to the note that its target names: the path, the path without `.md`, a part of the path after a slash, a fact key, or an alias. Case does not count. A path wins over a fact key, and a fact key wins over an alias. A link never resolves to the note that holds it, and a link from outside `sensitive/` never resolves into it. The `note_names` table keeps these names for each note, so a write finds the targets of all its links in one query. Each write keeps the table right, and the nightly reconcile repairs it.
+
 Every version is an immutable copy under `sys/history/<id>/`, labelled with the write that produced it, so history shows each version's own text and `POST /v1/admin/restore` restores it. Journal day files keep no copies.
 
 ## Time zone

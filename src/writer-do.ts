@@ -618,7 +618,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (!saved.ok) return saved;
     if (moving && active) {
       await this.retireMoved(active, path, op.actor, true);
-      await this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id).run();
+      await this.env.DB.batch([this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id), ...this.refreshNames([id])]);
     }
     if (conflict && active) await this.flagConflict(op.key, id, active.version_ts ?? active.id, op.actor, op.observedAt, active.observed_at);
     if (op.scope === "shared" || moving) await this.refreshSummary(op.actor);
@@ -906,6 +906,7 @@ export class VaultWriter extends DurableObject<Env> {
         `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', r2_etag = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?
          WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), hash, etag.etag, now, etag.versionTs, op.actor.agentId, this.gen(), note.id),
+      ...this.refreshNames([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare(
@@ -1041,6 +1042,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare(
         `UPDATE notes SET status = 'forgotten', body = ?, frontmatter = ?, content_hash = ?, r2_etag = NULL, updated_at = ?, last_writer = ?, index_gen = ? WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), now, actor.agentId, this.gen(), note.id),
+      ...this.refreshNames([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
@@ -1146,6 +1148,7 @@ export class VaultWriter extends DurableObject<Env> {
         `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', fact_key = NULL, r2_etag = ?, updated_at = ?, last_writer = ?, index_gen = ?
          WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), etag, now, actor.agentId, this.gen(), note.id),
+      ...this.refreshNames([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
@@ -1356,6 +1359,8 @@ export class VaultWriter extends DurableObject<Env> {
         statements.push(this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(input.id));
       }
     }
+    // An append changes only the body, so the names of the note stay as they are.
+    if (!(appending && existing)) statements.push(...this.refreshNames([input.id]));
     // F15: every version is an immutable copy under sys/history/<id>/, labelled with the write that
     // produced it, so history shows each version's own text and restoring one restores it.
     // A journal day file is append-only and never restored, so it keeps no copies. The generated
@@ -1724,9 +1729,10 @@ export class VaultWriter extends DurableObject<Env> {
       await this.env.VAULT.delete(key);
     }
     const parked = `.forgotten/${row.id}.md`;
-    await this.env.DB.prepare("UPDATE notes SET path = ?, r2_key = ?, fact_key = NULL WHERE id = ? AND status = 'forgotten'")
-      .bind(parked, r2KeyFor(this.prefix(), parked), row.id)
-      .run();
+    await this.env.DB.batch([
+      this.env.DB.prepare("UPDATE notes SET path = ?, r2_key = ?, fact_key = NULL WHERE id = ? AND status = 'forgotten'").bind(parked, r2KeyFor(this.prefix(), parked), row.id),
+      ...this.refreshNames([row.id]),
+    ]);
   }
 
   // Indexes what R2 holds at a path now, so the next attempt of a write works from the stored file.
@@ -1780,6 +1786,7 @@ export class VaultWriter extends DurableObject<Env> {
       ).bind(note.id, now, actor.agentId, reason, now, hash, note.path),
       ...this.vectorDeletes(chunkIds, note.id, now),
       this.env.DB.prepare("DELETE FROM notes WHERE id = ?").bind(note.id),
+      ...this.refreshNames([note.id]),
     ]);
     if (feedsSummary(note)) {
       // The summary is regenerated without the erased statement. Its earlier versions quoted it, and
@@ -2212,7 +2219,13 @@ export class VaultWriter extends DurableObject<Env> {
       }
     }
     await this.flushRows(rows, now);
-    if (keepAlive.length) await this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE id IN (SELECT value FROM json_each(?))").bind(gen, JSON.stringify(keepAlive)).run();
+    // A row kept as it is gets its names made again too, so a rebuild repairs the name table.
+    if (keepAlive.length) {
+      await this.env.DB.batch([
+        this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE id IN (SELECT value FROM json_each(?))").bind(gen, JSON.stringify(keepAlive)),
+        ...this.refreshNames(keepAlive),
+      ]);
+    }
     // A path read back at its normal size is no longer oversize.
     const indexed = rows.notes.map((row) => String(row[1]));
     if (indexed.length) await this.env.DB.prepare("DELETE FROM oversize_files WHERE path IN (SELECT value FROM json_each(?))").bind(JSON.stringify(indexed)).run();
@@ -2242,9 +2255,12 @@ export class VaultWriter extends DurableObject<Env> {
         db.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
         db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
         db.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(replaced),
+        ...this.refreshNames(rows.replaced),
       );
     }
-    if (rows.unkeyed.length) statements.push(db.prepare("UPDATE notes SET fact_key = NULL WHERE id IN (SELECT value FROM json_each(?))").bind(ids(rows.unkeyed)));
+    if (rows.unkeyed.length) {
+      statements.push(db.prepare("UPDATE notes SET fact_key = NULL WHERE id IN (SELECT value FROM json_each(?))").bind(ids(rows.unkeyed)), ...this.refreshNames(rows.unkeyed));
+    }
     const staged = rows.notes.map((row) => String(row[0]));
     for (const json of jsonSlices(rows.notes)) {
       statements.push(
@@ -2256,6 +2272,7 @@ export class VaultWriter extends DurableObject<Env> {
     }
     if (staged.length) {
       const stagedIds = ids(staged);
+      statements.push(...this.refreshNames(staged));
       statements.push(db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
       statements.push(db.prepare("DELETE FROM links WHERE src_note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
       const entryIds = JSON.stringify(rows.journal.map((row) => row[0]));
@@ -2386,6 +2403,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
       this.env.DB.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(json),
+      ...this.refreshNames(stale),
     ]);
     this.count(job, "swept", stale.length);
     return stale.length < 100;
@@ -2400,16 +2418,8 @@ export class VaultWriter extends DurableObject<Env> {
     if (!list.length) return true;
     const first = list[0]!;
     const last = list.at(-1)!;
-    const file = "(CASE WHEN links.target LIKE '%.md' THEN links.target ELSE links.target || '.md' END)";
     const fence = "(n.path NOT LIKE 'sensitive/%' OR (SELECT s.path FROM notes s WHERE s.id = links.src_note_id) LIKE 'sensitive/%')";
-    await this.env.DB.prepare(
-      `UPDATE links SET dst_note_id = COALESCE(
-         (SELECT n.id FROM notes n WHERE n.id != links.src_note_id AND n.status = 'active' AND ${fence}
-            AND (n.path = links.target OR n.path = ${file} OR n.fact_key = links.target OR n.path LIKE '%/' || ${file}) LIMIT 1),
-         (SELECT n.id FROM notes n, json_each(CASE WHEN json_valid(n.frontmatter) THEN n.frontmatter ELSE '{}' END, '$.aliases') a
-            WHERE n.id != links.src_note_id AND n.status = 'active' AND ${fence} AND lower(a.value) = lower(links.target) LIMIT 1))
-       WHERE rowid BETWEEN ? AND ?`,
-    )
+    await this.env.DB.prepare(`UPDATE links SET dst_note_id = ${linkTargetSql("links.target", "links.src_note_id", fence)} WHERE rowid BETWEEN ? AND ?`)
       .bind(first, last)
       .run();
     this.count(job, "links", list.length);
@@ -2437,7 +2447,7 @@ export class VaultWriter extends DurableObject<Env> {
   // Reconcile: index files whose etag differs from D1, then forget rows whose object is missing.
   private async reconcileStep(job: Job, deadline: number): Promise<boolean> {
     if (job.phase === "start") {
-      for (const name of ["scanned", "updated", "moved", "forgotten", "oversize"]) job.counts[name] = 0;
+      for (const name of ["scanned", "updated", "moved", "forgotten", "oversize", "names"]) job.counts[name] = 0;
       this.nextPhase(job, "files");
     }
     const actor: Actor = { agentId: "reconcile", tokenId: "reconcile", client: "reconcile", requestId: job.actor.requestId, ipCountry: null };
@@ -2480,6 +2490,10 @@ export class VaultWriter extends DurableObject<Env> {
         for (const record of records.results ?? []) {
           if (!(await this.env.VAULT.head(r2KeyFor(this.prefix(), record.path)))) await this.clearOversize(record.path);
         }
+        // Each write keeps the name table right. This repairs it after a write that missed it, such as
+        // one by the code from before the table, while a deploy applied the migration.
+        const repaired = await this.env.DB.batch(NOTE_NAMES_REPAIR.map((sql) => this.env.DB.prepare(sql)));
+        this.count(job, "names", repaired.reduce((sum, result) => sum + (result.meta.changes ?? 0), 0));
         this.nextPhase(job, "quarantine");
       }
       return false;
@@ -2681,37 +2695,24 @@ export class VaultWriter extends DurableObject<Env> {
     return (rows.results ?? []).map((row) => row.id);
   }
 
+  // Looks up every link target of a write in one query. A link from outside sensitive/ never resolves into it.
   private async resolvedLinks(srcId: string, srcPath: string, targets: string[]): Promise<{ target: string; dst: string | null }[]> {
-    const links: { target: string; dst: string | null }[] = [];
-    for (const target of targets) {
-      links.push({ target, dst: await this.lookupTarget(target, srcId, srcPath.startsWith("sensitive/")) });
-    }
-    return links;
+    if (!targets.length) return [];
+    const fence = srcPath.startsWith("sensitive/") ? "1" : "n.path NOT LIKE 'sensitive/%'";
+    const rows = await this.env.DB.prepare(`SELECT t.value AS target, ${linkTargetSql("t.value", "?", fence)} AS dst FROM json_each(?) t`)
+      .bind(srcId, JSON.stringify(targets))
+      .all<{ target: string; dst: string | null }>();
+    return rows.results ?? [];
   }
 
-  private async lookupTarget(target: string, except: string, fromSensitive: boolean): Promise<string | null> {
-    const file = target.endsWith(".md") ? target : `${target}.md`;
-    const fence = fromSensitive ? "" : "AND path NOT LIKE 'sensitive/%'";
-    const row = await this.env.DB.prepare(
-      `SELECT id FROM notes WHERE id != ? AND status = 'active' ${fence} AND (path = ? OR path = ? OR fact_key = ? OR path LIKE ?) LIMIT 1`,
-    )
-      .bind(except, target, file, target, `%/${file}`)
-      .first<{ id: string }>();
-    if (row) return row.id;
-    const candidates = await this.env.DB.prepare(
-      `SELECT id, frontmatter FROM notes WHERE id != ? AND status = 'active' ${fence} AND instr(lower(frontmatter), lower(?)) > 0 LIMIT 20`,
-    )
-      .bind(except, `"${target.toLowerCase()}"`)
-      .all<{ id: string; frontmatter: string }>();
-    for (const candidate of candidates.results ?? []) {
-      try {
-        const fm = JSON.parse(candidate.frontmatter) as Frontmatter;
-        if (stringList(fm.aliases).some((alias) => alias.toLowerCase() === target.toLowerCase())) return candidate.id;
-      } catch {
-        continue;
-      }
-    }
-    return null;
+  // Makes the note_names rows of these notes again from their note rows, or removes them for a note
+  // that is gone. Each batch that changes a note's path, fact key, or frontmatter includes these.
+  private refreshNames(ids: string[]): D1PreparedStatement[] {
+    const json = JSON.stringify(ids);
+    return [
+      this.env.DB.prepare("DELETE FROM note_names WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare(NOTE_NAMES_FILL).bind(json),
+    ];
   }
 
   private backfillLinks(id: string, path: string, factKey: string | null, aliases: string[]): D1PreparedStatement {
@@ -2807,6 +2808,50 @@ function keyReused(): VaultError {
 function idempotencyFields(idem: Idem, outcome: string, rerouted: boolean): Frontmatter {
   if (!idem.key) return {};
   return { vault_idempotency: idem.key, vault_idempotency_hash: idem.hash, vault_outcome: outcome, vault_rerouted: rerouted ? true : null };
+}
+
+// The note_names rows of the notes that `picked` selects: each name a [[link]] can use for a note, in
+// lower case, with its kind: 0 the path, 1 a part of the path after a slash, 2 the fact key, 3 an
+// alias. migrations/0006_note_names.sql fills the table with the same statement for every note.
+function noteNames(picked: string): string {
+  return `WITH RECURSIVE
+  picked AS (${picked}),
+  tail(id, rest) AS (
+    SELECT id, substr(path, instr(path, '/') + 1) FROM picked WHERE instr(path, '/') > 0
+    UNION ALL SELECT id, substr(rest, instr(rest, '/') + 1) FROM tail WHERE instr(rest, '/') > 0
+  ),
+  named(name, id, kind) AS (
+    SELECT path, id, 0 FROM picked
+    UNION ALL SELECT rest, id, 1 FROM tail
+    UNION ALL SELECT fact_key, id, 2 FROM picked WHERE fact_key IS NOT NULL
+    UNION ALL SELECT trim(a.value), p.id, 3 FROM picked p,
+      json_each(CASE WHEN json_valid(p.frontmatter) THEN CASE json_type(p.frontmatter, '$.aliases') WHEN 'array' THEN p.frontmatter END END, '$.aliases') a
+      WHERE a.type = 'text'
+  )
+SELECT lower(name), id, MIN(kind) FROM named WHERE name != '' GROUP BY lower(name), id`;
+}
+
+// The note_names rows of the notes whose ids are bound.
+export const NOTE_NAMES_FILL = `INSERT INTO note_names (name, note_id, kind)\n${noteNames("SELECT id, path, fact_key, frontmatter FROM notes WHERE id IN (SELECT value FROM json_each(?))")}`;
+
+// Makes the whole name table equal to the notes: removes each row that the notes do not give, then
+// adds each row that is missing. When the table is already right, the two statements write nothing.
+const ALL_NAMES = noteNames("SELECT id, path, fact_key, frontmatter FROM notes");
+export const NOTE_NAMES_REPAIR = [
+  `DELETE FROM note_names WHERE (name, note_id, kind) NOT IN (${ALL_NAMES})`,
+  `INSERT INTO note_names (name, note_id, kind)\n${ALL_NAMES}\nEXCEPT SELECT name, note_id, kind FROM note_names`,
+];
+
+// The note a link target names, with the same rules on a write and in a rebuild. A path name (kind 0
+// or 1) matches the target or the target with .md, a fact key or an alias matches the target only.
+// The lowest kind wins, then a name equal to the target, then the oldest note. Case does not count.
+// A link never resolves to the note that holds it.
+export function linkTargetSql(target: string, source: string, fence: string): string {
+  // CROSS JOIN keeps note_names as the outer loop, so the lookup starts from the name index.
+  return `(SELECT nn.note_id FROM note_names nn CROSS JOIN notes n ON n.id = nn.note_id
+    WHERE nn.name IN (lower(${target}), lower(${target}) || '.md') AND (nn.kind < 2 OR nn.name = lower(${target}))
+      AND n.id != ${source} AND n.status = 'active' AND ${fence}
+    ORDER BY nn.kind, nn.name != lower(${target}), n.rowid LIMIT 1)`;
 }
 
 type StoredReply = { response: string; at: string; payload_hash: string | null };
