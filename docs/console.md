@@ -10,4 +10,6 @@ It shows the hive of recent memories, notes with their links and version history
 
 **New agent** and **New token** call `POST /v1/admin/tokens` with the scopes `read:all`, `read:own`, `write:own`, and `write:shared`. The console shows the token, the MCP address, and the header one time only.
 
+**Copy agent instructions** copies setup text that you paste to an AI agent. The text has the MCP address of this worker and a token. It tells the agent to add the MCP server, call `vault_whoami`, read `AGENTS.md`, and then tell you how the vault works. The vault keeps only a hash of each token. Thus the button on an agent page makes a new token first. The console does not store the text.
+
 It reads two admin-only routes besides the ones in [api.md](api.md): `GET /v1/admin/agents` (agents, token metadata without hashes, writes in the last 24 hours) and `GET /v1/admin/overview` (the 500 most recently updated notes without bodies, links between them, writes per hour for 24 hours, open conflicts).
