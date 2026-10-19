@@ -75,6 +75,12 @@ export function isFactPath(path: string): boolean {
   return /(^|\/)facts\/[^/]+\.md$/.test(path);
 }
 
+// profile/summary.md is generated from the shared facts on every change to them. The facts keep
+// their own links and history, so the summary stores no links and no history copies.
+export function isGeneratedFile(path: string): boolean {
+  return path === "profile/summary.md";
+}
+
 export function isServerManagedPath(path: string): boolean {
   return path === "profile/summary.md" || isFactPath(path);
 }

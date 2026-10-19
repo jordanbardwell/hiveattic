@@ -23,6 +23,7 @@ import {
   inSensitiveFolder,
   isAppendOnlyPath,
   isFactPath,
+  isGeneratedFile,
   isServerDocument,
   journalPath,
   ownerForPath,
@@ -1251,7 +1252,8 @@ export class VaultWriter extends DurableObject<Env> {
     if (utf8Length(input.markdown) > FILE_LIMIT_BYTES) throw fileTooLarge();
     const existing = input.create ? null : await this.noteByPath(input.path);
     const appending = input.reason === "appended" || input.reason === "conflict";
-    if (existing && !appending && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
+    const generated = isGeneratedFile(input.path);
+    if (existing && !appending && !generated && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
       await this.snapshotIfUnversioned(existing, input.actor.agentId);
     }
     const hash = await sha256Hex(input.markdown);
@@ -1278,7 +1280,7 @@ export class VaultWriter extends DurableObject<Env> {
     const frontmatter = JSON.stringify(parsed.frontmatter);
     const appendedText = appending && existing && input.markdown.startsWith(existing.body) ? input.markdown.slice(existing.body.length) : null;
     const chunks = appending && existing ? chunkMarkdown(input.path, input.title, appendedText ?? parsed.body) : chunkMarkdown(input.path, input.title, parsed.body);
-    const links = await this.resolvedLinks(input.id, input.path, linkTargets(appendedText ?? parsed.body));
+    const links = generated ? [] : await this.resolvedLinks(input.id, input.path, linkTargets(appendedText ?? parsed.body));
     const versionTs = versionStamp();
     const r2Key = r2KeyFor(this.prefix(), input.path);
     const gen = this.gen();
@@ -1349,9 +1351,10 @@ export class VaultWriter extends DurableObject<Env> {
     }
     // F15: every version is an immutable copy under sys/history/<id>/, labelled with the write that
     // produced it, so history shows each version's own text and restoring one restores it.
-    // A journal day file is append-only and never restored, so it keeps no copies.
+    // A journal day file is append-only and never restored, so it keeps no copies. The generated
+    // summary keeps none either: it is made again from the facts, which keep their own.
     let historyKey: string | null = null;
-    if (!appending && !input.journal) {
+    if (!appending && !input.journal && !generated) {
       historyKey = await this.historyCopy(input.id, versionTs, hash, input.markdown);
       statements.push(
         this.env.DB.prepare(
@@ -1547,19 +1550,25 @@ export class VaultWriter extends DurableObject<Env> {
     }
     const existing = await this.noteByPath("profile/summary.md");
     const id = existing?.id ?? ulid();
-    const markdown = buildMarkdown(
-      {
-        vault_id: id,
-        type: "profile",
-        owner: "shared",
-        status: "active",
-        sensitivity: "normal",
-        source: "hiveattic",
-        updated_at: new Date().toISOString(),
-        vault_summary: true,
-      },
-      lines.join("\n"),
-    );
+    const build = (updatedAt: string) =>
+      buildMarkdown(
+        {
+          vault_id: id,
+          type: "profile",
+          owner: "shared",
+          status: "active",
+          sensitivity: "normal",
+          source: "hiveattic",
+          updated_at: updatedAt,
+          vault_summary: true,
+        },
+        lines.join("\n"),
+      );
+    // A change that leaves the list as it was, such as a fact with a domain tag, writes nothing.
+    // The stored file must match byte for byte apart from updated_at, so an outside edit is still replaced.
+    const stamped = existing?.status === "active" && existing.r2_etag ? stringField(parseFrontmatter(existing.frontmatter).updated_at) : undefined;
+    if (stamped && build(stamped) === existing!.body) return;
+    const markdown = build(new Date().toISOString());
     await this.saveMarkdown({
       id,
       path: "profile/summary.md",
@@ -2165,7 +2174,7 @@ export class VaultWriter extends DurableObject<Env> {
       ]);
       if (status === "active") {
         for (const chunk of chunkMarkdown(file.path, title, file.parsed.body)) rows.chunks.push([`${id}:${chunk.n}`, id, chunk.n, chunk.text, title, file.path, chunk.tokenCount]);
-        for (const target of linkTargets(file.parsed.body)) rows.links.push([id, target]);
+        if (!isGeneratedFile(file.path)) for (const target of linkTargets(file.parsed.body)) rows.links.push([id, target]);
       }
       // L5: idempotency rows inside the 7-day window come back from the files themselves: the MAC'd
       // markers of journal entries, and the frontmatter of notes, facts, and keyed forget stubs.
