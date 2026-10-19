@@ -41,6 +41,7 @@ pnpm test
 - `test/rebuild.test.ts`: a rebuild of about 150 notes as a paged job, with bounded D1 and R2 round trips, a rebuild after D1 lost its version, link, and idempotency rows, a failed page, and duplicated files.
 - `test/review.test.ts`, `test/pr2.test.ts`, `test/classify.test.ts`: earlier review regressions and the classifier.
 - `test/indexes.test.ts`: the lookups that every write runs use an index, not a table scan.
+- `test/prefix-limits.test.ts`: lists, searches, and scopes with a folder, an agent id, a domain name, or a `read:prefix:` scope longer than the 50-byte LIKE limit of D1, and a prefix with `_`.
 - `test/links.test.ts`: the rules for link targets, links into `sensitive/`, long link targets, one lookup for all links of a write, and a name table that stays equal to the notes.
 - `test/write-calls.test.ts`: the number of D1 round trips for a journal append and a note update, chunk numbers across appends, and links that point at a new day file.
 
