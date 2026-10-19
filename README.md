@@ -28,13 +28,15 @@ Your copy gets the updates from this repository one time each day. For updates, 
 
 ## Connect an agent
 
-1. Make a token for the agent:
+1. Make a token for the agent. Use one of these two methods:
+   - In the console, open **Agents** and click **New agent**. Enter a name.
+   - Send this request:
 
-   ```sh
-   curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/tokens" \
-     -H "authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
-     -d '{"agent_id": "my-agent", "scopes": ["read:all", "read:own", "write:own", "write:shared"]}'
-   ```
+     ```sh
+     curl -X POST "https://<worker>.<subdomain>.workers.dev/v1/admin/tokens" \
+       -H "authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
+       -d '{"agent_id": "my-agent", "scopes": ["read:all", "read:own", "write:own", "write:shared"]}'
+     ```
 
 2. Copy the token from the reply. The vault shows it one time only.
 

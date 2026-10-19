@@ -9,11 +9,9 @@ pnpm install
 cp .dev.vars.example .dev.vars
 ```
 
-Put long random strings in `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`. Hash the admin token with the same pepper and put the hex digest in `ADMIN_TOKEN_HASH`:
+Put long random strings in `TOKEN_PEPPER`, `AUDIT_KEY`, and `JOURNAL_MAC_KEY`. Put an admin password of 16 characters or more in `ADMIN_TOKEN`.
 
-```sh
-printf '%s' 'the-admin-token' | TOKEN_PEPPER='the-pepper' pnpm hash-token
-```
+Use `pnpm dev` to start the local server. It sends each value in `.dev.vars` to the dev server. When `wrangler.jsonc` lists required secrets, the dev server by itself reads only those names from `.dev.vars`.
 
 Apply migrations locally before the first request, start the dev server, then `POST /v1/admin/bootstrap`:
 
