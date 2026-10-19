@@ -1,6 +1,6 @@
 # Architecture
 
-HiveAttic is a shared memory vault for agents. Markdown in R2 is the source of truth. D1 is a rebuildable keyword index. A single Durable Object serializes writes and runs the long admin jobs.
+HiveAttic is a shared memory vault for agents. Markdown in R2 is the source of truth. D1 is a rebuildable keyword index. A single Durable Object serializes writes and runs the long admin jobs. Each write waits for the write before it, so a write makes few D1 round trips. A journal append makes one batch of reads and one batch of writes.
 
 This is the Milestone 1 vault: REST and MCP, bearer tokens and scopes, an append-only audit log, and a queue consumer for R2 object notifications. Semantic search, OAuth, and the cost load test are later milestones.
 
