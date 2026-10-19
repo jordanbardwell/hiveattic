@@ -54,12 +54,14 @@ button, input, select, textarea { font-family: inherit; }
 
 /* shell */
 .shell { height: 100vh; min-width: 900px; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 52px minmax(0, 1fr); overflow: hidden; font-size: 13px; background: var(--bg); }
-.top { background: var(--bg); border-bottom: 1px solid var(--line); min-width: 0; overflow: hidden; display: flex; align-items: center; gap: 16px; padding: 0 20px; }
+.top { background: var(--bg); border-bottom: 1px solid var(--line); min-width: 0; overflow: hidden; display: grid; grid-template-columns: minmax(max-content, 1fr) minmax(150px, 340px) minmax(max-content, 1fr); align-items: center; gap: 16px; padding: 0 20px; }
+.top-side { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.top-side.end { justify-content: flex-end; }
 .brand { display: flex; align-items: center; gap: 9px; cursor: pointer; }
 .brand-mark { width: 14px; height: 16px; background: var(--honey); flex-shrink: 0; }
 .brand-name { font: 600 15px var(--sans); letter-spacing: -.01em; }
 .hive-pill { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border: 1px solid #232326; border-radius: 8px; white-space: nowrap; font-weight: 500; }
-.search-pill { margin-left: auto; flex: 0 1 340px; min-width: 150px; height: 32px; border: 1px solid #232326; border-radius: 999px; background: var(--hover-3); display: flex; align-items: center; justify-content: space-between; padding: 0 6px 0 16px; color: var(--muted-2); cursor: text; gap: 8px; }
+.search-pill { min-width: 0; height: 32px; border: 1px solid #232326; border-radius: 999px; background: var(--hover-3); display: flex; align-items: center; justify-content: space-between; padding: 0 6px 0 16px; color: var(--muted-2); cursor: text; gap: 8px; }
 .search-pill:hover { border-color: var(--b5); }
 .keycap { font: 400 11px var(--mono); border: 1px solid #232326; border-radius: 999px; padding: 2px 8px; background: var(--input); color: var(--muted-2); white-space: nowrap; }
 .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: var(--sec); user-select: none; white-space: nowrap; }
@@ -981,19 +983,21 @@ input.field { height: 36px; }
     const healthText = S.loadErr ? "Could not load the vault" : conflicts ? plural(conflicts, "conflict") + (conflicts === 1 ? " needs you" : " need you") : "All systems normal";
     return h("div", { class: "shell" },
       h("header", { class: "top" },
-        h("div", { class: "brand", onClick: () => go("overview") }, h("div", { class: "brand-mark hex" }), h("span", { class: "brand-name" }, "HiveAttic")),
-        h("span", { class: "sep" }, "/"),
-        h("div", { class: "hive-pill" }, "Personal Hive", S.tech && ov ? h("span", { class: "mono", style: { fontSize: "11px", color: "var(--muted-2)", fontWeight: 400 } }, ov.vault.deploy_env) : null),
+        h("div", { class: "top-side" },
+          h("div", { class: "brand", onClick: () => go("overview") }, h("div", { class: "brand-mark hex" }), h("span", { class: "brand-name" }, "HiveAttic")),
+          h("span", { class: "sep" }, "/"),
+          h("div", { class: "hive-pill" }, "Personal Hive", S.tech && ov ? h("span", { class: "mono", style: { fontSize: "11px", color: "var(--muted-2)", fontWeight: 400 } }, ov.vault.deploy_env) : null)),
         h("div", { class: "search-pill", onClick: openPalette }, h("span", { class: "ellip" }, "Search notes, facts, agents"), h("span", { class: "keycap" }, "⌘K")),
-        h("div", { class: "toggle" + (S.tech ? " on" : ""), onClick: () => { S.tech = !S.tech; savePrefs(); render(); } }, h("span", { class: "toggle-track" }, h("span", { class: "toggle-knob" })), "Technical details"),
-        h("div", { class: "health" }, h("span", { class: "dot", style: { background: healthDot } }), healthText),
-        h("div", { class: "avatar-wrap" },
-          h("button", { class: "avatar", title: "Account", "aria-label": "Account", onClick: () => set({ userMenu: !S.userMenu }) }, "YOU"),
-          S.userMenu ? [h("div", { class: "menu-scrim", onClick: () => set({ userMenu: false }) }),
-            h("div", { class: "menu pop", style: { top: "38px" } },
-              h("div", { class: "menu-item static" }, "Signed in with the admin token."),
-              h("div", { class: "menu-sep" }),
-              h("div", { class: "menu-item red", onClick: () => signOut("") }, "Sign out"))] : null)),
+        h("div", { class: "top-side end" },
+          h("div", { class: "toggle" + (S.tech ? " on" : ""), onClick: () => { S.tech = !S.tech; savePrefs(); render(); } }, h("span", { class: "toggle-track" }, h("span", { class: "toggle-knob" })), "Technical details"),
+          h("div", { class: "health" }, h("span", { class: "dot", style: { background: healthDot } }), healthText),
+          h("div", { class: "avatar-wrap" },
+            h("button", { class: "avatar", title: "Account", "aria-label": "Account", onClick: () => set({ userMenu: !S.userMenu }) }, "YOU"),
+            S.userMenu ? [h("div", { class: "menu-scrim", onClick: () => set({ userMenu: false }) }),
+              h("div", { class: "menu pop", style: { top: "38px" } },
+                h("div", { class: "menu-item static" }, "Signed in with the admin token."),
+                h("div", { class: "menu-sep" }),
+                h("div", { class: "menu-item red", onClick: () => signOut("") }, "Sign out"))] : null))),
       h("div", { class: "body" + (S.navOpen ? "" : " closed") },
         h("aside", { class: "side" },
           group("Memory", [navItem("overview", "Overview"), navItem("browse", "Browse", S.index ? Object.keys(S.index.byPath).length : null), navItem("facts", "Facts & profile", factCount), navItem("journal", "Journal")]),
