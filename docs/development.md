@@ -40,6 +40,7 @@ pnpm test
 - `test/fixes.test.ts`, `test/summary.test.ts`, `test/gaps.test.ts`: the full review's remaining fixes (F11-F25, F33), the summary, and the PR #3 and PR #5 test gaps.
 - `test/rebuild.test.ts`: a rebuild of about 150 notes as a paged job, with bounded D1 and R2 round trips, a rebuild after D1 lost its version, link, and idempotency rows, a failed page, and duplicated files.
 - `test/review.test.ts`, `test/pr2.test.ts`, `test/classify.test.ts`: earlier review regressions and the classifier.
+- `test/indexes.test.ts`: the lookups that every write runs use an index, not a table scan.
 
 CI (`.github/workflows/test.yml`) runs install, typecheck, and the full suite on every push and pull request. It uses no secrets and deploys nothing.
 

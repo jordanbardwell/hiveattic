@@ -1,12 +1,10 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv } from "./helpers";
+import { ADMIN, mint, nid, resetVault, rest, runJob, testEnv, withInstrumentedWriter, type Stats } from "./helpers";
 
 // A live T-12 reindex returned an error on a staging vault of roughly this size. These tests
 // rebuild a vault that size, count the D1 and R2 round trips the writer makes, and check the
 // audit trail a rebuild leaves for both outcomes.
 
-type Stats = { d1Calls: number; d1Statements: number; r2Gets: number; r2Lists: number; sql: string[] };
 type AuditRow = { action: string; outcome: string; reason_codes: string | null; detail: string | null; request_id: string };
 
 let writer = "";
@@ -327,76 +325,3 @@ async function auditRows(requestId: string): Promise<AuditRow[]> {
 
 // Swaps the writer's D1 and R2 bindings for counting wrappers while \`work\` runs. \`fail\` makes a
 // matching statement throw, to prove a failed rebuild leaves the live tables alone.
-async function withInstrumentedWriter<T>(stats: Stats, work: () => Promise<T>, fail?: (sql: string) => boolean): Promise<T> {
-  const stub = env.WRITER.get(env.WRITER.idFromName("main"));
-  let original: Env | undefined;
-  await runInDurableObject(stub, (instance) => {
-    const holder = instance as unknown as { env: Env };
-    original = holder.env;
-    holder.env = { ...original, DB: countingD1(original.DB, stats, fail), VAULT: countingR2(original.VAULT, stats) } as Env;
-  });
-  try {
-    return await work();
-  } finally {
-    await runInDurableObject(stub, (instance) => {
-      (instance as unknown as { env: Env }).env = original!;
-    });
-  }
-}
-
-function countingD1(db: D1Database, stats: Stats, fail?: (sql: string) => boolean): D1Database {
-  const real = new WeakMap<object, D1PreparedStatement>();
-  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
-    const proxy = new Proxy(statement, {
-      get(target, prop) {
-        if (prop === "bind") return (...values: unknown[]) => wrap(target.bind(...values), sql);
-        if (prop === "first" || prop === "all" || prop === "run" || prop === "raw") {
-          return (...args: unknown[]) => {
-            stats.d1Calls += 1;
-            stats.d1Statements += 1;
-            stats.sql.push(sql);
-            if (fail?.(sql)) return Promise.reject(new Error("injected failure"));
-            return (target[prop] as (...a: unknown[]) => unknown).apply(target, args);
-          };
-        }
-        const value = Reflect.get(target, prop, target) as unknown;
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    real.set(proxy, statement);
-    sqlOf.set(proxy, sql);
-    return proxy;
-  };
-  const sqlOf = new WeakMap<object, string>();
-  return new Proxy(db, {
-    get(target, prop) {
-      if (prop === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
-      if (prop === "batch") {
-        return (statements: D1PreparedStatement[]) => {
-          stats.d1Calls += 1;
-          stats.d1Statements += statements.length;
-          const sqls = statements.map((statement) => sqlOf.get(statement) ?? "");
-          stats.sql.push(...sqls);
-          if (fail && sqls.some((sql) => fail(sql))) return Promise.reject(new Error("injected failure"));
-          return target.batch(statements.map((statement) => real.get(statement) ?? statement));
-        };
-      }
-      const value = Reflect.get(target, prop, target) as unknown;
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-}
-
-function countingR2(bucket: R2Bucket, stats: Stats): R2Bucket {
-  return new Proxy(bucket, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop, target) as unknown;
-      if (typeof value !== "function") return value;
-      return (...args: unknown[]) => {
-        if (prop === "get") stats.r2Gets += 1;
-        if (prop === "list") stats.r2Lists += 1;
-        return (value as (...a: unknown[]) => unknown).apply(target, args);
-      };
-    },
-  });
-}
