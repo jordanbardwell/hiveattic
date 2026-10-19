@@ -175,6 +175,8 @@ type SaveInput = {
   actor: Actor;
   ifMatch: string | null;
   create: boolean;
+  // The row at the path, when the caller read it in this write. saveMarkdown reads it otherwise.
+  existing?: NoteRow | null;
   reason: string;
   action: string;
   journal: { id: string; title: string; at: string; idempotencyKey: string | null } | null;
@@ -669,8 +671,6 @@ export class VaultWriter extends DurableObject<Env> {
 
   private async journal(op: Extract<WriterOp, { kind: "journal" }>): Promise<ApiResult> {
     const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
-    const replay = await this.replay(op.actor.agentId, idem);
-    if (replay) return replay;
     const stamp = etStamp(op.at, vaultTimeZone(this.env));
     const route = op.reroute;
     // A rerouted entry goes to a sensitive day file of the writer's: PII alone to its own
@@ -678,7 +678,8 @@ export class VaultWriter extends DurableObject<Env> {
     // to sensitive/restricted/journal/<writer>/. The requested day file gets no entry and no placeholder.
     const requested = journalPath(op.actor.agentId, op.target, stamp.date);
     const path = route ? sensitiveJournalPath(route, op.actor.agentId, stamp.date) : requested;
-    await this.assertNotOversize(path);
+    const start = await this.startReads(op.actor.agentId, idem, path);
+    if (start.replay) return start.replay;
     const decisions = !route && op.target === "decisions";
     const type = decisions ? "decision" : "journal";
     const owner = route || op.target === "own" ? op.actor.agentId : "shared";
@@ -694,7 +695,7 @@ export class VaultWriter extends DurableObject<Env> {
     let attempt = 0;
     while (attempt < 3) {
       attempt += 1;
-      let current = await this.noteByPath(path);
+      let current = attempt === 1 ? start.note : await this.noteByPath(path);
       // A day file the admin forgot starts over as a new file under a new id.
       let releasable: NoteRow | null = null;
       if (current?.status === "forgotten") {
@@ -748,6 +749,7 @@ export class VaultWriter extends DurableObject<Env> {
         actor: op.actor,
         ifMatch: current?.r2_etag ?? null,
         create: !current,
+        existing: current,
         reason: current ? "appended" : "created",
         action: route ? "journal_reroute" : "append_journal",
         detail: route ? rerouteDetail(requested, route) : null,
@@ -770,16 +772,15 @@ export class VaultWriter extends DurableObject<Env> {
       throw new VaultError("invalid", "That path is append-only or server-managed");
     }
     const idem: Idem = { key: op.idempotencyKey, hash: op.payloadHash };
-    const replay = await this.replay(op.actor.agentId, idem);
-    if (replay) return replay;
     const route = op.reroute;
     const path = route ? reroutedPath(route, op.path) : op.path;
-    await this.assertNotOversize(path);
+    const start = await this.startReads(op.actor.agentId, idem, path);
+    if (start.replay) return start.replay;
     // A forgotten note's path can be written again under a new id (F24). A forgotten note at the
     // requested path of a rerouted write is not moved: it is already gone.
     let original = route ? await this.noteByPath(op.path) : null;
     if (original?.status === "forgotten") original = null;
-    let existing = await this.noteByPath(path);
+    let existing = start.note;
     let releasable: NoteRow | null = null;
     if (existing?.status === "forgotten") {
       releasable = existing;
@@ -847,6 +848,7 @@ export class VaultWriter extends DurableObject<Env> {
       actor: op.actor,
       ifMatch: existing?.r2_etag ?? null,
       create: !existing,
+      existing,
       reason: existing ? "updated" : "created",
       action: route ? "reroute" : "write_note",
       detail: route ? rerouteDetail(op.path, route) : null,
@@ -1250,7 +1252,7 @@ export class VaultWriter extends DurableObject<Env> {
 
   private async saveMarkdown(input: SaveInput): Promise<ApiResult<{ etag: string }>> {
     if (utf8Length(input.markdown) > FILE_LIMIT_BYTES) throw fileTooLarge();
-    const existing = input.create ? null : await this.noteByPath(input.path);
+    const existing = input.create ? null : (input.existing ?? (await this.noteByPath(input.path)));
     const appending = input.reason === "appended" || input.reason === "conflict";
     const generated = isGeneratedFile(input.path);
     if (existing && !appending && !generated && input.reason !== "cleanup" && input.reason !== "rebuild" && input.reason !== "replay") {
@@ -1284,14 +1286,16 @@ export class VaultWriter extends DurableObject<Env> {
     const versionTs = versionStamp();
     const r2Key = r2KeyFor(this.prefix(), input.path);
     const gen = this.gen();
+    // The index job is sent after the batch. A failed send is logged and the write still succeeds,
+    // so index_enqueued_at is set in the batch.
     const statements: D1PreparedStatement[] = [];
     if (input.create) {
       statements.push(
         this.env.DB.prepare(
           `INSERT INTO notes (
             id, path, type, owner, domain, sensitivity, fact_key, title, body, frontmatter, content_hash, statement_hash,
-            r2_etag, r2_key, status, observed_at, created_at, updated_at, version_ts, last_writer, last_confirmed_at, index_gen
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            r2_etag, r2_key, status, observed_at, created_at, updated_at, version_ts, last_writer, last_confirmed_at, index_gen, index_enqueued_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           input.id,
           input.path,
@@ -1315,13 +1319,15 @@ export class VaultWriter extends DurableObject<Env> {
           input.actor.agentId,
           now,
           gen,
+          now,
         ),
       );
     } else {
       statements.push(
         this.env.DB.prepare(
           `UPDATE notes SET type = ?, owner = ?, domain = ?, sensitivity = ?, fact_key = ?, title = ?, body = ?, frontmatter = ?,
-           content_hash = ?, statement_hash = ?, r2_etag = ?, status = ?, observed_at = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?
+           content_hash = ?, statement_hash = ?, r2_etag = ?, status = ?, observed_at = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?,
+           index_enqueued_at = ?
            WHERE id = ?`,
         ).bind(
           input.type,
@@ -1341,6 +1347,7 @@ export class VaultWriter extends DurableObject<Env> {
           versionTs,
           input.actor.agentId,
           gen,
+          now,
           input.id,
         ),
       );
@@ -1363,17 +1370,18 @@ export class VaultWriter extends DurableObject<Env> {
       );
     }
     if (status === "active") {
-      let nextChunk = 0;
-      if (appending && existing) {
-        const prior = await this.env.DB.prepare("SELECT COALESCE(MAX(n), -1) AS n FROM chunks WHERE note_id = ?").bind(input.id).first<{ n: number }>();
-        nextChunk = (prior?.n ?? -1) + 1;
-      }
       for (const chunk of chunks) {
-        const n = appending && existing ? nextChunk++ : chunk.n;
+        // An appended chunk takes the number after the last one stored. The batch runs its
+        // statements in order, so each insert sees the one before it.
         statements.push(
-          this.env.DB.prepare(
-            "INSERT INTO chunks (id, note_id, n, text, title, path, token_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          ).bind(`${input.id}:${n}`, input.id, n, chunk.text, input.title, input.path, chunk.tokenCount),
+          appending && existing
+            ? this.env.DB.prepare(
+                `INSERT INTO chunks (id, note_id, n, text, title, path, token_count)
+                 SELECT ? || ':' || next.n, ?, next.n, ?, ?, ?, ? FROM (SELECT COALESCE(MAX(n), -1) + 1 AS n FROM chunks WHERE note_id = ?) AS next`,
+              ).bind(input.id, input.id, chunk.text, input.title, input.path, chunk.tokenCount, input.id)
+            : this.env.DB.prepare(
+                "INSERT INTO chunks (id, note_id, n, text, title, path, token_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              ).bind(`${input.id}:${chunk.n}`, input.id, chunk.n, chunk.text, input.title, input.path, chunk.tokenCount),
         );
       }
     }
@@ -1382,6 +1390,8 @@ export class VaultWriter extends DurableObject<Env> {
         this.env.DB.prepare("INSERT OR IGNORE INTO links (src_note_id, target, dst_note_id) VALUES (?, ?, ?)").bind(input.id, link.target, link.dst),
       );
     }
+    // Open links that name this note now point at it. A note under sensitive/ is skipped, so no link resolves into it this way.
+    if (!input.path.startsWith("sensitive/")) statements.push(this.backfillLinks(input.id, input.path, input.factKey, stringList(parsed.frontmatter.aliases)));
     if (input.journal) {
       statements.push(
         this.env.DB.prepare(
@@ -1443,9 +1453,7 @@ export class VaultWriter extends DurableObject<Env> {
       }
       throw err;
     }
-    if (!input.path.startsWith("sensitive/")) await this.backfillLinks(input.id, input.path, input.factKey, stringList(parsed.frontmatter.aliases));
     await this.enqueue({ kind: "agent-index", note_id: input.id, path: input.path });
-    await this.env.DB.prepare("UPDATE notes SET index_enqueued_at = ? WHERE id = ?").bind(new Date().toISOString(), input.id).run();
     return { ok: true, data: { etag: put.etag } };
   }
 
@@ -2612,20 +2620,29 @@ export class VaultWriter extends DurableObject<Env> {
     return this.env.E2E_CLEANUP_ENABLED === "true" && stagingResources(this.env);
   }
 
-  // A stored reply for (agent, key) inside the 7-day window. The same payload replays it; any
-  // other payload is refused with 422. A row with no hash predates payload binding and replays.
   private async replay(agentId: string, idem: Idem): Promise<ApiResult | null> {
     if (!idem.key) return null;
-    const row = await this.env.DB.prepare("SELECT response, at, payload_hash FROM idempotency WHERE agent_id = ? AND key = ?")
-      .bind(agentId, idem.key)
-      .first<{ response: string; at: string; payload_hash: string | null }>();
-    if (!row) return null;
-    if (Date.now() - Date.parse(row.at) > OPERATION_TTL_MS) return null;
-    if (row.payload_hash && idem.hash && row.payload_hash !== idem.hash) throw keyReused();
-    const parsed = JSON.parse(row.response) as { v?: number; status?: number; data?: { [key: string]: JsonValue }; pending?: boolean };
-    if (parsed.pending) return null;
-    if (parsed.v === 2 && parsed.data) return withStatus(parsed.data, parsed.status ?? 200);
-    return { ok: true, data: parsed as { [key: string]: JsonValue } };
+    return replayed(idem, await this.storedReply(agentId, idem.key).first<StoredReply>());
+  }
+
+  private storedReply(agentId: string, key: string): D1PreparedStatement {
+    return this.env.DB.prepare("SELECT response, at, payload_hash FROM idempotency WHERE agent_id = ? AND key = ?").bind(agentId, key);
+  }
+
+  // The reads a journal append or a note write starts with, in one round trip: the oversize flag of
+  // the path, the note row at the path, and the stored reply for the idempotency key. A replay is
+  // checked first, then the oversize flag, as when they were read one at a time.
+  private async startReads(agentId: string, idem: Idem, path: string): Promise<{ replay: ApiResult | null; note: NoteRow | null }> {
+    const statements = [
+      this.env.DB.prepare("SELECT 1 AS hit FROM oversize_files WHERE path = ?").bind(path),
+      this.env.DB.prepare("SELECT * FROM notes WHERE path = ?").bind(path),
+    ];
+    if (idem.key) statements.push(this.storedReply(agentId, idem.key));
+    const [oversize, note, reply] = await this.env.DB.batch<Record<string, unknown>>(statements);
+    const replay = idem.key ? replayed(idem, (reply?.results?.[0] as StoredReply | undefined) ?? null) : null;
+    if (replay) return { replay, note: null };
+    if (oversize?.results?.length) throw fileTooLarge();
+    return { replay: null, note: (note?.results?.[0] as NoteRow | undefined) ?? null };
   }
 
   private rememberStatements(agentId: string, idem: Idem, data: { [key: string]: JsonValue }, status: number): D1PreparedStatement[] {
@@ -2697,11 +2714,12 @@ export class VaultWriter extends DurableObject<Env> {
     return null;
   }
 
-  private async backfillLinks(id: string, path: string, factKey: string | null, aliases: string[]): Promise<void> {
+  private backfillLinks(id: string, path: string, factKey: string | null, aliases: string[]): D1PreparedStatement {
     const names = [path, path.replace(/\.md$/, ""), factKey, ...aliases].filter((name): name is string => Boolean(name));
-    for (const name of names) {
-      await this.env.DB.prepare("UPDATE links SET dst_note_id = ? WHERE dst_note_id IS NULL AND target = ?").bind(id, name).run();
-    }
+    return this.env.DB.prepare("UPDATE links SET dst_note_id = ? WHERE dst_note_id IS NULL AND target IN (SELECT value FROM json_each(?))").bind(
+      id,
+      JSON.stringify(names),
+    );
   }
 
   private async deleteRunObjects(runId: string): Promise<void> {
@@ -2789,6 +2807,20 @@ function keyReused(): VaultError {
 function idempotencyFields(idem: Idem, outcome: string, rerouted: boolean): Frontmatter {
   if (!idem.key) return {};
   return { vault_idempotency: idem.key, vault_idempotency_hash: idem.hash, vault_outcome: outcome, vault_rerouted: rerouted ? true : null };
+}
+
+type StoredReply = { response: string; at: string; payload_hash: string | null };
+
+// A stored reply for (agent, key) inside the 7-day window. The same payload replays it; any
+// other payload is refused with 422. A row with no hash predates payload binding and replays.
+function replayed(idem: Idem, row: StoredReply | null): ApiResult | null {
+  if (!row) return null;
+  if (Date.now() - Date.parse(row.at) > OPERATION_TTL_MS) return null;
+  if (row.payload_hash && idem.hash && row.payload_hash !== idem.hash) throw keyReused();
+  const parsed = JSON.parse(row.response) as { v?: number; status?: number; data?: { [key: string]: JsonValue }; pending?: boolean };
+  if (parsed.pending) return null;
+  if (parsed.v === 2 && parsed.data) return withStatus(parsed.data, parsed.status ?? 200);
+  return { ok: true, data: parsed as { [key: string]: JsonValue } };
 }
 
 function journalReply(entryId: string, path: string, route: string | null): { [key: string]: JsonValue } {

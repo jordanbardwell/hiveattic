@@ -6,8 +6,12 @@ import { testEnv } from "./helpers";
 const LOOKUPS: [sql: string, binds: unknown[], index: string][] = [
   ["DELETE FROM chunks WHERE note_id = ?", ["n"], "chunks_note"],
   ["SELECT id FROM chunks WHERE note_id = ?", ["n"], "chunks_note"],
-  ["SELECT COALESCE(MAX(n), -1) AS n FROM chunks WHERE note_id = ?", ["n"], "chunks_note"],
-  ["UPDATE links SET dst_note_id = ? WHERE dst_note_id IS NULL AND target = ?", ["n", "t"], "links_target_open"],
+  [
+    "INSERT INTO chunks (id, note_id, n, text, title, path, token_count) SELECT ? || ':' || next.n, ?, next.n, ?, ?, ?, ? FROM (SELECT COALESCE(MAX(n), -1) + 1 AS n FROM chunks WHERE note_id = ?) AS next",
+    ["n", "n", "t", "t", "p", 1, "n"],
+    "chunks_note",
+  ],
+  ["UPDATE links SET dst_note_id = ? WHERE dst_note_id IS NULL AND target IN (SELECT value FROM json_each(?))", ["n", '["a","b"]'], "links_target_open"],
   ["DELETE FROM links WHERE src_note_id = ? OR dst_note_id = ?", ["n", "n"], "links_dst"],
   ["SELECT block_ref FROM journal_entries WHERE note_id = ? ORDER BY rowid", ["n"], "journal_entries_note"],
   ["DELETE FROM journal_entries WHERE note_id = ?", ["n"], "journal_entries_note"],
