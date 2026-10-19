@@ -1052,10 +1052,17 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
   }
 
   // ---- agents ----
+  // A token minted with scopes keeps them, so an agent can do what its live tokens allow,
+  // not only what it got at its first mint.
+  function scopesOf(a) {
+    const now = Date.now();
+    const live = (a.tokens || []).filter((t) => !t.revoked_at && !(t.expires_at && Date.parse(t.expires_at) <= now));
+    return live.length ? [...new Set(live.flatMap((t) => t.scopes || a.scopes))] : a.scopes;
+  }
   function access(a) {
-    const sc = a.scopes, has = (x) => x && (sc.includes(x) || sc.includes("read:all") && x.startsWith("read:"));
+    const sc = scopesOf(a), has = (x) => x && (sc.includes(x) || sc.includes("read:all") && x.startsWith("read:"));
     const lvl = (edit, read, sum) => (has(edit) ? "Edit" : has(read) ? "Read" : sum && has(sum) ? "Summary" : "None");
-    const cols = [["Shared notes", "shared notes", lvl("write:shared", "read:shared")], ["Own folder", "its own folder", lvl("write:own", "read:own")], ["Inbox", "your inbox", lvl("write:inbox", "read:inbox")]];
+    const cols = [["Shared notes", "shared notes", lvl("write:shared", "read:shared")], ["Own folder", "its own folder", lvl("write:own", "read:own")], ["Inbox", "your inbox", lvl("write:inbox", "read:inbox")], ["Other agents", "other agents' notes", lvl("write:bots/*", "read:bots/*")]];
     for (const d of S.overview.vault.sensitive_domains) {
       const wild = (fam) => sc.includes(fam + ":sensitive/*") ? fam + ":sensitive/*" : fam + ":sensitive/" + d;
       cols.push([d[0].toUpperCase() + d.slice(1), d, lvl(wild("write"), wild("read"), "read:sensitive:summary/" + d)]);
@@ -1067,7 +1074,8 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
     const pick = (l) => cols.filter((c) => c[2] === l).map((c) => c[1]);
     const j = (xs) => (xs.length ? xs.join(", ") : "nothing");
     const edit = pick("Edit"), read = pick("Read");
-    const out = [["Can edit", j(edit)], ["Can read", read.length ? read.join(", ") : edit.length ? "nothing else" : "nothing"]];
+    const all = scopesOf(a).includes("read:all");
+    const out = [["Can edit", j(edit)], ["Can read", all ? "everything except restricted notes and private journals" : read.length ? read.join(", ") : edit.length ? "nothing else" : "nothing"]];
     if (pick("Summary").length) out.push(["Summaries", j(pick("Summary")) + ", conclusions only"]);
     return out;
   }
@@ -1086,7 +1094,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
         h("span", { class: "sec", style: { fontSize: "12.5px", lineHeight: 1.45, minHeight: "36px" } }, plainAccess(a).map(([k, v]) => k + " " + v).join(". ") + "."),
         h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", borderTop: "1px solid var(--line-3)", paddingTop: "12px" } },
           [["Writes 24h", a.writes_24h], ["Rejected 24h", a.rejected_24h], ["Last seen", ago(a.last_seen_at)]].map(([k, v], i) => h("div", { class: "col", style: { gap: "2px" } }, h("span", { class: "muted", style: { fontSize: "11.5px" } }, k), h("span", { style: { font: i < 2 ? "500 15px var(--mono)" : "500 13px var(--sans)", paddingTop: i < 2 ? 0 : "1px" } }, v)))),
-        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "tag" }, a.kind), h("span", { class: "tag" }, plural(a.scopes.length, "scope")))))) : h("div", { class: "card empty" }, "No agents yet. Click New agent to make one."),
+        h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, h("span", { class: "tag" }, a.kind), h("span", { class: "tag" }, plural(scopesOf(a).length, "scope")))))) : h("div", { class: "card empty" }, "No agents yet. Click New agent to make one."),
       S.agents.length ? h("div", { class: "card clip", style: { flexShrink: 0 } },
         h("div", { class: "col", style: { padding: "14px 18px", borderBottom: "1px solid var(--line-2)", gap: "2px" } }, h("span", { class: "card-title" }, "Who can see what"), h("span", { class: "sec", style: { fontSize: "12px" } }, "What each agent can read or change about you. Summary means it sees conclusions only, never the raw notes.")),
         h("div", { class: "grid-row th", style: grid }, h("span", null, "Agent"), cols.map((c) => h("span", null, c))),
@@ -1113,7 +1121,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
           h("div", { class: "card col", style: { padding: "16px 18px", gap: "10px" } }, h("span", { class: "card-title" }, "Access"),
             h("div", { class: "col", style: { gap: "6px" } }, plainAccess(a).map(([k, v]) => h("div", { class: "kv w76" }, h("span", null, k), h("span", null, v)))),
             S.tech ? h("span", { class: "muted", style: { fontSize: "12px", marginTop: "4px" } }, "Scopes") : null,
-            S.tech ? h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, a.scopes.map((s) => h("span", { class: "tag" + (s.startsWith("write") ? " write" : "") }, s))) : null),
+            S.tech ? h("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, scopesOf(a).map((s) => h("span", { class: "tag" + (s.startsWith("write") ? " write" : "") }, s))) : null),
           h("div", { class: "card col clip" },
             h("div", { class: "card-head" }, h("span", { class: "card-title" }, "Tokens"), S.tech ? h("span", { class: "muted", style: { fontSize: "12px" } }, "Stored as sha256(pepper ‖ token)") : null),
             a.tokens.length ? a.tokens.slice().reverse().map((t) => h("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: "12px", padding: "12px 18px", borderBottom: "1px solid var(--line-3)", alignItems: "center" } },
