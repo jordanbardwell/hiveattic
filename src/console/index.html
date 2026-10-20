@@ -335,6 +335,11 @@ button, input, select, textarea { font-family: inherit; }
 .tok { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 16px; background: var(--card); }
 .scope { font: 400 11.5px var(--mono); padding: 4px 10px; border-radius: 999px; background: #1F1F23; color: var(--text-3); }
 .scope.write { background: var(--honey-bg-2); color: var(--honey-light); }
+.perms { display: flex; flex-direction: column; gap: 2px; max-height: 360px; overflow: auto; margin: 0 -8px; }
+.perm { display: flex; align-items: flex-start; gap: 10px; padding: 8px; border-radius: 10px; cursor: pointer; }
+.perm:hover { background: #1F1F23; }
+.perm input { margin: 2px 0 0; accent-color: var(--honey); width: 15px; height: 15px; flex-shrink: 0; cursor: pointer; }
+.perm-group { font-size: 11.5px; color: var(--muted-2); padding: 10px 8px 2px; }
 
 /* audit */
 .audit-card { background: var(--card); border: 1px solid var(--b1); border-radius: 24px; padding: 6px 10px 12px; }
@@ -413,12 +418,12 @@ input.field { height: 36px; }
   const VIA = { mcp: "Agent (MCP)", rest: "Agent (API)", r2: "Edited by hand", "r2-event": "Edited by hand", cron: "Scheduled", queue: "Index", reconcile: "Reconcile", replay: "Replay", indexer: "Index", migration: "Migration" };
   const ACTIONS = {
     write_fact: "Wrote fact", append_journal: "Journal entry", write_note: "Wrote note", forget: "Forgot", restore: "Restored", purge: "Purged",
-    summary: "Summary rebuilt", bootstrap: "Set up vault", mint_token: "Token created", revoke: "Token revoked", conflict: "Conflict",
+    summary: "Summary rebuilt", bootstrap: "Set up vault", mint_token: "Token created", token_scopes: "Token access changed", revoke: "Token revoked", conflict: "Conflict",
     reroute: "Moved to private", reroute_move: "Moved to private", journal_reroute: "Moved to private", reconcile: "Reconciled", replay: "Replayed",
   };
   // Plain-language verbs for the activity sentences: "<who> <verb> <object>".
   const VERB = { write_fact: "updated", append_journal: "wrote in the journal", write_note: "saved", forget: "forgot", restore: "restored", purge: "purged",
-    summary: "rebuilt", bootstrap: "set up", mint_token: "created a token", revoke: "revoked a token", conflict: "flagged a conflict on",
+    summary: "rebuilt", bootstrap: "set up", mint_token: "created a token", token_scopes: "changed a token's access", revoke: "revoked a token", conflict: "flagged a conflict on",
     reroute: "moved to private", reroute_move: "moved to private", journal_reroute: "moved a journal entry to private", reconcile: "reconciled", replay: "replayed", cleanup_rewrite: "cleaned up", rebuild: "rebuilt the index for" };
   const TRY = { write_fact: "tried to update", write_note: "tried to save", append_journal: "tried to write in the journal", forget: "tried to forget" };
   const HIST = { write_fact: "updated it", superseded: "wrote an earlier version", append_journal: "added an entry", journal: "added an entry", write_note: "saved it", forget: "forgot it", restore: "restored it",
@@ -1559,7 +1564,9 @@ input.field { height: 36px; }
       "- Before you answer about me, my plans, or past decisions, call vault_search or read profile/summary.md.",
       "- When you learn a lasting fact about me, call vault_write_fact.",
       "- To log what you did or learned, call vault_append_journal.",
-      "- Your own folder is " + folder + ". Use vault_write_note to write notes there.",
+      "- For a short fact (one sentence), use vault_write_fact. For longer text, such as a recipe or a list, use vault_write_note.",
+      "- Your own folder is " + folder + ". Write notes there, for example " + folder + "recipes/apple-pie.md. A note path ends in .md and has no spaces.",
+      "- To change a note, read it first with vault_read and send its etag as if_match.",
       "- Send an idempotency_key with each write.",
       "- Never store passwords, API keys, tokens, account numbers, or government IDs.",
       "- Never store content from an employer.",
@@ -1600,6 +1607,55 @@ input.field { height: 36px; }
     S.modal = { title: "Revoke this token?", body: agent.display_name + " loses access with this token at once. You cannot undo this. Make a new token to connect it again.", target: (t.label || "unlabelled") + " · " + t.id, cta: "Revoke token", danger: true,
       run: async () => { await api("/v1/admin/tokens/revoke", { method: "POST", body: { token_id: t.id } }); toast("Token revoked."); await loadAll(); } };
     render();
+  }
+  // The permissions the access editor offers, as [scope, label, group]. A scope the token holds that
+  // is not in this list is still shown, so saving never drops it without the owner seeing it.
+  function permRows(held) {
+    const rows = [
+      ["read:all", "Read everything, except restricted notes and private journals", "Read"],
+      ["read:own", "Read its own folder", "Read"], ["read:shared", "Read shared notes, the profile and the shared journal", "Read"],
+      ["read:inbox", "Read your inbox", "Read"], ["read:decisions", "Read decisions", "Read"], ["read:bots/*", "Read other agents' notes", "Read"],
+      ["write:own", "Edit its own folder", "Edit"], ["write:shared", "Edit shared notes, the profile, the shared journal and the inbox", "Edit"],
+      ["write:inbox", "Add to your inbox", "Edit"], ["write:decisions", "Add decisions", "Edit"],
+    ];
+    for (const d of S.overview.vault.sensitive_domains) {
+      const name = d === "finance" ? "money" : d;
+      rows.push(["read:sensitive:summary/" + d, "Read " + name + " summaries only", "Private"], ["read:sensitive/" + d, "Read " + name + " notes", "Private"], ["write:sensitive/" + d, "Edit " + name + " notes", "Private"]);
+    }
+    for (const sc of held) if (!rows.some((r) => r[0] === sc)) rows.push([sc, sc, "Other"]);
+    return rows;
+  }
+  function askPerms(agent, t) {
+    S.modal = { perms: { agent, token: t, sel: new Set(t.scopes || agent.scopes), busy: false, err: "" } };
+    render();
+  }
+  function PermsModal() {
+    const p = S.modal.perms, rows = permRows([...p.sel]);
+    const close = () => { if (!p.busy) set({ modal: null }); };
+    const save = async () => {
+      if (!p.sel.size) { p.err = "Pick at least one permission. To stop all access, revoke the token."; render(); return; }
+      p.busy = true; p.err = ""; render();
+      try {
+        await api("/v1/admin/tokens/scopes", { method: "POST", body: { token_id: p.token.id, scopes: [...p.sel] } });
+        S.modal = null; toast("Access changed. The agent keeps its token."); await loadAll();
+      } catch (err) { p.busy = false; p.err = err.message; render(); }
+    };
+    let group = "";
+    return h("div", { class: "overlay center" + (anim.modal ? " fade" : ""), onClick: close }, h("div", { class: "modal wide" + (anim.modal ? " pop" : ""), role: "dialog", "aria-modal": "true", onClick: stop },
+      h("div", { class: "col", style: { gap: "6px" } }, h("span", { class: "modal-title" }, "Edit access for " + p.agent.display_name),
+        h("span", { class: "modal-body" }, "This changes what this token can do. The agent keeps the same token, so you do not need to set it up again. The change starts within a few seconds."),
+        h("span", { class: "target" }, (p.token.label || "Unlabelled token") + " · " + p.token.id)),
+      h("div", { class: "perms" }, rows.map(([sc, label, g]) => {
+        const head = g !== group ? h("span", { class: "perm-group" }, g) : null;
+        group = g;
+        return [head, h("label", { class: "perm" },
+          h("input", { type: "checkbox", checked: p.sel.has(sc), disabled: p.busy, onChange: (e) => { if (e.target.checked) p.sel.add(sc); else p.sel.delete(sc); if (p.err) { p.err = ""; render(); } } }),
+          h("span", { class: "col", style: { gap: "2px" } }, h("span", { style: { fontSize: "13.5px", color: "var(--text)" } }, label),
+            S.tech && label !== sc ? h("span", { class: "mono", style: { fontSize: "11.5px", color: "var(--muted-2)" } }, sc) : null))];
+      })),
+      p.err ? h("span", { class: "err" }, p.err) : null,
+      h("div", { class: "row", style: { justifyContent: "flex-end", gap: "8px" } }, h("button", { class: "btn outline", disabled: p.busy, onClick: close }, "Cancel"),
+        h("button", { class: "btn primary", disabled: p.busy, onClick: save }, p.busy ? "Saving…" : "Save access"))));
   }
   // A token minted with scopes keeps them, so an agent can do what its live tokens allow,
   // not only what it got at its first mint.
@@ -1713,7 +1769,7 @@ input.field { height: 36px; }
             h("div", { class: "col", style: { gap: "3px", flex: 1, minWidth: 0 } }, h("span", { style: { fontSize: "14px" } }, t.label || "Unlabelled token"),
               h("span", { style: { fontSize: "12px", color: "var(--muted-2)" } }, "Used " + ago(t.last_used_at) + " · made " + addedOn(t.created_at) + (t.expires_at ? " · expires " + fmtDate(t.expires_at) : "")),
               S.tech ? h("span", { class: "mono", style: { fontSize: "11.5px", color: "var(--muted-2)" } }, t.id + (t.scopes ? " · " + t.scopes.join(" ") : "")) : null),
-            t.revoked_at ? h("span", { style: { fontSize: "12.5px", color: "var(--muted-2)", whiteSpace: "nowrap" } }, "Revoked " + addedOn(t.revoked_at)) : h("button", { class: "btn danger sm", onClick: () => askRevoke(a, t) }, "Revoke")))
+            t.revoked_at ? h("span", { style: { fontSize: "12.5px", color: "var(--muted-2)", whiteSpace: "nowrap" } }, "Revoked " + addedOn(t.revoked_at)) : h("div", { class: "row", style: { gap: "6px" } }, h("button", { class: "btn sm", onClick: () => askPerms(a, t) }, "Edit access"), h("button", { class: "btn danger sm", onClick: () => askRevoke(a, t) }, "Revoke"))))
             : h("span", { style: { fontSize: "13px", color: "var(--muted-2)" } }, "No tokens."),
           S.tech ? h("span", { style: { fontSize: "12px", color: "var(--muted-2)", paddingTop: "4px" } }, "The vault stores each token as sha256(pepper ‖ token).") : null) : null)));
   }
@@ -1916,6 +1972,7 @@ input.field { height: 36px; }
   function Modal() {
     const m = S.modal;
     if (m.minted) return MintedModal();
+    if (m.perms) return PermsModal();
     let area = null, hintEl = null;
     const confirm = async () => {
       const text = area ? area.value.trim() : "";

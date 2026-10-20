@@ -795,12 +795,12 @@ export class VaultWriter extends DurableObject<Env> {
     const moving = Boolean(route && original);
     if (moving) {
       // An update that adds sensitive text moves the note. The caller's if_match is for the note it named.
-      if (normalizeEtag(op.ifMatch) !== normalizeEtag(original!.r2_etag)) throw new VaultError("conflict_etag", "if_match does not match the current etag");
+      if (normalizeEtag(op.ifMatch) !== normalizeEtag(original!.r2_etag)) throw new VaultError("conflict_etag", etagMessage(op.ifMatch));
       if (existing) throw new VaultError("conflict_etag", "if_match does not match the current etag");
     } else if (existing) {
       // Updating a note that was rerouted needs write access to its sensitive folder.
       if (route && !grantsAllow(op.grants, route)) throw new VaultError("forbidden_scope", "Scope does not allow this write");
-      if (normalizeEtag(op.ifMatch) !== normalizeEtag(existing.r2_etag)) throw new VaultError("conflict_etag", "if_match does not match the current etag");
+      if (normalizeEtag(op.ifMatch) !== normalizeEtag(existing.r2_etag)) throw new VaultError("conflict_etag", etagMessage(op.ifMatch));
     }
     const id = existing?.id ?? ulid();
     const now = new Date().toISOString();
@@ -3217,3 +3217,7 @@ function stripRunContent(markdown: string, runId: string): { markdown: string; e
   return { markdown: next, empty, changed: true };
 }
 
+// A replace without if_match is the usual first mistake, so that case says what to send.
+function etagMessage(ifMatch: string | null | undefined): string {
+  return ifMatch ? "if_match does not match the current etag" : "The note already exists. Read it with vault_read and send its etag as if_match to replace it";
+}

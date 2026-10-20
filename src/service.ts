@@ -1,4 +1,4 @@
-import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, RESERVED_AGENT_IDS, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
+import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, RESERVED_AGENT_IDS, REVIEWER_SCOPES, scopeProblem, writableFolders, type Access, type NoteView } from "./access";
 import { clearAuthCache } from "./auth";
 import { classifyText, frontmatterText, journalRouteFor, routeFor } from "./classify";
 import { CONTENT_LIMIT_BYTES, domainConfig, isOrdinaryDomain, isSensitiveDomain, stagingResources, utf8Length, vaultTimeZone } from "./config";
@@ -231,7 +231,11 @@ export async function writeNote(
     assertRerouteWrite(session.access, path, declared, reroute);
   } else {
     sensitivity = inSensitiveFolder(path) || (declared !== null && !isOrdinaryDomain(declared)) ? "sensitive" : "normal";
-    assertCanWrite(session.access, path, sensitivity, declared);
+    if (!canWrite(session.access, path, sensitivity, declared)) {
+      const folders = writableFolders(session.access);
+      const where = folders.length ? `This token can write notes under ${folders.join(", ")}` : "This token cannot write notes";
+      throw new VaultError("forbidden_scope", `Scope does not allow this write. ${where}`);
+    }
   }
   const ifMatch = headerMatch ?? input.if_match ?? null;
   const hash = await keyedHash(idempotencyKey, "note", {
@@ -380,6 +384,22 @@ export async function revokeToken(env: Env, session: Session, input: { token_id?
   clearAuthCache();
   await audit(env, session, "revoke", null, input.token_id ?? null, "ok", [], null, result.meta.changes ?? 0);
   return { revoked: result.meta.changes ?? 0 };
+}
+
+// Replaces the scopes of one live token. The token string and its hash stay the same, so the agent
+// keeps working with the new access. Other isolates can use the old scopes until their auth cache
+// expires (10 seconds), the same as a revoke.
+export async function setTokenScopes(env: Env, session: Session, input: { token_id: string; scopes: string[] }): Promise<Record<string, unknown>> {
+  assertAdmin(session.access);
+  const scopes = [...new Set(input.scopes)];
+  const problems = scopes.map((scope) => scopeProblem(scope)).filter((problem): problem is string => problem !== null);
+  if (problems.length) throw new VaultError("invalid", "A scope is not valid", [...new Set(problems)]);
+  const token = await env.DB.prepare("SELECT agent_id FROM tokens WHERE id = ? AND revoked_at IS NULL").bind(input.token_id).first<{ agent_id: string }>();
+  if (!token) throw new VaultError("not_found", "Token not found or revoked");
+  await env.DB.prepare("UPDATE tokens SET scopes_override = ? WHERE id = ? AND revoked_at IS NULL").bind(JSON.stringify(scopes), input.token_id).run();
+  clearAuthCache();
+  await audit(env, session, "token_scopes", null, input.token_id, "ok", [], null, 0);
+  return { token_id: input.token_id, agent_id: token.agent_id, scopes };
 }
 
 // Rebuild, reindex, reconcile, and the quarantine erase run as paged jobs in the writer. Start

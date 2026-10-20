@@ -67,6 +67,11 @@ export const revokeSchema = z.object({
   label: z.string().min(1).max(80).optional(),
 });
 
+export const tokenScopesSchema = z.object({
+  token_id: z.string().min(1).max(80),
+  scopes: z.array(z.string().min(1).max(80)).min(1).max(40),
+});
+
 export const restoreSchema = z.object({
   path: z.string().min(1).max(200).optional(),
   id: z.string().min(1).max(80).optional(),

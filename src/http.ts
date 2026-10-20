@@ -25,6 +25,7 @@ import {
   restoreVersion,
   revokeToken,
   search,
+  setTokenScopes,
   startJob,
   toolRateKind,
   verifyAuditAppendOnly,
@@ -46,6 +47,7 @@ import {
   restoreSchema,
   revokeSchema,
   tokenSchema,
+  tokenScopesSchema,
 } from "./schemas";
 
 export type McpHandler = (request: Request, env: Env, ctx: ExecutionContext, original: Request) => Promise<Response>;
@@ -147,6 +149,7 @@ async function route(request: Request, env: Env, url: URL, session: Session, raw
   if (method === "GET" && operation) return getOperation(env, session, operation[1]!);
   if (method === "POST" && pathname === "/v1/admin/bootstrap") return bootstrap(env, session);
   if (method === "POST" && pathname === "/v1/admin/tokens") return ok(await mintToken(env, session, parseInput(tokenSchema, await body())));
+  if (method === "POST" && pathname === "/v1/admin/tokens/scopes") return ok(await setTokenScopes(env, session, parseInput(tokenScopesSchema, await body())));
   if (method === "POST" && pathname === "/v1/admin/tokens/revoke") return ok(await revokeToken(env, session, parseInput(revokeSchema, await body())));
   if (method === "POST" && pathname === "/v1/admin/reindex") return startJob(env, session, "reindex");
   if (method === "POST" && pathname === "/v1/admin/rebuild") return startJob(env, session, "rebuild");

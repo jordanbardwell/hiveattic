@@ -193,18 +193,38 @@ export function canWrite(access: Access, path: string, sensitivity: "normal" | "
 
 export function assertVaultPath(path: string): string {
   const trimmed = path.trim().replace(/^\/+/, "");
-  if (
-    trimmed.length === 0 ||
-    trimmed.length > 200 ||
-    trimmed.includes("..") ||
-    trimmed.includes("\\") ||
-    trimmed.includes("//") ||
-    !/^[A-Za-z0-9][A-Za-z0-9_./-]*\.md$/.test(trimmed) ||
-    trimmed.startsWith("sys/")
-  ) {
-    throw new VaultError("invalid", "Path is not a vault-relative markdown path");
-  }
+  const problem = vaultPathProblem(trimmed);
+  if (problem) throw new VaultError("invalid", `Path is not a vault-relative markdown path: ${problem}`);
   return trimmed;
+}
+
+// The first rule a path breaks, in words an agent can act on. An agent that only sees "invalid"
+// tends to give up on notes and write a fact instead.
+function vaultPathProblem(path: string): string | null {
+  if (path.length === 0) return "the path is empty";
+  if (path.length > 200) return "the path is longer than 200 characters";
+  if (path.startsWith("sys/")) return "sys/ is for the server only";
+  if (path.includes("..") || path.includes("//") || path.includes("\\")) return "the path must not contain '..', '//' or '\\'";
+  if (!path.endsWith(".md")) return "the path must end in .md";
+  if (!/^[A-Za-z0-9]/.test(path)) return "the path must start with a letter or a digit";
+  if (!/^[A-Za-z0-9_./-]*$/.test(path)) return "use only letters, digits, '-', '_', '.' and '/' (no spaces), for example bots/<agent>/recipes/apple-pie.md";
+  return null;
+}
+
+// The folders a token can write notes in, for the forbidden_scope message. It names the common
+// grants only. canWrite stays the rule.
+export function writableFolders(access: Access): string[] {
+  if (access.admin) return ["any folder"];
+  const out: string[] = [];
+  if (hasScope(access, "write:own")) out.push(`bots/${access.agentId}/`);
+  if (hasScope(access, "write:shared")) out.push("shared/", "profile/", "journal/", "inbox/");
+  else if (hasScope(access, "write:inbox")) out.push("inbox/");
+  for (const scope of access.scopes) {
+    const named = /^write:(domain|bots)\/([a-z0-9][a-z0-9-]*)$/.exec(scope);
+    if (named) out.push(named[1] === "domain" ? `domains/${named[2]}/` : `bots/${named[2]}/`);
+    if (scope.startsWith("write:prefix:")) out.push(scope.slice("write:prefix:".length));
+  }
+  return [...new Set(out)];
 }
 
 // Scope grammar for mint. A raw `admin` string is not a scope, and nothing names `restricted`.
