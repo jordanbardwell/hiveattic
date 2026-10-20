@@ -786,7 +786,11 @@ input.field { height: 36px; }
     if (!m) return { fm: [], body: md || "", raw: "" };
     const fm = [];
     for (const line of m[1].split("\n")) { const kv = /^([A-Za-z0-9_]+):\s?(.*)$/.exec(line); if (kv) fm.push([kv[1], kv[2]]); }
-    return { fm, body: md.slice(m[0].length), raw: m[1] };
+    // A note saved before the server took out a pasted frontmatter block can hold a second copy of
+    // the vault's own block at the top of its body. Hide that copy too.
+    const again = /^---\n([\s\S]*?)\n---\n?/.exec(md.slice(m[0].length));
+    const skip = again && /^vault_id:/m.test(again[1]) ? again[0].length : 0;
+    return { fm, body: md.slice(m[0].length + skip), raw: m[1] };
   }
   function linksOf(md) { const out = []; const re = /\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g; let m; while ((m = re.exec(md || ""))) if (!out.includes(m[1].trim())) out.push(m[1].trim()); return out; }
   function inline(text) { return text.replace(/\[\[([^\]|#]+)(?:[#|]([^\]]*))?\]\]/g, (_, p, alias) => alias || p).replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1"); }
