@@ -11,3 +11,11 @@
 9. When facts conflict, the newest observed fact wins. Real contradictions are flagged in `inbox/conflicts.md`.
 10. Times are written in the vault time zone, `VAULT_TZ` (UTC unless the operator sets another). Journal day files follow that zone.
 11. If the rules change (`vault_whoami` shows a new AGENTS.md hash), re-read this file.
+
+## How the vault is stored
+
+Everything in the vault is a markdown note in a folder. Facts and journal days are notes of a special kind.
+
+- Facts: `bots/<you>/facts/<key>.md`. Each fact is one short statement. Write facts with `vault_write_fact`.
+- Journal: `bots/<you>/journal/<year>/<month>/<date>.md`. There is one file for each day. You can only add entries. Write entries with `vault_append_journal`.
+- Other notes: any other path in your folder, for example `bots/<you>/recipes/apple-pie.md`. Use a note for longer text, such as a recipe, a list, or a plan. Write notes with `vault_write_note`. A note path ends in `.md` and has no spaces.
