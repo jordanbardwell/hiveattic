@@ -386,6 +386,22 @@ export async function revokeToken(env: Env, session: Session, input: { token_id?
   return { revoked: result.meta.changes ?? 0 };
 }
 
+// Replaces the scopes of one live token. The token string and its hash stay the same, so the agent
+// keeps working with the new access. Other isolates can use the old scopes until their auth cache
+// expires (10 seconds), the same as a revoke.
+export async function setTokenScopes(env: Env, session: Session, input: { token_id: string; scopes: string[] }): Promise<Record<string, unknown>> {
+  assertAdmin(session.access);
+  const scopes = [...new Set(input.scopes)];
+  const problems = scopes.map((scope) => scopeProblem(scope)).filter((problem): problem is string => problem !== null);
+  if (problems.length) throw new VaultError("invalid", "A scope is not valid", [...new Set(problems)]);
+  const token = await env.DB.prepare("SELECT agent_id FROM tokens WHERE id = ? AND revoked_at IS NULL").bind(input.token_id).first<{ agent_id: string }>();
+  if (!token) throw new VaultError("not_found", "Token not found or revoked");
+  await env.DB.prepare("UPDATE tokens SET scopes_override = ? WHERE id = ? AND revoked_at IS NULL").bind(JSON.stringify(scopes), input.token_id).run();
+  clearAuthCache();
+  await audit(env, session, "token_scopes", null, input.token_id, "ok", [], null, 0);
+  return { token_id: input.token_id, agent_id: token.agent_id, scopes };
+}
+
 // Rebuild, reindex, reconcile, and the quarantine erase run as paged jobs in the writer. Start
 // answers 202 with a job id. The job audits `<name>_started`, then one row with counts or the
 // phase and error it stopped at.
