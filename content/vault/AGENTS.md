@@ -14,7 +14,7 @@
 
 ## How the vault is stored
 
-Everything in the vault is a markdown note in a folder. Facts and journal days are notes of a special kind.
+Everything in the vault is a markdown note in a folder. Facts and journal days are notes of a special kind. Call `vault_guide` to see this with your own folder.
 
 - Facts: `bots/<you>/facts/<key>.md`. Each fact is one short statement. Write facts with `vault_write_fact`.
 - Journal: `bots/<you>/journal/<year>/<month>/<date>.md`. There is one file for each day. You can only add entries. Write entries with `vault_append_journal`.

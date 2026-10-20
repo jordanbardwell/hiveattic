@@ -26,8 +26,21 @@ export function mcpHandler(request: Request, env: Env, ctx: ExecutionContext, or
   return handler(request, env, ctx);
 }
 
+// How the vault stores things, for agents to find on their own. It comes from the code, so a vault
+// keeps it current after a deploy even when its stored AGENTS.md is older.
+export function vaultGuide(folder: string): string {
+  return [
+    "Hive Attic is a shared memory vault. Everything in it is a markdown note in a folder. Facts and journal days are notes of a special kind.",
+    `- Facts: ${folder}facts/<key>.md. Each fact is one short statement. Write facts with vault_write_fact.`,
+    `- Journal: ${folder}journal/<year>/<month>/<date>.md. There is one file for each day. You can only add entries. Write entries with vault_append_journal.`,
+    `- Other notes: any other path in your folder, for example ${folder}recipes/apple-pie.md. Use a note for longer text, such as a recipe, a list, or a plan. Write notes with vault_write_note. A note path ends in .md and has no spaces. To replace a note, read it first and send its etag as if_match.`,
+    "- Shared notes are in shared/. Write there only if your token allows it.",
+    "Before you write, read AGENTS.md with vault_read. It has the rules for all agents. Call vault_guide to see this text with your own folder.",
+  ].join("\n");
+}
+
 function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServer {
-  const server = new McpServer({ name: "hiveattic", version: "0.1.0" });
+  const server = new McpServer({ name: "hiveattic", version: "0.1.0" }, { instructions: vaultGuide("bots/<your agent id>/") });
   // One /mcp request can carry several tool calls, so the Idempotency-Key header is ignored here.
   // Only the idempotency_key tool argument counts.
   const session = async (): Promise<Session> => {
@@ -59,6 +72,10 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
       const vault = err instanceof VaultError ? err : new VaultError("invalid", "Request failed");
       return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: errorBody(vault) }) }] };
     }
+  });
+  tool("vault_guide", "Explain how the vault stores facts, journal days, and notes, with your own folder. Call this first if you are new to the vault.", z.object({}), async (current) => {
+    const folder = `bots/${current.access.agentId}/`;
+    return { agent_id: current.access.agentId, own_folder: folder, guide: vaultGuide(folder), rules: "AGENTS.md" };
   });
   tool("vault_read", "Read one vault note by path or id.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) => {
     if (typeof args.id === "string" && args.id) return readById(env, current, args.id);
