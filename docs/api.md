@@ -18,6 +18,9 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 | PUT | `/v1/notes` | `vault_write_note` |
 | POST | `/v1/forget` | `vault_forget` |
 | GET | `/v1/operations/:id` | |
+| | | `vault_guide` |
+
+`vault_guide` is MCP only. It tells the agent how the vault stores facts, journal days, and notes, and gives its own folder. The MCP `initialize` reply has the same text as server instructions, so a client can show it to the agent without a call.
 
 `GET /v1/search` is the canonical search; there is no `POST /v1/search` (404). MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` return the keyword results plus `warning: semantic_deferred`. List pages fill with notes the caller can read and return a `cursor` until the prefix is exhausted. A list `prefix` is the literal start of a path, and case counts: `_` and `%` are ordinary characters, and the prefix can have any length.
 
