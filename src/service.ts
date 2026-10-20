@@ -7,6 +7,7 @@ import { hashToken, randomToken, ulid } from "./crypto";
 import { payloadHash } from "./idempotency";
 import { fromFailure, VaultError, type ApiResult, type JsonValue } from "./errors";
 import { logEvent } from "./log";
+import { parseMarkdown } from "./markdown";
 import { factPath, inSensitiveFolder, isForgetProtectedPath, journalPath, ownerForPath } from "./paths";
 import { listNotes, noteHistory, readNote, searchVault, whoami } from "./query";
 import { IDEMPOTENCY_KEY } from "./schemas";
@@ -220,12 +221,12 @@ export async function writeNote(
   const idempotencyKey = idempotencyKeyFrom(idempotencyHeader, input.idempotency_key);
   const path = assertVaultPath(input.path);
   const declared = resolveDomain(path, input.domain);
-  const extra = input.extra ?? {};
+  const { body, extra } = bodyWithoutFrontmatter(input.body, input.extra ?? {});
   // The folder decides visibility. Text that classifies as health, finance, or PII at a path that
   // is not already sensitive is stored under sensitive/<d>/<same path>. Frontmatter cannot lower it.
   const reroute = inSensitiveFolder(path)
     ? null
-    : routeFor(classifyText(`${input.body}\n${frontmatterText(extra)}`), input.sensitivity === "sensitive", declared);
+    : routeFor(classifyText(`${body}\n${frontmatterText(extra)}`), input.sensitivity === "sensitive", declared);
   let sensitivity: "normal" | "sensitive" = "normal";
   if (reroute) {
     assertRerouteWrite(session.access, path, declared, reroute);
@@ -240,7 +241,7 @@ export async function writeNote(
   const ifMatch = headerMatch ?? input.if_match ?? null;
   const hash = await keyedHash(idempotencyKey, "note", {
     path,
-    body: input.body,
+    body,
     extra,
     sensitivity: input.sensitivity ?? null,
     domain: input.domain ?? null,
@@ -253,7 +254,7 @@ export async function writeNote(
     access: session.access,
     grants: grants(session.access),
     path,
-    body: input.body,
+    body,
     extra,
     ifMatch,
     sensitivity,
@@ -263,6 +264,16 @@ export async function writeNote(
     payloadHash: hash,
     reroute,
   });
+}
+
+// An agent that reads a note and writes it back often sends the whole file, frontmatter included.
+// The writer adds its own frontmatter, so that block would be kept as text in the body. Take it out
+// and keep its keys as extra frontmatter: keys the caller set in extra win, and the writer drops
+// server-managed keys (vault_*, status, owner, and the rest).
+export function bodyWithoutFrontmatter(body: string, extra: Record<string, unknown>): { body: string; extra: Record<string, unknown> } {
+  const parsed = parseMarkdown(body);
+  if (Object.keys(parsed.frontmatter).length === 0) return { body, extra };
+  return { body: parsed.body, extra: { ...parsed.frontmatter, ...extra } };
 }
 
 export async function forgetNote(
