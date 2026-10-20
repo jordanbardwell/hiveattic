@@ -1,4 +1,4 @@
-import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, RESERVED_AGENT_IDS, REVIEWER_SCOPES, scopeProblem, type Access, type NoteView } from "./access";
+import { assertClassifiedDomain, assertVaultPath, canRead, canWrite, domainOf, hasScope, noteSensitivity, resolveDomain, RESERVED_AGENT_IDS, REVIEWER_SCOPES, scopeProblem, writableFolders, type Access, type NoteView } from "./access";
 import { clearAuthCache } from "./auth";
 import { classifyText, frontmatterText, journalRouteFor, routeFor } from "./classify";
 import { CONTENT_LIMIT_BYTES, domainConfig, isOrdinaryDomain, isSensitiveDomain, stagingResources, utf8Length, vaultTimeZone } from "./config";
@@ -231,7 +231,11 @@ export async function writeNote(
     assertRerouteWrite(session.access, path, declared, reroute);
   } else {
     sensitivity = inSensitiveFolder(path) || (declared !== null && !isOrdinaryDomain(declared)) ? "sensitive" : "normal";
-    assertCanWrite(session.access, path, sensitivity, declared);
+    if (!canWrite(session.access, path, sensitivity, declared)) {
+      const folders = writableFolders(session.access);
+      const where = folders.length ? `This token can write notes under ${folders.join(", ")}` : "This token cannot write notes";
+      throw new VaultError("forbidden_scope", `Scope does not allow this write. ${where}`);
+    }
   }
   const ifMatch = headerMatch ?? input.if_match ?? null;
   const hash = await keyedHash(idempotencyKey, "note", {

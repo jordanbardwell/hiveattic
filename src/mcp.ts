@@ -96,7 +96,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   tool("vault_append_journal", "Append one journal or decision entry. Send an idempotency_key so a retry writes once.", journalSchema, async (current, args) =>
     (await appendJournal(env, current, parseInput(journalSchema, args))).data,
   );
-  tool("vault_write_note", "Create or replace a note. Existing notes require if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
+  tool("vault_write_note", "Create or replace a markdown note, such as a recipe, a list, or a longer write-up. Use a fact for one short statement. path is vault-relative, ends in .md, and uses only letters, digits, '-', '_', '.' and '/' (no spaces). Write in your own folder bots/<your agent id>/, for example bots/<your agent id>/recipes/apple-pie.md, or in shared/ if you have write:shared. To replace an existing note, read it first and send its etag as if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
     (await writeNote(env, current, parseInput(noteSchema, args), null)).data,
   );
   tool("vault_forget", "Soft-delete a note. History is kept for the admin. Send an idempotency_key so a retry writes once.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
