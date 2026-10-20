@@ -234,6 +234,27 @@ button, input, select, textarea { font-family: inherit; }
 .b-title { font-size: 14px; font-weight: 500; line-height: 1.4; color: var(--text); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .b-title.gone { color: var(--muted-2); text-decoration: line-through; }
 .b-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted-2); min-width: 0; }
+.b-views { display: flex; gap: 2px; padding: 3px; background: var(--input-2); border: 1px solid #1C1C1F; border-radius: 999px; flex-shrink: 0; }
+.b-views span { height: 28px; display: flex; align-items: center; gap: 7px; padding: 0 13px; border-radius: 999px; color: var(--sec); font-size: 12.5px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: background .15s, color .15s; }
+.b-views span.on { background: var(--text); color: #0C0C0D; }
+.f-dir, .f-file { display: flex; align-items: center; gap: 10px; border-radius: 14px; cursor: pointer; transition: background .12s; }
+.f-dir { height: 40px; padding-right: 14px; flex-shrink: 0; }
+.f-file { min-height: 40px; padding-top: 8px; padding-bottom: 8px; padding-right: 14px; }
+.f-dir:hover, .f-file:hover { background: var(--raised); }
+.f-file.on { background: var(--hover-2); }
+.f-chev { flex-shrink: 0; color: var(--muted-2); transition: transform .18s cubic-bezier(.2,.8,.2,1); }
+.f-dir.open .f-chev { transform: rotate(90deg); }
+.f-icon { flex-shrink: 0; color: var(--muted-2); }
+.f-dir.open .f-icon { color: var(--honey); }
+.f-label { font-size: 13.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.f-dir.open .f-label { color: var(--text); }
+.f-dir.f-top .f-label { font-weight: 500; }
+.f-count, .f-when { font-size: 12px; color: var(--faint); white-space: nowrap; flex-shrink: 0; }
+.f-count { margin-left: auto; }
+.f-dot { width: 7px; height: 8px; flex-shrink: 0; margin: 0 3px 0 2px; }
+.f-title { flex: 1; min-width: 0; font-size: 13.5px; line-height: 1.4; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.f-title.gone { color: var(--muted-2); text-decoration: line-through; }
+.f-flag { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .area-dot { width: 7px; height: 8px; flex-shrink: 0; }
 .reader { background: var(--card); border: 1px solid var(--b1); border-radius: 28px; padding: 40px 48px 28px; display: flex; flex-direction: column; gap: 26px; min-width: 0; min-height: 520px; }
 .reader-title { margin: 0; font: 600 36px/1.15 var(--sans); letter-spacing: -.045em; color: var(--white); overflow-wrap: anywhere; text-wrap: balance; }
@@ -431,7 +452,7 @@ input.field { height: 36px; }
   const LEAD = { write_fact: "updated this", superseded: "wrote this", append_journal: "added to this", journal: "added to this", write_note: "saved this", forget: "forgot this", restore: "restored this",
     summary: "rebuilt this", bootstrap: "created this", conflict: "flagged a conflict here", created: "created this", reconcile: "reconciled this", replay: "replayed this", quarantined: "quarantined this" };
   const PAGES = [["overview", "Overview", "O"], ["browse", "Browse", "B"], ["facts", "Facts & profile", "F"], ["journal", "Journal", "J"], ["agents", "Agents", "A"], ["audit", "Audit log", "L"]];
-  const ICON = { overview: "M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z", browse: "M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.2h7.5A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z", facts: "M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01", journal: "M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5zM5 19.5A1.5 1.5 0 0 0 6.5 21H19M9 7.5h6", agents: "M15.5 19v-1.2a3.8 3.8 0 0 0-3.8-3.8H6.3a3.8 3.8 0 0 0-3.8 3.8V19M9 10.5a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4zM21.5 19v-1.2a3.8 3.8 0 0 0-2.8-3.66M15.6 4.2a3.2 3.2 0 0 1 0 6.2", audit: "M12 3l7.5 2.8v5.7c0 4.4-3.1 8.2-7.5 9.5-4.4-1.3-7.5-5.1-7.5-9.5V5.8zM9 12l2 2 4-4", search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.6-3.6", plus: "M12 5v14M5 12h14", chev: "M6 9l6 6 6-6", collapse: "M14.5 6l-6 6 6 6M20 4v16", expand: "M9.5 6l6 6-6 6M4 4v16" };
+  const ICON = { overview: "M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z", browse: "M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.2h7.5A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z", facts: "M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01", journal: "M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5zM5 19.5A1.5 1.5 0 0 0 6.5 21H19M9 7.5h6", agents: "M15.5 19v-1.2a3.8 3.8 0 0 0-3.8-3.8H6.3a3.8 3.8 0 0 0-3.8 3.8V19M9 10.5a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4zM21.5 19v-1.2a3.8 3.8 0 0 0-2.8-3.66M15.6 4.2a3.2 3.2 0 0 1 0 6.2", audit: "M12 3l7.5 2.8v5.7c0 4.4-3.1 8.2-7.5 9.5-4.4-1.3-7.5-5.1-7.5-9.5V5.8zM9 12l2 2 4-4", search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.6-3.6", plus: "M12 5v14M5 12h14", chev: "M6 9l6 6 6-6", chevR: "M9 6l6 6-6 6", clock: "M12 7v5l3 2M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17z", collapse: "M14.5 6l-6 6 6 6M20 4v16", expand: "M9.5 6l6 6-6 6M4 4v16" };
   const CARD_LIKE = /\d[\d -]{10,}\d/;
   const LIVE_POLL_MS = 30000;
 
@@ -442,7 +463,7 @@ input.field { height: 36px; }
     whoami: null, overview: null, agents: [], audit: [], paths: [], layout: null, index: null,
     hive: { mode: "recency", filter: null, q: "", sel: null, hover: null, introAt: 0, live: "", pulse: null },
     hoverHour: -1,
-    browse: { q: "", scope: "all", sel: null, note: null, history: null, raw: false, info: false, menu: false, err: "" },
+    browse: { q: "", scope: "all", view: "recent", open: {}, sel: null, note: null, history: null, raw: false, info: false, menu: false, err: "" },
     facts: { q: "", domain: "all", sel: null, history: null, summary: null },
     journal: { mode: "journal", agent: "all", days: 7, cache: {}, loading: false },
     agentSel: null, agMenu: false, agTok: false, userMenu: false,
@@ -455,13 +476,14 @@ input.field { height: 36px; }
     if (typeof prefs.navOpen === "boolean") S.navOpen = prefs.navOpen;
     if (PAGES.some((p) => p[0] === prefs.view)) S.view = prefs.view;
     if (typeof prefs.note === "string") S.browse.sel = prefs.note;
+    if (prefs.browseView === "folders") S.browse.view = "folders";
     if (typeof prefs.agent === "string") S.agentSel = prefs.agent;
     if (prefs.journal === "decisions") S.journal.mode = "decisions";
   } catch (e) { /* defaults */ }
 
   function readStore(store, key) { try { return store.getItem(key); } catch (e) { return null; } }
   function writeStore(store, key, value) { try { if (value == null) store.removeItem(key); else store.setItem(key, value); } catch (e) { /* private mode */ } }
-  function savePrefs() { writeStore(localStorage, PREFS_KEY, JSON.stringify({ tech: S.tech, view: S.view, navOpen: S.navOpen, note: S.browse.sel, agent: S.agentSel, journal: S.journal.mode })); }
+  function savePrefs() { writeStore(localStorage, PREFS_KEY, JSON.stringify({ tech: S.tech, view: S.view, navOpen: S.navOpen, note: S.browse.sel, browseView: S.browse.view, agent: S.agentSel, journal: S.journal.mode })); }
 
   // ---- DOM helpers ----
   function h(tag, props, ...kids) {
@@ -724,7 +746,7 @@ input.field { height: 36px; }
   }
   function openNote(path) {
     if (!path) return;
-    S.browse = Object.assign({}, S.browse, { sel: path, note: null, history: null, err: "", q: "", scope: "all", menu: false });
+    S.browse = Object.assign({}, S.browse, { sel: path, note: null, history: null, err: "", q: "", scope: "all", menu: false, open: Object.assign({}, S.browse.open, parentKeys(path)) });
     go("browse");
   }
   function openAgent(id) { if (!S.agents.some((a) => a.id === id)) return; S.agMenu = false; S.agTok = false; go("agents", { agentSel: id }); }
@@ -744,6 +766,12 @@ input.field { height: 36px; }
       S.browse.note = null; S.browse.err = err.message;
     }
     render();
+  }
+  // The folder keys ("bots/", "bots/muse/") that hold a path, so the tree can open them.
+  function parentKeys(path) {
+    const parts = path.split("/"), keys = {};
+    for (let i = 1; i < parts.length; i++) keys[parts.slice(0, i).join("/") + "/"] = true;
+    return keys;
   }
   function pickNote(path) { Object.assign(S.browse, { sel: path, note: null, history: null, err: "", menu: false }); savePrefs(); render(); ensureNote(); }
   async function ensureSummary() {
@@ -1290,9 +1318,13 @@ input.field { height: 36px; }
         h("div", { class: "searchbar" }, icon("search", 18, 1.8),
           h("input", { key: "browse-q", placeholder: "Search notes, facts and journal days", value: b.q, onInput: (e) => { b.q = e.target.value; render(); } }),
           h("span", { class: "count" }, plural(list.length, "note"))),
-        h("div", { class: "pills" }, scopes.map(([k, l]) => Pill(l, b.scope === k, () => { b.scope = k; render(); }, k === "all" ? matches.length : matches.filter((n) => clusterOf(n) === k).length)))),
+        h("div", { class: "pills" },
+          h("div", { class: "b-views" }, [["recent", "Recent", "clock"], ["folders", "Folders", "browse"]].map(([k, l, ic]) =>
+            h("span", { class: b.view === k ? "on" : "", onClick: () => { b.view = k; savePrefs(); render(); } }, icon(ic, 14, 1.8), l))),
+          h("span", { class: "pill-rule" }),
+          scopes.map(([k, l]) => Pill(l, b.scope === k, () => { b.scope = k; render(); }, k === "all" ? matches.length : matches.filter((n) => clusterOf(n) === k).length)))),
       h("div", { class: "browse-grid" },
-        h("div", { class: "browse-list", "data-scroll": "browse-list" }, list.length ? list.map((n) => {
+        h("div", { class: "browse-list", "data-scroll": "browse-list" }, !list.length ? Empty("Nothing in the vault matches.") : b.view === "folders" ? folderRows(list, !!b.q.trim() || b.scope !== "all") : list.map((n) => {
           const bd = badgeOf(n), w = who(n.last_writer || n.owner);
           return h("div", { class: "b-row" + (n.path === b.sel ? " on" : ""), title: n.path, onClick: () => pickNote(n.path) },
             h("span", { class: "b-title" + (n.status === "forgotten" ? " gone" : "") }, titleOf(n)),
@@ -1301,8 +1333,57 @@ input.field { height: 36px; }
               h("span", { class: "nowrap" }, AREA_LABEL[clusterOf(n)]), h("span", null, "·"), h("span", { class: "nowrap" }, when(n.updated_at)),
               h("span", { class: "av", title: w.name, style: { marginLeft: "auto", width: "18px", height: "18px", fontSize: "8px", background: w.bg, color: w.fg } }, w.ini),
               bd ? h("span", { class: "row nowrap", style: { marginLeft: "4px", gap: "6px", color: "var(--text-3)" } }, h("span", { class: "dot sm", style: { background: bd[1] } }), bd[0]) : null));
-        }) : Empty("Nothing in the vault matches.")),
+        })),
         Reader())));
+  }
+  // Friendly folder names. Technical details shows the raw folder name instead.
+  const FOLDER_LABEL = { profile: "Profile", facts: "Facts", bots: "Agent notes", journal: "Journal", "journal-sensitive": "Private journal", shared: "Shared", inbox: "Inbox", sensitive: "Sensitive", decisions: "Decisions", projects: "Projects", people: "People", recipes: "Recipes" };
+  const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  function folderLabel(name, parent) {
+    if (S.tech) return name + "/";
+    if (FOLDER_LABEL[name]) return FOLDER_LABEL[name];
+    if (parent === "bots") return agentName(name);
+    if (/^\d{2}$/.test(name) && /^\d{4}$/.test(parent)) return MONTHS[Number(name) - 1] || name;
+    return name.charAt(0).toUpperCase() + name.slice(1).replace(/[-_]/g, " ");
+  }
+  // The Browse list as a folder tree: in each folder, files first (newest first), then subfolders A to Z.
+  // While a search or a scope filter is on, every folder is open so that each match shows.
+  function folderRows(list, forceOpen) {
+    const b = S.browse;
+    const root = { dirs: {}, files: [], count: 0 };
+    for (const n of list) {
+      const parts = n.path.split("/");
+      let node = root;
+      node.count++;
+      for (let i = 0; i < parts.length - 1; i++) {
+        node = node.dirs[parts[i]] = node.dirs[parts[i]] || { dirs: {}, files: [], count: 0, key: parts.slice(0, i + 1).join("/") + "/", name: parts[i], parent: parts[i - 1] || "" };
+        node.count++;
+      }
+      node.files.push(n);
+    }
+    const rows = [];
+    const walk = (node, depth) => {
+      for (const n of node.files) {
+        const bd = badgeOf(n);
+        rows.push(h("div", { class: "f-file" + (n.path === b.sel ? " on" : ""), title: n.path, style: { paddingLeft: (18 + depth * 22) + "px" }, onClick: () => pickNote(n.path) },
+          h("span", { class: "f-dot hex", style: { background: areaColor(clusterOf(n)) } }),
+          h("span", { class: "f-title" + (n.status === "forgotten" ? " gone" : "") }, S.tech ? n.path.split("/").pop() : titleOf(n)),
+          bd ? h("span", { class: "f-flag", title: bd[0], style: { background: bd[1] } }) : null,
+          h("span", { class: "f-when" }, when(n.updated_at))));
+      }
+      for (const name of Object.keys(node.dirs).sort()) {
+        const d = node.dirs[name], open = forceOpen || !!b.open[d.key];
+        rows.push(h("div", { class: "f-dir" + (open ? " open" : "") + (depth === 0 ? " f-top" : ""), title: d.key, style: { paddingLeft: (14 + depth * 22) + "px" },
+          onClick: () => { b.open[d.key] = !b.open[d.key]; render(); } },
+          h("span", { class: "f-chev" }, icon("chevR", 12, 2.2)),
+          h("span", { class: "f-icon" }, icon("browse", 16, 1.7)),
+          h("span", { class: "f-label" }, folderLabel(name, d.parent)),
+          h("span", { class: "f-count" }, String(d.count))));
+        if (open) walk(d, depth + 1);
+      }
+    };
+    walk(root, 0);
+    return rows;
   }
   function Reader() {
     const b = S.browse;
