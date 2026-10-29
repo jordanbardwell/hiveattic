@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { classificationText, classifyText, frontmatterRoute, routeFor } from "../src/classify";
+import { afterEach, describe, expect, it } from "vitest";
+import { classificationText, classifyText, frontmatterRoute, journalRouteFor, routeFor } from "../src/classify";
 import { configure } from "../src/config";
 import { testEnv } from "./helpers";
 
@@ -45,8 +45,25 @@ describe("content classification", () => {
       "Ship the release on 2026-10-17",
       "health check endpoint returns 200",
       "Ira joined the call",
+      "Run `brew doctor` before the upgrade",
+      "flutter doctor --verbose found no issues",
+      "scripts/check_env.py doctor returned ok=true",
+      "Best used for debugging, tool failure diagnosis, root cause analysis",
+      "Error diagnosis took an hour",
     ]) {
       expect(route(text), text).toBeNull();
+    }
+  });
+
+  it("still routes a person's doctor and diagnosis to health", () => {
+    for (const text of [
+      "My doctor moved the appointment to Friday",
+      "Saw the doctor -- feeling better",
+      "The diagnosis came back clean",
+      "Doctor's note for school",
+      "Ask the doctor about `metformin` dosing",
+    ]) {
+      expect(route(text), text).toBe("health");
     }
   });
 
@@ -57,5 +74,34 @@ describe("content classification", () => {
     expect(frontmatterRoute({ sensitivity: "normal", domain: "deals" }, "---\nsensitivity: normal\ndomain: deals\n---\nFlu shot\n")).toBe("health");
     expect(frontmatterRoute({ sensitivity: "sensitive" }, "---\nsensitivity: sensitive\n---\nplain\n")).toBe("restricted");
     expect(frontmatterRoute({ title: "Dentist" }, "---\ntitle: Dentist\n---\nplain\n")).toBe("health");
+  });
+});
+
+describe("PII_ROUTE", () => {
+  afterEach(() => {
+    configure(testEnv());
+  });
+
+  it("defaults to restricted", () => {
+    configure({ ...testEnv(), PII_ROUTE: undefined });
+    expect(route("Call 206-555-0142 tomorrow")).toBe("restricted");
+  });
+
+  it("keep leaves PII-only text where it was written and routes everything else as before", () => {
+    configure({ ...testEnv(), PII_ROUTE: "keep" });
+    expect(route("Call 206-555-0142 tomorrow")).toBeNull();
+    expect(route("Lives at 12 Elm Street")).toBeNull();
+    expect(route("Date of birth is on file")).toBeNull();
+    expect(journalRouteFor(classifyText("Call 206-555-0142 tomorrow"), false, null)).toBeNull();
+    // Health and finance, mixed text, the sensitivity flag, and a declared domain do not change.
+    expect(route("Doctor's office is 206-555-0142")).toBe("health");
+    expect(route("Mortgage payment, call 206-555-0142")).toBe("finance");
+    expect(route("Hospital bill blew the budget")).toBe("restricted");
+    expect(route("A plain note", true)).toBe("restricted");
+    expect(route("Call 206-555-0142", false, "finance")).toBe("finance");
+  });
+
+  it("refuses any other value", () => {
+    expect(() => configure({ ...testEnv(), PII_ROUTE: "off" })).toThrow(/PII_ROUTE/);
   });
 });

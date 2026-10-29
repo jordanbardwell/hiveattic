@@ -29,6 +29,8 @@ interface __BaseEnv_Env {
 	TZ_DISPLAY?: string;
 	// Test override for the caller-facing write timeout. Unset in deployed configs.
 	WRITE_TIMEOUT_MS?: string;
+	// Where PII-only text goes: restricted (default) or keep. See docs/content-and-privacy.md.
+	PII_ROUTE?: string;
 	WRITER: DurableObjectNamespace<import("./src/index").VaultWriter>;
 }
 declare namespace Cloudflare {

@@ -19,6 +19,7 @@
     "VAULT_TZ": "UTC",
     "SENSITIVE_DOMAINS": "health,finance",
     "ORDINARY_DOMAINS": "deals,x",
+    "PII_ROUTE": "restricted",
     "ENVIRONMENT": "production",
     "RATE_LIMIT_WRITES_PER_MIN": "60",
     "RATE_LIMIT_READS_PER_MIN": "300",

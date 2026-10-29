@@ -4,10 +4,11 @@ import { sha256Hex } from "./crypto";
 import { VaultError } from "./errors";
 import { AGENTS_MD } from "./content";
 import { inSensitiveFolder, ownerForPath, r2KeyFor } from "./paths";
+import { searchTags, tagPrefix, taggedIdsBinds, taggedIdsSql } from "./tags";
 
 export { stagingResources };
 
-export type SearchOptions = { limit?: number; domains?: string[]; types?: string[]; since?: string };
+export type SearchOptions = { limit?: number; domains?: string[]; types?: string[]; since?: string; tags?: string[] };
 
 type NoteHit = {
   id: string;
@@ -41,10 +42,13 @@ type NoteRecord = {
 const RESTRICTED_LIKE = `sensitive/${RESTRICTED}/%`;
 
 export async function searchVault(env: Env, access: Access, query: string, mode: string, options: SearchOptions = {}): Promise<Record<string, unknown>> {
+  const tags = searchTags(options.tags);
+  // Tags without words list the newest notes that have them.
+  if (!query.trim() && tags.length) return taggedNotes(env, access, tags, mode, options);
   const match = ftsQuery(query);
   const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
   const scope = scopeSql(access);
-  const filters = extraFilters(options);
+  const filters = extraFilters(options, tags);
   // The SQL prefilter is broader than canRead, so rows the caller cannot read are dropped after it.
   // Reading goes on, a batch at a time, until the page has `limit` notes or the matches run out.
   const best = new Map<string, { hit: NoteHit; score: number; boosts: string[] }>();
@@ -78,24 +82,163 @@ export async function searchVault(env: Env, access: Access, query: string, mode:
     }
     if (rows.length < batch) break;
   }
-  const results = [...best.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map(({ hit, score, boosts }) => ({
-      id: hit.id,
-      path: hit.path,
-      title: hit.title,
-      type: hit.type,
-      owner: hit.owner,
-      domain: hit.domain,
-      updated_at: hit.updated_at,
-      score: Number(score.toFixed(4)),
-      snippet: hit.chunk_text.slice(0, 180),
-      why: { kw_rank: hit.rank, vec_rank: null, boosts },
-    }));
+  const ranked = [...best.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+  const tagged = await tagsOf(env, ranked.map(({ hit }) => hit.id));
+  const results = ranked.map(({ hit, score, boosts }) => ({
+    id: hit.id,
+    path: hit.path,
+    title: hit.title,
+    type: hit.type,
+    owner: hit.owner,
+    domain: hit.domain,
+    updated_at: hit.updated_at,
+    score: Number(score.toFixed(4)),
+    snippet: hit.chunk_text.slice(0, 180),
+    tags: tagged.get(hit.id) ?? [],
+    why: { kw_rank: hit.rank, vec_rank: null, boosts },
+  }));
+  return searchReply(results, mode);
+}
+
+function searchReply(results: Record<string, unknown>[], mode: string): Record<string, unknown> {
   const data: Record<string, unknown> = { results, index_lag_ms: 0, mode: mode === "hybrid" || mode === "semantic" ? mode : "keyword" };
   if (mode === "hybrid" || mode === "semantic") data.warning = "semantic_deferred";
   return data;
+}
+
+// The newest notes with every tag asked for, the same filters, and the same read checks as a search.
+// The first tag's rows in note_tags lead the query, so it reads those notes and no others.
+async function taggedNotes(env: Env, access: Access, tags: string[], mode: string, options: SearchOptions): Promise<Record<string, unknown>> {
+  const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
+  const scope = scopeSql(access);
+  const filters = extraFilters(options, tags.slice(1));
+  const found: (NoteHit & { snippet: string })[] = [];
+  const batch = Math.min(limit * 2, 100);
+  for (let round = 0, offset = 0; round < 5 && found.length < limit; round++, offset += batch) {
+    const selected = await env.DB.prepare(
+      `SELECT n.id, n.path, n.title, n.owner, n.type, n.domain, n.sensitivity, n.updated_at, n.frontmatter,
+              COALESCE((SELECT c.text FROM chunks c WHERE c.note_id = n.id ORDER BY c.n LIMIT 1), '') AS snippet
+       FROM (${taggedIdsSql()}) m
+       CROSS JOIN notes n ON n.id = m.note_id
+       WHERE n.status = 'active' AND (${scope.sql}) ${filters.sql}
+         AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
+       ORDER BY n.updated_at DESC, n.id
+       LIMIT ? OFFSET ?`,
+    )
+      .bind(...taggedIdsBinds(tags[0]!), ...scope.binds, ...filters.binds, batch, offset)
+      .all<NoteHit & { snippet: string }>();
+    const rows = selected.results ?? [];
+    for (const hit of rows) {
+      if (!canRead(access, noteView(hit))) continue;
+      found.push(hit);
+      if (found.length === limit) break;
+    }
+    if (rows.length < batch) break;
+  }
+  const tagged = await tagsOf(env, found.map((hit) => hit.id));
+  const results = found.map((hit) => ({
+    id: hit.id,
+    path: hit.path,
+    title: hit.title,
+    type: hit.type,
+    owner: hit.owner,
+    domain: hit.domain,
+    updated_at: hit.updated_at,
+    score: 0,
+    snippet: hit.snippet.slice(0, 180),
+    tags: tagged.get(hit.id) ?? [],
+    why: { kw_rank: null, vec_rank: null, boosts: [] },
+  }));
+  return searchReply(results, mode);
+}
+
+// The tags of each note in a reply, in one query. Callers pass only notes the caller can read.
+async function tagsOf(env: Env, ids: string[]): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (!ids.length) return out;
+  const rows = await env.DB.prepare("SELECT note_id, tag FROM note_tags WHERE note_id IN (SELECT value FROM json_each(?)) ORDER BY note_id, tag")
+    .bind(JSON.stringify(ids))
+    .all<{ note_id: string; tag: string }>();
+  for (const row of rows.results ?? []) {
+    const list = out.get(row.note_id);
+    if (list) list.push(row.tag);
+    else out.set(row.note_id, [row.tag]);
+  }
+  return out;
+}
+
+const TAG_PAGE = 200;
+const TAG_ROWS = 500;
+// Reads per call: TAG_ROUNDS once the page has a tag, TAG_ROUNDS_FIRST while it has none, so a tag
+// on thousands of notes still gets counted whole.
+const TAG_ROUNDS = 8;
+const TAG_ROUNDS_FIRST = 24;
+
+// The tags on notes the caller can read, in order, with how many of those notes carry each. A tag
+// that only notes the caller cannot read carry is left out, the same as those notes are, and the
+// cursor is always a tag the reply lists. Rows come in (tag, note_id) order from the primary key, a
+// batch at a time, and each is checked with canRead. A page holds whole tags only: when the reads
+// run out in the middle of a tag, the page ends before it. If no tag is whole by then, the first one
+// is returned with `partial: true` and a count that is a lower bound, or, when none of the notes
+// read so far were readable, the reply has `truncated: true` and no cursor.
+export async function listTags(env: Env, access: Access, prefix: string, cursor = ""): Promise<Record<string, unknown>> {
+  const from = tagPrefix(prefix);
+  const end = from ? prefixEnd(from) : null;
+  const scope = scopeSql(access);
+  const tags: { tag: string; count: number; partial?: true }[] = [];
+  // The cursor is the last tag of the previous page, so this page starts after all of its rows.
+  let afterTag = cursor;
+  let afterId = cursor ? "\u{10FFFF}" : "";
+  let current: string | null = null;
+  let count = 0;
+  let full = false;
+  let exhausted = false;
+  const push = () => {
+    if (current !== null && count > 0) tags.push({ tag: current, count });
+    current = null;
+    count = 0;
+  };
+  rounds: for (let round = 0; round < (tags.length ? TAG_ROUNDS : TAG_ROUNDS_FIRST); round++) {
+    const selected = await env.DB.prepare(
+      `SELECT t.tag, n.id, n.path, n.owner, n.domain, n.sensitivity, n.frontmatter
+       FROM note_tags t CROSS JOIN notes n ON n.id = t.note_id
+       WHERE (t.tag, t.note_id) > (?, ?) ${from ? "AND t.tag >= ?" : ""} ${end === null ? "" : "AND t.tag < ?"}
+         AND n.status = 'active' AND (${scope.sql})
+         AND NOT EXISTS (SELECT 1 FROM oversize_files o WHERE o.path = n.path)
+       ORDER BY t.tag, t.note_id
+       LIMIT ?`,
+    )
+      .bind(afterTag, afterId, ...(from ? [from] : []), ...(end === null ? [] : [end]), ...scope.binds, TAG_ROWS)
+      .all<{ tag: string; id: string; path: string; owner: string; domain: string | null; sensitivity: string; frontmatter: string }>();
+    const rows = selected.results ?? [];
+    for (const row of rows) {
+      if (row.tag !== current) {
+        push();
+        if (tags.length === TAG_PAGE) {
+          full = true;
+          break rounds;
+        }
+        current = row.tag;
+      }
+      if (canRead(access, noteView(row))) count += 1;
+      afterTag = row.tag;
+      afterId = row.id;
+    }
+    if (rows.length < TAG_ROWS) {
+      push();
+      exhausted = true;
+      break;
+    }
+  }
+  let truncated = false;
+  if (!full && !exhausted && current !== null && tags.length === 0) {
+    if (count > 0) tags.push({ tag: current, count, partial: true });
+    else truncated = true;
+  }
+  const more = full || (!exhausted && tags.length > 0);
+  const reply: Record<string, unknown> = { tags, cursor: more ? tags.at(-1)!.tag : null };
+  if (truncated) reply.truncated = true;
+  return reply;
 }
 
 const NOTE_SELECT = `SELECT id, path, owner, domain, sensitivity, frontmatter, body, status, r2_etag, type, title,
@@ -248,9 +391,13 @@ function prefixEnd(prefix: string): string | null {
   return chars.join("") + String.fromCodePoint(last + 1);
 }
 
-function extraFilters(options: SearchOptions): { sql: string; binds: string[] } {
+function extraFilters(options: SearchOptions, tags: string[] = []): { sql: string; binds: string[] } {
   const parts: string[] = [];
   const binds: string[] = [];
+  for (const tag of tags) {
+    parts.push(`n.id IN (${taggedIdsSql()})`);
+    binds.push(...taggedIdsBinds(tag));
+  }
   const domains = (options.domains ?? []).filter((domain) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(domain));
   if (domains.length) {
     parts.push(`n.domain IN (${domains.map(() => "?").join(", ")})`);

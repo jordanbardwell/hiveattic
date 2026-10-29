@@ -36,6 +36,7 @@ import {
   vaultPathFromKey,
 } from "./paths";
 import { emptyRows, jsonInsert, jsonSelect, jsonSlices, slices, type StagedRows } from "./stage";
+import { NOTE_TAGS_FILL, NOTE_TAGS_REPAIR } from "./tags";
 import { etStamp, versionStamp, within24h } from "./time";
 
 export type Actor = {
@@ -618,7 +619,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (!saved.ok) return saved;
     if (moving && active) {
       await this.retireMoved(active, path, op.actor, true);
-      await this.env.DB.batch([this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id), ...this.refreshNames([id])]);
+      await this.env.DB.batch([this.env.DB.prepare("UPDATE notes SET fact_key = ? WHERE id = ?").bind(op.key, id), ...this.refreshLookups([id])]);
     }
     if (conflict && active) await this.flagConflict(op.key, id, active.version_ts ?? active.id, op.actor, op.observedAt, active.observed_at);
     if (op.scope === "shared" || moving) await this.refreshSummary(op.actor);
@@ -906,7 +907,7 @@ export class VaultWriter extends DurableObject<Env> {
         `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', r2_etag = ?, updated_at = ?, version_ts = ?, last_writer = ?, index_gen = ?
          WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), hash, etag.etag, now, etag.versionTs, op.actor.agentId, this.gen(), note.id),
-      ...this.refreshNames([note.id]),
+      ...this.refreshLookups([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare(
@@ -1042,7 +1043,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare(
         `UPDATE notes SET status = 'forgotten', body = ?, frontmatter = ?, content_hash = ?, r2_etag = NULL, updated_at = ?, last_writer = ?, index_gen = ? WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), now, actor.agentId, this.gen(), note.id),
-      ...this.refreshNames([note.id]),
+      ...this.refreshLookups([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
@@ -1148,7 +1149,7 @@ export class VaultWriter extends DurableObject<Env> {
         `UPDATE notes SET body = ?, frontmatter = ?, content_hash = ?, status = 'forgotten', fact_key = NULL, r2_etag = ?, updated_at = ?, last_writer = ?, index_gen = ?
          WHERE id = ?`,
       ).bind(stub, JSON.stringify(parseMarkdown(stub).frontmatter), await sha256Hex(stub), etag, now, actor.agentId, this.gen(), note.id),
-      ...this.refreshNames([note.id]),
+      ...this.refreshLookups([note.id]),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(note.id),
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id = ? AND r2_key = ?").bind(note.id, note.r2_key),
@@ -1359,8 +1360,10 @@ export class VaultWriter extends DurableObject<Env> {
         statements.push(this.env.DB.prepare("DELETE FROM links WHERE src_note_id = ?").bind(input.id));
       }
     }
-    // An append changes only the body, so the names of the note stay as they are.
-    if (!(appending && existing)) statements.push(...this.refreshNames([input.id]));
+    // An append changes only the body, so the names of the note stay as they are. Its entry can
+    // bring tags, so those are made again.
+    if (appending && existing) statements.push(...this.refreshTags([input.id]));
+    else statements.push(...this.refreshLookups([input.id]));
     // F15: every version is an immutable copy under sys/history/<id>/, labelled with the write that
     // produced it, so history shows each version's own text and restoring one restores it.
     // A journal day file is append-only and never restored, so it keeps no copies. The generated
@@ -1731,7 +1734,7 @@ export class VaultWriter extends DurableObject<Env> {
     const parked = `.forgotten/${row.id}.md`;
     await this.env.DB.batch([
       this.env.DB.prepare("UPDATE notes SET path = ?, r2_key = ?, fact_key = NULL WHERE id = ? AND status = 'forgotten'").bind(parked, r2KeyFor(this.prefix(), parked), row.id),
-      ...this.refreshNames([row.id]),
+      ...this.refreshLookups([row.id]),
     ]);
   }
 
@@ -1786,7 +1789,7 @@ export class VaultWriter extends DurableObject<Env> {
       ).bind(note.id, now, actor.agentId, reason, now, hash, note.path),
       ...this.vectorDeletes(chunkIds, note.id, now),
       this.env.DB.prepare("DELETE FROM notes WHERE id = ?").bind(note.id),
-      ...this.refreshNames([note.id]),
+      ...this.refreshLookups([note.id]),
     ]);
     if (feedsSummary(note)) {
       // The summary is regenerated without the erased statement. Its earlier versions quoted it, and
@@ -2223,7 +2226,7 @@ export class VaultWriter extends DurableObject<Env> {
     if (keepAlive.length) {
       await this.env.DB.batch([
         this.env.DB.prepare("UPDATE notes SET index_gen = ? WHERE id IN (SELECT value FROM json_each(?))").bind(gen, JSON.stringify(keepAlive)),
-        ...this.refreshNames(keepAlive),
+        ...this.refreshLookups(keepAlive),
       ]);
     }
     // A path read back at its normal size is no longer oversize.
@@ -2255,11 +2258,11 @@ export class VaultWriter extends DurableObject<Env> {
         db.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
         db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(replaced),
         db.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(replaced),
-        ...this.refreshNames(rows.replaced),
+        ...this.refreshLookups(rows.replaced),
       );
     }
     if (rows.unkeyed.length) {
-      statements.push(db.prepare("UPDATE notes SET fact_key = NULL WHERE id IN (SELECT value FROM json_each(?))").bind(ids(rows.unkeyed)), ...this.refreshNames(rows.unkeyed));
+      statements.push(db.prepare("UPDATE notes SET fact_key = NULL WHERE id IN (SELECT value FROM json_each(?))").bind(ids(rows.unkeyed)), ...this.refreshLookups(rows.unkeyed));
     }
     const staged = rows.notes.map((row) => String(row[0]));
     for (const json of jsonSlices(rows.notes)) {
@@ -2272,7 +2275,7 @@ export class VaultWriter extends DurableObject<Env> {
     }
     if (staged.length) {
       const stagedIds = ids(staged);
-      statements.push(...this.refreshNames(staged));
+      statements.push(...this.refreshLookups(staged));
       statements.push(db.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
       statements.push(db.prepare("DELETE FROM links WHERE src_note_id IN (SELECT value FROM json_each(?))").bind(stagedIds));
       const entryIds = JSON.stringify(rows.journal.map((row) => row[0]));
@@ -2403,7 +2406,7 @@ export class VaultWriter extends DurableObject<Env> {
       this.env.DB.prepare("DELETE FROM note_versions WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
       this.env.DB.prepare("DELETE FROM chunks WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
       this.env.DB.prepare("DELETE FROM notes WHERE id IN (SELECT value FROM json_each(?))").bind(json),
-      ...this.refreshNames(stale),
+      ...this.refreshLookups(stale),
     ]);
     this.count(job, "swept", stale.length);
     return stale.length < 100;
@@ -2447,7 +2450,7 @@ export class VaultWriter extends DurableObject<Env> {
   // Reconcile: index files whose etag differs from D1, then forget rows whose object is missing.
   private async reconcileStep(job: Job, deadline: number): Promise<boolean> {
     if (job.phase === "start") {
-      for (const name of ["scanned", "updated", "moved", "forgotten", "oversize", "names"]) job.counts[name] = 0;
+      for (const name of ["scanned", "updated", "moved", "forgotten", "oversize", "names", "tags"]) job.counts[name] = 0;
       this.nextPhase(job, "files");
     }
     const actor: Actor = { agentId: "reconcile", tokenId: "reconcile", client: "reconcile", requestId: job.actor.requestId, ipCountry: null };
@@ -2490,10 +2493,12 @@ export class VaultWriter extends DurableObject<Env> {
         for (const record of records.results ?? []) {
           if (!(await this.env.VAULT.head(r2KeyFor(this.prefix(), record.path)))) await this.clearOversize(record.path);
         }
-        // Each write keeps the name table right. This repairs it after a write that missed it, such as
-        // one by the code from before the table, while a deploy applied the migration.
+        // Each write keeps the name and tag tables right. This repairs them after a write that missed
+        // them, such as one by the code from before a table, while a deploy applied its migration.
         const repaired = await this.env.DB.batch(NOTE_NAMES_REPAIR.map((sql) => this.env.DB.prepare(sql)));
         this.count(job, "names", repaired.reduce((sum, result) => sum + (result.meta.changes ?? 0), 0));
+        const retagged = await this.env.DB.batch(NOTE_TAGS_REPAIR.map((sql) => this.env.DB.prepare(sql)));
+        this.count(job, "tags", retagged.reduce((sum, result) => sum + (result.meta.changes ?? 0), 0));
         this.nextPhase(job, "quarantine");
       }
       return false;
@@ -2705,13 +2710,23 @@ export class VaultWriter extends DurableObject<Env> {
     return rows.results ?? [];
   }
 
-  // Makes the note_names rows of these notes again from their note rows, or removes them for a note
-  // that is gone. Each batch that changes a note's path, fact key, or frontmatter includes these.
-  private refreshNames(ids: string[]): D1PreparedStatement[] {
+  // Makes the note_names and note_tags rows of these notes again from their note rows, or removes
+  // them for a note that is gone. Each batch that changes a note's path, fact key, frontmatter, or
+  // body includes these.
+  private refreshLookups(ids: string[]): D1PreparedStatement[] {
     const json = JSON.stringify(ids);
     return [
       this.env.DB.prepare("DELETE FROM note_names WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
       this.env.DB.prepare(NOTE_NAMES_FILL).bind(json),
+      ...this.refreshTags(ids),
+    ];
+  }
+
+  private refreshTags(ids: string[]): D1PreparedStatement[] {
+    const json = JSON.stringify(ids);
+    return [
+      this.env.DB.prepare("DELETE FROM note_tags WHERE note_id IN (SELECT value FROM json_each(?))").bind(json),
+      this.env.DB.prepare(NOTE_TAGS_FILL).bind(json),
     ];
   }
 

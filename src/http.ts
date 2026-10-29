@@ -27,6 +27,7 @@ import {
   search,
   setTokenScopes,
   startJob,
+  tagList,
   toolRateKind,
   verifyAuditAppendOnly,
   writeFact,
@@ -119,16 +120,20 @@ async function route(request: Request, env: Env, url: URL, session: Session, raw
   // GET is the canonical search. There is no POST /v1/search.
   if (method === "GET" && pathname === "/v1/search") {
     const q = url.searchParams.get("q") ?? url.searchParams.get("query");
-    if (!q) throw new VaultError("invalid", "A required query parameter is missing", ["q"]);
+    const tags = splitList(url.searchParams.get("tags"));
+    // Tags alone list the newest notes that have them, so q is optional with tags.
+    if (!q && !tags) throw new VaultError("invalid", "A required query parameter is missing", ["q"]);
     return ok(
-      await search(env, session, q, url.searchParams.get("mode") ?? "keyword", {
+      await search(env, session, q ?? "", url.searchParams.get("mode") ?? "keyword", {
         limit: Number(url.searchParams.get("limit") ?? "20"),
         domains: splitList(url.searchParams.get("domains")),
         types: splitList(url.searchParams.get("types")),
         since: url.searchParams.get("since") ?? undefined,
+        tags,
       }),
     );
   }
+  if (method === "GET" && pathname === "/v1/tags") return ok(await tagList(env, session, url.searchParams.get("prefix") ?? "", url.searchParams.get("cursor") ?? ""));
   if (method === "GET" && pathname === "/v1/list") return ok(await list(env, session, url.searchParams.get("prefix") ?? "", url.searchParams.get("cursor") ?? ""));
   if (method === "GET" && pathname === "/v1/history") return ok(await history(env, session, url.searchParams.get("path") ?? undefined, url.searchParams.get("id") ?? undefined));
   if (method === "POST" && pathname === "/v1/facts") {

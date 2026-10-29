@@ -9,7 +9,7 @@ import { fromFailure, VaultError, type ApiResult, type JsonValue } from "./error
 import { logEvent } from "./log";
 import { parseMarkdown } from "./markdown";
 import { factPath, inSensitiveFolder, isForgetProtectedPath, journalPath, ownerForPath } from "./paths";
-import { listNotes, noteHistory, readNote, searchVault, whoami } from "./query";
+import { listNotes, listTags, noteHistory, readNote, searchVault, whoami } from "./query";
 import { IDEMPOTENCY_KEY } from "./schemas";
 import { etStamp } from "./time";
 import type { Actor, Grants, JobKind, JobRequest, VaultWriter, WriterOp } from "./writer-do";
@@ -60,10 +60,14 @@ export async function readById(env: Env, session: Session, id: string): Promise<
   return readNote(env, session.access, undefined, id);
 }
 
-export type SearchOptions = { limit?: number; domains?: string[]; types?: string[]; since?: string };
+export type SearchOptions = { limit?: number; domains?: string[]; types?: string[]; since?: string; tags?: string[] };
 
 export async function search(env: Env, session: Session, query: string, mode: string, options: SearchOptions = {}): Promise<Record<string, unknown>> {
   return searchVault(env, session.access, query, mode, options);
+}
+
+export async function tagList(env: Env, session: Session, prefix: string, cursor = ""): Promise<Record<string, unknown>> {
+  return listTags(env, session.access, prefix, cursor);
 }
 
 export async function list(env: Env, session: Session, prefix: string, cursor = ""): Promise<Record<string, unknown>> {
@@ -211,6 +215,7 @@ export async function writeNote(
     sensitivity?: "normal" | "sensitive";
     domain?: string | null;
     type: string;
+    tags?: string[];
     if_match?: string | null;
     idempotency_key?: string | null;
   },
@@ -221,7 +226,7 @@ export async function writeNote(
   const idempotencyKey = idempotencyKeyFrom(idempotencyHeader, input.idempotency_key);
   const path = assertVaultPath(input.path);
   const declared = resolveDomain(path, input.domain);
-  const { body, extra } = bodyWithoutFrontmatter(input.body, input.extra ?? {});
+  const { body, extra } = withTags(bodyWithoutFrontmatter(input.body, input.extra ?? {}), input);
   // The folder decides visibility. Text that classifies as health, finance, or PII at a path that
   // is not already sensitive is stored under sensitive/<d>/<same path>. Frontmatter cannot lower it.
   const reroute = inSensitiveFolder(path)
@@ -270,6 +275,17 @@ export async function writeNote(
 // The writer adds its own frontmatter, so that block would be kept as text in the body. Take it out
 // and keep its keys as extra frontmatter: keys the caller set in extra win, and the writer drops
 // server-managed keys (vault_*, status, owner, and the rest).
+// `tags` is the frontmatter `tags` list. It replaces any tags a note written back with its
+// frontmatter block carries, and is refused next to `extra.tags`, which would name them twice.
+function withTags(
+  parsed: { body: string; extra: Record<string, unknown> },
+  input: { tags?: string[]; extra?: Record<string, unknown> },
+): { body: string; extra: Record<string, unknown> } {
+  if (input.tags === undefined) return parsed;
+  if (input.extra && Object.hasOwn(input.extra, "tags")) throw new VaultError("invalid", "Send tags in tags or in extra.tags, not both", ["tags"]);
+  return { body: parsed.body, extra: { ...parsed.extra, tags: input.tags } };
+}
+
 export function bodyWithoutFrontmatter(body: string, extra: Record<string, unknown>): { body: string; extra: Record<string, unknown> } {
   const parsed = parseMarkdown(body);
   if (Object.keys(parsed.frontmatter).length === 0) return { body, extra };

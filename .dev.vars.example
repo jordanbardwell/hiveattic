@@ -9,3 +9,6 @@ VAULT_TZ=UTC
 # Domain classes. A domain in neither list is refused on write and read as sensitive.
 SENSITIVE_DOMAINS=health,finance
 ORDINARY_DOMAINS=deals,x
+# Where text whose only sensitive part is a phone number, street address, or date of birth goes:
+# restricted (the default, admin-only sensitive/restricted/) or keep (where it was written).
+PII_ROUTE=restricted

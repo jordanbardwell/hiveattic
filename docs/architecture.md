@@ -33,6 +33,8 @@ Only active notes are served to non-admin callers: a forgotten, moved, or supers
 
 A `[[link]]` resolves to the note that its target names: the path, the path without `.md`, a part of the path after a slash, a fact key, or an alias. Case does not count. A path wins over a fact key, and a fact key wins over an alias. A link never resolves to the note that holds it, and a link from outside `sensitive/` never resolves into it. The `note_names` table keeps these names for each note, so a write finds the targets of all its links in one query. Each write keeps the table right, and the nightly reconcile repairs it.
 
+The `note_tags` table keeps each note's tags in their indexed form (see [api.md](api.md)), keyed `(tag, note_id)`, so a tag search and the tag list read one range of the key. The rows come from the note row alone (its frontmatter `tags` and, for a journal or decision day file, the `Tags:` lines the server writes), so the same SQL fills them on a write, in a rebuild, in `migrations/0007_note_tags.sql`, and in the reconcile repair. A journal append adds its entry's tags. A caller's body cannot start a `Tags:` line, because the journal escapes it.
+
 Every version is an immutable copy under `sys/history/<id>/`, labelled with the write that produced it, so history shows each version's own text and `POST /v1/admin/restore` restores it. Journal day files keep no copies.
 
 ## Time zone

@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { ADMIN, auditText, deliverEvent, mcp, mint, nid, resetVault, rest, results, runJob, testEnv, versionsOf, type Envelope } from "./helpers";
+import { ADMIN, auditText, deliverEvent, drainJobs, mcp, mint, nid, resetVault, rest, results, runJob, testEnv, versionsOf, type Envelope } from "./helpers";
 
 // T-15. The folder decides visibility: text that classifies as health, finance, or PII at a path
 // that is not already sensitive is stored under sensitive/<d>/<same path>. Nothing is refused.
@@ -371,3 +371,49 @@ describe("T-15 rerouting", () => {
 });
 
 export type { Envelope };
+
+describe("PII_ROUTE=keep", () => {
+  afterEach(() => {
+    testEnv().PII_ROUTE = undefined;
+  });
+
+  it("keeps a note whose only sensitive text is a phone number at its path, readable by a shared reader", async () => {
+    await resetVault();
+    testEnv().PII_ROUTE = "keep";
+    const marker = `qxphone${nid()}`;
+    const path = `shared/rr-pii-keep-${nid()}.md`;
+    const written = await put(writer, { path, body: `Plumber: Seth, 206-555-0142. ${marker}`, type: "note" });
+    expect(written.status, written.text).toBeLessThan(300);
+    expect(written.json.data?.path).toBe(path);
+    expect(written.json.data?.rerouted ?? false).toBe(false);
+    const got = await read(reader, path);
+    expect(got.status, got.text).toBe(200);
+    expect(got.text).toContain(marker);
+    await drainJobs();
+    expect(results((await rest(`/v1/search?q=${marker}`, reader)).json).map((r) => r.path)).toEqual([path]);
+  });
+
+  it("keeps a journal entry whose only sensitive text is a phone number in the requested day file", async () => {
+    await resetVault();
+    testEnv().PII_ROUTE = "keep";
+    const marker = `qxjournal${nid()}`;
+    const entry = await rest("/v1/journal", writer, {
+      method: "POST",
+      body: JSON.stringify({ target: "own", title: "Plumber", body: `Seth can come Tuesday, 206-555-0142. ${marker}` }),
+    });
+    expect(entry.status, entry.text).toBe(200);
+    expect(entry.json.data?.rerouted ?? false).toBe(false);
+    expect(String(entry.json.data?.path)).toMatch(/^bots\/[^/]+\/journal\//);
+    expect((await read(writer, String(entry.json.data?.path))).text).toContain(marker);
+  });
+
+  it("still sends health text to sensitive/health/ under keep", async () => {
+    await resetVault();
+    testEnv().PII_ROUTE = "keep";
+    const path = `shared/rr-pii-keep-h-${nid()}.md`;
+    const written = await put(writer, { path, body: "Got a synthetic flu shot, office 206-555-0142.", type: "note" });
+    expect(written.json.data?.path).toBe(`sensitive/health/${path}`);
+    expect((await read(reader, path)).status).toBe(404);
+  });
+});
+

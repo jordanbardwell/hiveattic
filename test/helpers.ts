@@ -134,6 +134,7 @@ export async function resetVault(): Promise<void> {
     db.prepare("DELETE FROM tombstones"),
     db.prepare("DELETE FROM conflicts"),
     db.prepare("DELETE FROM chunks"),
+    db.prepare("DELETE FROM note_tags"),
     db.prepare("DELETE FROM vector_delete_queue"),
     db.prepare("DELETE FROM idempotency"),
     db.prepare("DELETE FROM rate_counters"),
