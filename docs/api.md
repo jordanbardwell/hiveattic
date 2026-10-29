@@ -10,8 +10,9 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 | --- | --- | --- |
 | GET | `/v1/whoami` | `vault_whoami` |
 | GET | `/v1/notes?path=` or `?id=` | `vault_read` |
-| GET | `/v1/search?q=` (`query` is an alias; `limit`, `domains`, `types`, `since`, `mode`) | `vault_search` |
+| GET | `/v1/search?q=` (`query` is an alias; `limit`, `domains`, `types`, `since`, `mode`, `tags`) | `vault_search` |
 | GET | `/v1/list?prefix=&cursor=` | `vault_list` (`cursor` argument) |
+| GET | `/v1/tags?prefix=&cursor=` | `vault_tags` (`cursor` argument) |
 | GET | `/v1/history?path=` or `?id=` | `vault_history` |
 | POST | `/v1/facts` | `vault_write_fact` |
 | POST | `/v1/journal` | `vault_append_journal` |
@@ -22,7 +23,11 @@ Bearer tokens use `Authorization: Bearer <token>`. The stored value is `sha256(p
 
 `vault_guide` is MCP only. It tells the agent how the vault stores facts, journal days, and notes, and gives its own folder. The MCP `initialize` reply has the same text as server instructions, so a client can show it to the agent without a call.
 
-`GET /v1/search` is the canonical search; there is no `POST /v1/search` (404). MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` return the keyword results plus `warning: semantic_deferred`. List pages fill with notes the caller can read and return a `cursor` until the prefix is exhausted. A list `prefix` is the literal start of a path, and case counts: `_` and `%` are ordinary characters, and the prefix can have any length.
+`GET /v1/search` is the canonical search; there is no `POST /v1/search` (404). MCP is `POST /mcp` using Streamable HTTP. `mode=hybrid` and `mode=semantic` return the keyword results plus `warning: semantic_deferred`. List pages fill with notes the caller can read and return a `cursor` until the prefix is exhausted.
+
+**Tags.** A note's tags are its frontmatter `tags` (a list, or one comma-separated string from an outside edit), a fact's `tags`, and each journal entry's `Tags:` line. They are split on commas wherever they come from, and indexed in one form: spaces at either end and any leading `#` removed, and A to Z in lower case. A tag nests under another with `/`, and asking for a tag also finds the tags nested under it: `projects` finds `projects/garden`, not `projects-old`. The `tags` field of a note, fact, or journal entry takes tags of 1 to 40 characters with no comma. The index keeps tags up to 64 characters, with no line break, and at most 200 per note (the first in sorted order), so an outside edit's longer or extra tags stay in the file but are not searchable. `PUT /v1/notes` takes `tags`, which sets the note's tags the same way `extra.tags` does, and wins over a `tags` key in a frontmatter block at the top of `body`. Sending both `tags` and `extra.tags` is 400 `invalid`. A replace that sends no tags in any of the three drops the note's tags.
+
+`GET /v1/search?tags=a,b` (MCP `tags: ["a", "b"]`) keeps only notes that have every tag given, at most 10. With `q` the results are ranked as usual; without `q` they are the newest notes with the tags, `score: 0`. Each result carries its `tags`. A tag that is empty, too long, or has a comma or line break is 400 `invalid` (`reasons: ["tags"]`), rather than dropped, which would widen the search. `GET /v1/tags` (`vault_tags`) lists the tags on notes the caller can read, in order, with `count`, the number of those notes that carry each, so it never names a tag that only unreadable notes carry. `prefix` takes the same form, so `projects/` lists one branch. A page holds at most 200 whole tags; `cursor` is the last tag of the page. In the rare case where one tag has more rows than a call reads, that tag comes back alone with `partial: true` and a count that is a lower bound, or, when none of the notes read so far are readable, the reply is `truncated: true` with no cursor. A list `prefix` is the literal start of a path, and case counts: `_` and `%` are ordinary characters, and the prefix can have any length.
 
 Admin routes, all requiring the admin token (403 for any other token): bootstrap, token mint and revoke, the [job and migration routes](admin-jobs.md), journal order, restore, purge, cleanup, audit read, and append-only verification. `/v1/admin/policy` and `/v1/admin/quarantine` are gone (404). The server always assigns `request_id`; a caller `x-request-id` is echoed as `client_request_id`.
 

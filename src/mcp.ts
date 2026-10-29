@@ -14,6 +14,7 @@ import {
   readById,
   readPath,
   search,
+  tagList,
   writeFact,
   writeNote,
   type Session,
@@ -36,6 +37,7 @@ export function vaultGuide(folder: string): string {
     `- Journal: ${folder}journal/<year>/<month>/<date>.md. There is one file for each day. You can only add entries. Write entries with vault_append_journal.`,
     `- Other notes: any other path in your folder, for example ${folder}recipes/apple-pie.md. Use a note for longer text, such as a recipe, a list, or a plan. Write notes with vault_write_note. A note path ends in .md and has no spaces. To replace a note, read it first and send its etag as if_match.`,
     "- Shared notes are in shared/. Write there only if your token allows it.",
+    "- Tags group notes, facts, and journal entries across folders. Nest a tag under another with '/', for example projects/garden. Before you make a tag, call vault_tags to reuse one that exists. Search with tags to find everything that has them.",
     piiRoute() === "keep"
       ? "- Health and finance text moves a note to sensitive/. In this vault, phone numbers, street addresses, and dates of birth stay where you write them."
       : "- Health and finance text moves a note to sensitive/. Phone numbers, street addresses, and dates of birth move a note or fact to sensitive/restricted/, which only the admin reads.",
@@ -87,7 +89,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   });
   tool(
     "vault_search",
-    "Keyword search, the same as GET /v1/search. Hybrid mode is keyword-only until a later milestone.",
+    "Keyword search, the same as GET /v1/search. tags keeps only notes that have every tag given; a tag also matches the tags nested under it, so projects finds projects/garden. Send tags without q to list the newest notes that have them. Each result lists its tags. Hybrid mode is keyword-only until a later milestone.",
     z.object({
       q: z.string().optional(),
       query: z.string().optional(),
@@ -96,6 +98,7 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
       domains: z.array(z.string()).optional(),
       types: z.array(z.string()).optional(),
       since: z.string().optional(),
+      tags: z.array(z.string()).optional(),
     }),
     async (current, args) =>
       search(env, current, String(args.q ?? args.query ?? ""), typeof args.mode === "string" ? args.mode : "keyword", {
@@ -103,7 +106,14 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
         domains: Array.isArray(args.domains) ? args.domains.map(String) : undefined,
         types: Array.isArray(args.types) ? args.types.map(String) : undefined,
         since: typeof args.since === "string" ? args.since : undefined,
+        tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
       }),
+  );
+  tool(
+    "vault_tags",
+    "List the tags on notes you can read, in alphabetical order, with how many of those notes have each. Pass prefix to see one branch, such as projects/. Reuse a tag that exists before you make a new one. Pass the returned cursor to get the next page.",
+    z.object({ prefix: z.string().optional(), cursor: z.string().optional() }),
+    async (current, args) => tagList(env, current, typeof args.prefix === "string" ? args.prefix : "", typeof args.cursor === "string" ? args.cursor : ""),
   );
   tool("vault_list", "List notes under a path prefix. Pass the returned cursor to get the next page.", z.object({ prefix: z.string().optional(), cursor: z.string().optional() }), async (current, args) =>
     list(env, current, typeof args.prefix === "string" ? args.prefix : "", typeof args.cursor === "string" ? args.cursor : ""),
@@ -111,13 +121,13 @@ function buildServer(env: Env, request: Request, ctx: ExecutionContext): McpServ
   tool("vault_history", "List retained versions of a note.", z.object({ path: z.string().optional(), id: z.string().optional() }), async (current, args) =>
     history(env, current, typeof args.path === "string" ? args.path : undefined, typeof args.id === "string" ? args.id : undefined),
   );
-  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active. Send an idempotency_key so a retry writes once.", factSchema, async (current, args) =>
+  tool("vault_write_fact", "Write a durable fact. The newest observed_at stays active. Add tags to group it with related notes. Send an idempotency_key so a retry writes once.", factSchema, async (current, args) =>
     (await writeFact(env, current, parseInput(factSchema, args))).data,
   );
-  tool("vault_append_journal", "Append one journal or decision entry. Send an idempotency_key so a retry writes once.", journalSchema, async (current, args) =>
+  tool("vault_append_journal", "Append one journal or decision entry. Add tags to group it with related notes. Send an idempotency_key so a retry writes once.", journalSchema, async (current, args) =>
     (await appendJournal(env, current, parseInput(journalSchema, args))).data,
   );
-  tool("vault_write_note", "Create or replace a markdown note, such as a recipe, a list, or a longer write-up. body is the note text only. Do not include the frontmatter block that vault_read returns: the vault writes its own. Put your own frontmatter keys, such as title or tags, in extra. Use a fact for one short statement. path is vault-relative, ends in .md, and uses only letters, digits, '-', '_', '.' and '/' (no spaces). Write in your own folder bots/<your agent id>/, for example bots/<your agent id>/recipes/apple-pie.md, or in shared/ if you have write:shared. To replace an existing note, read it first and send its etag as if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
+  tool("vault_write_note", "Create or replace a markdown note, such as a recipe, a list, or a longer write-up. body is the note text only. Do not include the frontmatter block that vault_read returns: the vault writes its own. Send tags in tags, for example recipes and family/holidays; a replace without them drops the note's tags. Put other frontmatter keys of your own, such as title, in extra. Use a fact for one short statement. path is vault-relative, ends in .md, and uses only letters, digits, '-', '_', '.' and '/' (no spaces). Write in your own folder bots/<your agent id>/, for example bots/<your agent id>/recipes/apple-pie.md, or in shared/ if you have write:shared. To replace an existing note, read it first and send its etag as if_match. Send an idempotency_key so a retry writes once.", noteSchema, async (current, args) =>
     (await writeNote(env, current, parseInput(noteSchema, args), null)).data,
   );
   tool("vault_forget", "Soft-delete a note. History is kept for the admin. Send an idempotency_key so a retry writes once.", forgetSchema, async (current, args) => (await forgetNote(env, current, parseInput(forgetSchema, args))).data);
