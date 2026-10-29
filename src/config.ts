@@ -10,7 +10,14 @@ export const FILE_LIMIT_BYTES = 1_900_000;
 
 export const RESTRICTED = "restricted";
 
-export type DomainConfig = { sensitive: Set<string>; ordinary: Set<string> };
+export type DomainConfig = { sensitive: Set<string>; ordinary: Set<string>; pii: PiiRoute };
+
+// Where a note or fact goes when PII (a phone number, street address, or date of birth) is its
+// only sensitive signal. `restricted`, the default, moves it to sensitive/restricted/, which only
+// the admin token reads. `keep` leaves it where it was written, for a vault whose agents need
+// contact details. Health and finance text and the sensitivity flag route the same either way.
+export type PiiRoute = "restricted" | "keep";
+const PII_ROUTES: readonly PiiRoute[] = ["restricted", "keep"];
 
 const DEFAULT_SENSITIVE = "health,finance";
 let loaded: { key: string; config: DomainConfig } | null = null;
@@ -21,20 +28,28 @@ let loaded: { key: string; config: DomainConfig } | null = null;
 export function configure(env: Env): DomainConfig {
   const sensitiveRaw = env.SENSITIVE_DOMAINS?.trim() || DEFAULT_SENSITIVE;
   const ordinaryRaw = env.ORDINARY_DOMAINS?.trim() ?? "";
-  const key = `${sensitiveRaw}|${ordinaryRaw}`;
+  const piiRaw = env.PII_ROUTE?.trim() || "restricted";
+  const key = `${sensitiveRaw}|${ordinaryRaw}|${piiRaw}`;
   if (loaded?.key === key) return loaded.config;
   const sensitive = domainList(sensitiveRaw, "SENSITIVE_DOMAINS");
   const ordinary = domainList(ordinaryRaw, "ORDINARY_DOMAINS");
   for (const name of sensitive) {
     if (ordinary.has(name)) throw new VaultError("misconfigured", "A domain is listed as both sensitive and ordinary", [name]);
   }
-  loaded = { key, config: { sensitive, ordinary } };
+  if (!PII_ROUTES.includes(piiRaw as PiiRoute)) {
+    throw new VaultError("misconfigured", "PII_ROUTE must be restricted or keep", [piiRaw]);
+  }
+  loaded = { key, config: { sensitive, ordinary, pii: piiRaw as PiiRoute } };
   return loaded.config;
 }
 
 export function domainConfig(): DomainConfig {
   if (!loaded) return configure({} as Env);
   return loaded.config;
+}
+
+export function piiRoute(): PiiRoute {
+  return domainConfig().pii;
 }
 
 export function isSensitiveDomain(name: string | null | undefined): boolean {

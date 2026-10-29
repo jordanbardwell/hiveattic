@@ -1,4 +1,4 @@
-import { isSensitiveDomain, RESTRICTED } from "./config";
+import { isSensitiveDomain, piiRoute, RESTRICTED } from "./config";
 import { parseMarkdown, type Frontmatter } from "./markdown";
 import { PII_ROUTE } from "./paths";
 
@@ -18,14 +18,16 @@ function bounded(term: string): string {
 
 const HEALTH = new RegExp(
   [
-    "diagnosis",
+    // "Tool failure diagnosis" and "error diagnosis" are engineering, like "error budget".
+    "(?<!(?:failure|error|fault|bug|crash|outage|incident|performance|latency|network|tool|build|test|root[- ]cause)\\s)diagnosis",
     "diagnosed with",
     "prescription",
     "prescribed",
     "medications?",
     "medicine",
     "dosage",
-    "doctor'?s?",
+    // A `doctor` subcommand is not a person: `brew doctor`, `scripts/check.py doctor`, `doctor --verbose`.
+    "(?<!(?:[\\w-]+\\.(?:py|sh|js|ts|mjs|cjs|rb)|`[\\w./-]+)\\s)doctor'?s?(?!\\s+--[a-z])",
     "physician",
     "therapist",
     "therapy",
@@ -136,7 +138,8 @@ export function routeFor(classification: Classification, flagged: boolean, decla
   if (classification.finance) domains.push("finance");
   if (domains.length > 1) return RESTRICTED;
   if (domains.length === 1) return isSensitiveDomain(domains[0]) ? domains[0]! : RESTRICTED;
-  if (classification.pii || flagged) return RESTRICTED;
+  if (flagged) return RESTRICTED;
+  if (classification.pii && piiRoute() === "restricted") return RESTRICTED;
   return null;
 }
 

@@ -1,6 +1,6 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { mcp, mint, nid } from "./helpers";
+import { mcp, mint, nid, testEnv } from "./helpers";
 
 // An agent finds out how the vault stores things without the copied setup text: from the server
 // instructions in the initialize reply, or from the vault_guide tool.
@@ -30,5 +30,21 @@ describe("vault guide", () => {
     const body = JSON.parse(line.replace(/^data:\s*/, "")) as { result: { instructions?: string } };
     expect(body.result.instructions).toContain("vault_write_note");
     expect(body.result.instructions).toContain("vault_guide");
+  });
+
+  it("vault_guide says where contact details go under the vault's PII_ROUTE", async () => {
+    const token = await mint(`guide-${nid()}`, ["read:own"], "guide");
+    try {
+      testEnv().PII_ROUTE = undefined;
+      const restricted = String((await mcp(token, "vault_guide", {})).json.data?.guide);
+      expect(restricted).toContain("move a note or fact to sensitive/restricted/");
+      expect(restricted).not.toContain("stay where you write them");
+      testEnv().PII_ROUTE = "keep";
+      const kept = String((await mcp(token, "vault_guide", {})).json.data?.guide);
+      expect(kept).toContain("stay where you write them");
+      expect(kept).not.toContain("sensitive/restricted/");
+    } finally {
+      testEnv().PII_ROUTE = undefined;
+    }
   });
 });

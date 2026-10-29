@@ -3,6 +3,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { authenticate, countryOf } from "./auth";
 import { ulid } from "./crypto";
+import { piiRoute } from "./config";
 import { errorBody, VaultError } from "./errors";
 import {
   appendJournal,
@@ -35,6 +36,9 @@ export function vaultGuide(folder: string): string {
     `- Journal: ${folder}journal/<year>/<month>/<date>.md. There is one file for each day. You can only add entries. Write entries with vault_append_journal.`,
     `- Other notes: any other path in your folder, for example ${folder}recipes/apple-pie.md. Use a note for longer text, such as a recipe, a list, or a plan. Write notes with vault_write_note. A note path ends in .md and has no spaces. To replace a note, read it first and send its etag as if_match.`,
     "- Shared notes are in shared/. Write there only if your token allows it.",
+    piiRoute() === "keep"
+      ? "- Health and finance text moves a note to sensitive/. In this vault, phone numbers, street addresses, and dates of birth stay where you write them."
+      : "- Health and finance text moves a note to sensitive/. Phone numbers, street addresses, and dates of birth move a note or fact to sensitive/restricted/, which only the admin reads.",
     "Before you write, read AGENTS.md with vault_read. It has the rules for all agents. Call vault_guide to see this text with your own folder.",
   ].join("\n");
 }
