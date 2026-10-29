@@ -56,4 +56,4 @@ All technical documents are in [docs/](docs/README.md).
 
 ## License
 
-This repository does not have a license yet.
+This repository uses the MIT License. See [LICENSE](LICENSE).
